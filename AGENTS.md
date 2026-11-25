@@ -20,9 +20,12 @@
 
 ## 项目 Skills
 
+- [$refdesk-change-workflow](.agents/skills/refdesk-change-workflow/SKILL.md) 负责修改前建立或沿用 OpenSpec change，以及每次提交前检查关联 change 并确认同步与归档。
 - [$refdesk-build](.agents/skills/refdesk-build/SKILL.md) 负责 Windows Release 构建、工具链排查和更新本地启动产物。
 - [$refdesk-verify](.agents/skills/refdesk-verify/SKILL.md) 负责格式、Clippy、测试、真实仓库截图验收和性能计时。
 
 ## 仓库操作
 
 开始前检查 `git status --short --branch` 并保留用户已有的改动。提交时按任务范围显式添加文件，检查暂存差异。用户只要求提交时做本地提交，推送需要明确请求。本机配置、构建产物及包含真实项目数据的截图或日志留在本机。
+
+开始修改项目前，按 `refdesk-change-workflow` 建立或沿用对应的 OpenSpec change。每次提交前都用该 Skill 核对是否有对应的未归档 change。如有，询问用户是否先同步并归档，已有明确授权时直接执行。
