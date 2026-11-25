@@ -35,8 +35,11 @@ fn main() -> eframe::Result<()> {
             paths.push(PathBuf::from(argument));
         }
     }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/refdesk.png"))
+        .expect("embedded Refdesk icon must be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(icon)
             .with_inner_size(timing::capture_viewport().unwrap_or([1480.0, 850.0]))
             .with_position([56.0, 62.0])
             .with_min_inner_size([930.0, 610.0]),

@@ -19,14 +19,14 @@ Refdesk 是 Windows 上的 Rust Git 桌面客户端。左边放仓库和分支�
 
 ## 构建和验证
 
-Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。windows-gnu 工具链需要 GNU Binutils 可用。验证采用 Rust 1.100.0 和 Git for Windows 2.53.0。
+Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。使用 windows-gnu 工具链时需要 GNU Binutils。Windows x64 的工具链配置、Release EXE 打包和校验步骤见 [Windows 打包流程](docs/PACKAGING.md)。
 
     cargo build --release --locked
     cargo test --release --locked
     cargo fmt --check
     cargo clippy --locked --all-targets -- -D warnings
 
-发行构建在 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。需要新演示仓库时，安装 Python openpyxl 后执行 python scripts/make-demo.py。
+上述 Release 构建输出到 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。需要新演示仓库时，安装 Python openpyxl 后执行 python scripts/make-demo.py。
 
 ## 0.1 范围
 
