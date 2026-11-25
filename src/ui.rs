@@ -390,11 +390,11 @@ impl Desk {
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut select = None;
         let mut forget = None;
+        let repositories = self.repository_rows();
         let repo_limit = (ui.available_height() * 0.40).clamp(84.0, 290.0);
-        let repo_h =
-            (self.settings.repositories.len().max(2) as f32 * 40.0).clamp(84.0, repo_limit);
+        let repo_h = (repositories.len().max(2) as f32 * 40.0).clamp(84.0, repo_limit);
         ui.horizontal(|ui| {
-            heading(ui, "仓库", Some(self.settings.repositories.len()));
+            heading(ui, "仓库", Some(repositories.len()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("···", |ui| {
                     if ui
@@ -403,7 +403,7 @@ impl Desk {
                             "后台预读其他仓库的提交图",
                         )
                         .on_hover_text(
-                            "当前仓库优先。其余仓库逐个预读日志，首次打开时读取工作树状态。",
+                            "当前仓库优先。其他已登记仓库逐个预读日志，子模块在打开时加载。",
                         )
                         .changed()
                     {
@@ -411,11 +411,7 @@ impl Desk {
                     }
                     ui.separator();
                     if ui.button("添加当前仓库的 worktree").clicked() {
-                        self.discover(ctx, false);
-                        ui.close_menu();
-                    }
-                    if ui.button("添加已初始化的子模块").clicked() {
-                        self.discover(ctx, true);
+                        self.discover_worktrees(ctx);
                         ui.close_menu();
                     }
                 });
@@ -433,43 +429,34 @@ impl Desk {
             .min_scrolled_height(repo_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if self.settings.repositories.is_empty() {
+                if repositories.is_empty() {
                     ui.add_space(7.0);
                     if small_button(ui, "选择仓库文件夹…").clicked() {
                         self.choose_repository(ctx);
                     }
                 }
-                let mut paths: Vec<(usize, &std::path::PathBuf, usize)> = self
-                    .settings
-                    .repositories
-                    .iter()
-                    .enumerate()
-                    .map(|(index, path)| {
-                        let mut anchor = index;
-                        let mut depth = 0;
-                        for (other_index, parent) in self.settings.repositories.iter().enumerate() {
-                            if path != parent && path.starts_with(parent) {
-                                depth += 1;
-                                anchor = anchor.min(other_index);
-                            }
-                        }
-                        (anchor, path, depth)
-                    })
-                    .collect();
-                paths.sort_by_key(|(index, _, depth)| (*index, *depth));
-                for (_, path, depth) in paths {
-                    let indent = depth.min(4) as f32 * 14.0;
+                for row in &repositories {
+                    let path = &row.path;
+                    let available = row.submodule != Some(false);
+                    let indent = row.depth.min(4) as f32 * 14.0;
                     let active = self.active.as_ref() == Some(path);
                     let name = path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("仓库");
-                    let detail = self
-                        .repos
-                        .get(path)
-                        .and_then(|repo| repo.history.as_ref())
-                        .map(|history| history.branch.as_str())
-                        .unwrap_or("工作树");
+                    let detail = if available {
+                        self.repos
+                            .get(path)
+                            .and_then(|repo| repo.history.as_ref())
+                            .map(|history| history.branch.as_str())
+                            .unwrap_or(if row.submodule.is_some() {
+                                "子模块"
+                            } else {
+                                "工作树"
+                            })
+                    } else {
+                        "子模块未检出"
+                    };
                     let (rect, response) = ui
                         .allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
                     if active || response.hovered() {
@@ -510,7 +497,7 @@ impl Desk {
                         rect.left() + 37.0 + indent,
                         name,
                         FontId::proportional(13.0),
-                        INK,
+                        if available { INK } else { MUTE },
                     );
                     paint(
                         ui,
@@ -518,9 +505,15 @@ impl Desk {
                         rect.left() + 37.0 + indent,
                         detail,
                         FontId::proportional(11.0),
-                        if active { ACCENT } else { MUTE },
+                        if !available {
+                            RED
+                        } else if active {
+                            ACCENT
+                        } else {
+                            MUTE
+                        },
                     );
-                    if response.clicked() {
+                    if available && response.clicked() {
                         select = Some(path.clone());
                     }
                     response.context_menu(|ui| {
@@ -528,7 +521,9 @@ impl Desk {
                             ui.ctx().copy_text(path.display().to_string());
                             ui.close_menu();
                         }
-                        if ui.button("从 Refdesk 列表移除…").clicked() {
+                        if self.settings.repositories.contains(path)
+                            && ui.button("从 Refdesk 列表移除…").clicked()
+                        {
                             forget = Some(path.clone());
                             ui.close_menu();
                         }

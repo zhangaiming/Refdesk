@@ -1,5 +1,7 @@
 use crate::diff::{self, Content};
-use crate::git::{self, Change, Commit, Compare, Details, History, HistoryScope, Operation};
+use crate::git::{
+    self, Change, Commit, Compare, Details, History, HistoryScope, Operation, Submodule,
+};
 use crate::graph::Graph;
 use crate::settings::{self, Settings, Tool};
 use crate::timing::{FrameCapture, Timings};
@@ -13,11 +15,12 @@ use tempfile::TempDir;
 
 type Task = Box<dyn FnOnce() + Send>;
 type Outcome<T> = std::result::Result<T, String>;
+type HistoryPayload = Option<(History, Graph)>;
 
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
-    History(PathBuf, u64, Outcome<(History, Graph)>),
-    Status(PathBuf, u64, Outcome<Vec<Change>>),
+    History(PathBuf, u64, Outcome<HistoryPayload>),
+    Status(PathBuf, u64, Outcome<Vec<Change>>, Outcome<Vec<Submodule>>),
     Details(u64, Outcome<Details>),
     Diff(u64, Outcome<Content>),
     Operation(PathBuf, Option<String>, Outcome<String>),
@@ -29,6 +32,7 @@ pub(crate) struct Repository {
     pub history: Option<History>,
     pub graph: Graph,
     pub changes: Vec<Change>,
+    submodules: Option<Vec<Submodule>>,
     pub has_status: bool,
     pub history_busy: bool,
     pub status_busy: bool,
@@ -37,9 +41,16 @@ pub(crate) struct Repository {
     pub filter: HistoryScope,
     pub limit: usize,
     history_request: u64,
+    history_on_demand: bool,
     draft: String,
     status_request: u64,
     status_checked: Option<Instant>,
+}
+
+pub(crate) struct RepositoryRow {
+    pub path: PathBuf,
+    pub depth: usize,
+    pub submodule: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +77,7 @@ pub(crate) struct Desk {
     pub settings: Settings,
     pub active: Option<PathBuf>,
     pub repos: HashMap<PathBuf, Repository>,
+    restore_active: Option<PathBuf>,
     pub selection: Selection,
     pub details: Option<Details>,
     pub details_error: Option<String>,
@@ -155,20 +167,27 @@ impl Desk {
         };
         let initial = settings
             .active
-            .clone()
+            .as_deref()
             .and_then(|active| {
                 settings
                     .repositories
                     .iter()
-                    .find(|path| same_path(path, &active))
+                    .filter(|path| same_path(path, active) || is_descendant(active, path))
+                    .min_by_key(|path| path.components().count())
                     .cloned()
             })
             .or_else(|| settings.repositories.first().cloned());
+        let restore_active = settings.active.clone().filter(|active| {
+            initial
+                .as_ref()
+                .is_some_and(|path| is_descendant(active, path))
+        });
         let status_is_error = warning.is_some();
         let mut desk = Self {
             settings,
             active: None,
             repos: HashMap::new(),
+            restore_active,
             selection: Selection::Worktree,
             details: None,
             details_error: None,
@@ -207,7 +226,7 @@ impl Desk {
             inbox,
         };
         if let Some(path) = initial {
-            desk.activate(ctx, path);
+            desk.activate_path(ctx, path);
         }
         desk
     }
@@ -243,6 +262,95 @@ impl Desk {
         self.active.as_ref().and_then(|path| self.repos.get(path))
     }
 
+    pub fn repository_rows(&self) -> Vec<RepositoryRow> {
+        let mut attached = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut registered: Vec<_> = self.settings.repositories.iter().collect();
+        // Visit parents first so an old standalone entry can be attached even
+        // if it was saved before its parent.
+        registered.sort_by_key(|path| path.components().count());
+        for root in registered {
+            if attached.contains(root) {
+                continue;
+            }
+            let mut pending = vec![root];
+            while let Some(path) = pending.pop() {
+                if visited.insert(path) {
+                    for module in self.submodules(path) {
+                        attached.insert(&module.path);
+                        if module.available {
+                            pending.push(&module.path);
+                        }
+                    }
+                }
+            }
+        }
+        let mut pending: Vec<_> = self
+            .settings
+            .repositories
+            .iter()
+            .rev()
+            .filter(|path| !attached.contains(path))
+            .map(|path| (0, path, None))
+            .collect();
+        let mut rows = Vec::new();
+        visited.clear();
+        while let Some((depth, path, submodule)) = pending.pop() {
+            if visited.insert(path) {
+                rows.push(RepositoryRow {
+                    path: path.clone(),
+                    depth,
+                    submodule,
+                });
+                if submodule != Some(false) {
+                    pending.extend(
+                        self.submodules(path)
+                            .iter()
+                            .rev()
+                            .map(|module| (depth + 1, &module.path, Some(module.available))),
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    fn submodules(&self, path: &Path) -> &[Submodule] {
+        self.repos
+            .get(path)
+            .and_then(|state| state.submodules.as_deref())
+            .unwrap_or_default()
+    }
+
+    fn restore_repository(&mut self, ctx: &egui::Context, parent: &Path) {
+        let Some(target) = self.restore_active.take() else {
+            return;
+        };
+        let module = self.submodules(parent).iter().find(|module| {
+            same_path(&target, &module.path) || is_descendant(&target, &module.path)
+        });
+        if let Some(path) = module
+            .filter(|module| module.available)
+            .map(|module| module.path.clone())
+        {
+            if !same_path(&target, &path) {
+                self.restore_active = Some(target);
+            }
+            self.activate_path(ctx, path);
+        } else if module.is_none()
+            && let Some(path) = self
+                .settings
+                .repositories
+                .iter()
+                .find(|path| same_path(path, &target))
+        {
+            self.activate_path(ctx, path.clone());
+        } else {
+            self.settings.active = self.active.clone();
+            self.save();
+        }
+    }
+
     pub fn choose_repository(&self, ctx: &egui::Context) {
         self.submit(ctx, || {
             Event::Added(
@@ -260,23 +368,25 @@ impl Desk {
         });
     }
 
-    pub fn discover(&self, ctx: &egui::Context, modules: bool) {
+    pub fn discover_worktrees(&self, ctx: &egui::Context) {
         let Some(root) = self.active.clone() else {
             return;
         };
         self.submit(ctx, move || {
-            Event::Added(
-                readable(if modules {
-                    git::submodules(&root)
-                } else {
-                    git::worktrees(&root)
-                }),
-                false,
-            )
+            Event::Added(readable(git::worktrees(&root)), false)
         });
     }
 
     pub fn activate(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.restore_active.take().is_some() && self.active.as_ref() == Some(&path) {
+            self.settings.active = Some(path);
+            self.save();
+            return;
+        }
+        self.activate_path(ctx, path);
+    }
+
+    fn activate_path(&mut self, ctx: &egui::Context, path: PathBuf) {
         if self.active.as_ref() == Some(&path) {
             return;
         }
@@ -291,7 +401,7 @@ impl Desk {
             timings.activate(&path);
         }
         self.active = Some(path.clone());
-        self.settings.active = Some(path.clone());
+        self.settings.active = Some(self.restore_active.clone().unwrap_or_else(|| path.clone()));
         self.repos
             .entry(path.clone())
             .or_insert_with(|| Repository {
@@ -331,8 +441,11 @@ impl Desk {
         self.settings.repositories.retain(|entry| entry != path);
         self.repos.remove(path);
         self.settings.branch_selection.remove(path);
-        if self.active.as_deref() == Some(path) {
+        if self.active.as_ref().is_some_and(|active| {
+            active == path || !self.repository_rows().iter().any(|row| &row.path == active)
+        }) {
             self.active = None;
+            self.restore_active = None;
             self.settings.active = None;
             self.selection = Selection::Worktree;
             self.details = None;
@@ -347,6 +460,10 @@ impl Desk {
     }
 
     pub fn request_history(&mut self, ctx: &egui::Context, path: &Path) {
+        self.queue_history(ctx, path, false);
+    }
+
+    fn queue_history(&mut self, ctx: &egui::Context, path: &Path, check_superproject: bool) {
         let request = self.next();
         let state = self
             .repos
@@ -370,10 +487,14 @@ impl Desk {
         let filter = state.filter.clone();
         let limit = state.limit;
         self.submit(ctx, move || {
-            let result = readable(git::history(&root, &filter, limit).map(|history| {
+            let result = readable((|| {
+                if check_superproject && git::has_superproject(&root)? {
+                    return Ok(None);
+                }
+                let history = git::history(&root, &filter, limit)?;
                 let graph = Graph::build(&history.commits);
-                (history, graph)
-            }));
+                Ok(Some((history, graph)))
+            })());
             Event::History(root, request, result)
         });
     }
@@ -397,7 +518,8 @@ impl Desk {
         let root = path.to_owned();
         self.submit(ctx, move || {
             let result = readable(git::status(&root));
-            Event::Status(root, request, result)
+            let submodules = readable(git::submodules(&root));
+            Event::Status(root, request, result, submodules)
         });
     }
 
@@ -564,7 +686,13 @@ impl Desk {
         while let Ok(event) = self.inbox.try_recv() {
             match event {
                 Event::Added(result, activate) => match result {
-                    Ok(paths) => {
+                    Ok(mut paths) => {
+                        let rows = self.repository_rows();
+                        for path in &mut paths {
+                            if let Some(row) = rows.iter().find(|row| same_path(&row.path, path)) {
+                                *path = row.path.clone();
+                            }
+                        }
                         let first = paths.first().cloned();
                         let mut added = 0;
                         for path in paths {
@@ -606,15 +734,20 @@ impl Desk {
                     }
                     state.history_busy = false;
                     match result {
-                        Ok((history, graph)) => {
+                        Ok(Some((history, graph))) => {
                             state.graph = graph;
-
                             state.history = Some(history);
+                        }
+                        Ok(None) => {
+                            state.history_on_demand = true;
+                            if self.active.as_ref() == Some(&path) {
+                                self.request_history(ctx, &path);
+                            }
                         }
                         Err(error) => state.history_error = Some(error),
                     }
                 }
-                Event::Status(path, request, result) => {
+                Event::Status(path, request, result, submodules) => {
                     let Some(state) = self.repos.get_mut(&path) else {
                         continue;
                     };
@@ -629,6 +762,42 @@ impl Desk {
                             state.has_status = true;
                         }
                         Err(error) => state.status_error = Some(error),
+                    }
+                    let updated = match submodules {
+                        Ok(mut modules) => {
+                            for module in &mut modules {
+                                if let Some(path) = self
+                                    .settings
+                                    .repositories
+                                    .iter()
+                                    .find(|path| same_path(path, &module.path))
+                                {
+                                    module.path = path.clone();
+                                }
+                            }
+                            state.submodules = Some(modules);
+                            true
+                        }
+                        Err(error) => {
+                            self.tell(
+                                format!("无法读取 {} 的子模块：{error}", path.display()),
+                                true,
+                            );
+                            false
+                        }
+                    };
+                    if self.active.as_ref() == Some(&path) {
+                        self.restore_repository(ctx, &path);
+                    } else if updated
+                        && self.active.as_ref().is_some_and(|active| {
+                            is_descendant(active, &path)
+                                && !self
+                                    .repository_rows()
+                                    .iter()
+                                    .any(|row| &row.path == active && row.submodule != Some(false))
+                        })
+                    {
+                        self.activate(ctx, path);
                     }
                 }
                 Event::Details(request, result) if request == self.details_request => {
@@ -758,14 +927,35 @@ impl Desk {
         }
         let candidate = self.settings.repositories.iter().find(|path| {
             self.active.as_ref() != Some(*path)
-                && self
-                    .repos
-                    .get(*path)
-                    .is_none_or(|repo| repo.history.is_none() && repo.history_error.is_none())
+                && self.repos.get(*path).is_none_or(|repo| {
+                    repo.history.is_none()
+                        && repo.history_error.is_none()
+                        && !repo.history_on_demand
+                })
+                && self.can_prefetch(path)
         });
         if let Some(path) = candidate.cloned() {
-            self.request_history(ctx, &path);
+            let nested = self
+                .settings
+                .repositories
+                .iter()
+                .any(|parent| is_descendant(&path, parent));
+            self.queue_history(ctx, &path, nested);
         }
+    }
+
+    fn can_prefetch(&self, path: &Path) -> bool {
+        // A legacy entry can be a submodule of a registered parent that is
+        // still loading. Wait for that scan before prefetching its descendants.
+        !self.repos.iter().any(|(parent, state)| {
+            (state.status_busy
+                && self.active.as_ref() == Some(parent)
+                && is_descendant(path, parent))
+                || self
+                    .submodules(parent)
+                    .iter()
+                    .any(|module| same_path(path, &module.path))
+        })
     }
 
     pub fn background_status(&mut self, ctx: &egui::Context) {
@@ -778,6 +968,12 @@ impl Desk {
         }
         self.focused = focused;
     }
+}
+
+fn is_descendant(path: &Path, parent: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| same_path(ancestor, parent))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

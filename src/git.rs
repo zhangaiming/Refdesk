@@ -163,6 +163,12 @@ pub struct Change {
     pub area: Area,
 }
 
+#[derive(Debug)]
+pub struct Submodule {
+    pub path: PathBuf,
+    pub available: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Version {
     Empty,
@@ -268,6 +274,11 @@ pub fn root(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+pub fn has_superproject(root: &Path) -> Result<bool> {
+    let output = run(root, &["rev-parse", "--show-superproject-working-tree"])?;
+    Ok(!trim(&output).is_empty())
+}
+
 pub fn worktrees(root: &Path) -> Result<Vec<PathBuf>> {
     let bytes = run(root, &["worktree", "list", "--porcelain", "-z"])?;
     let mut result = Vec::new();
@@ -282,34 +293,45 @@ pub fn worktrees(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-pub fn submodules(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.join(".gitmodules").is_file() {
-        return Ok(Vec::new());
-    }
-    let result = output(
+pub fn submodules(root: &Path) -> Result<Vec<Submodule>> {
+    let index = run(root, &["ls-files", "--stage", "-z"])?;
+    // The staged diff also exposes HEAD-only gitlinks (for example, a staged removal).
+    let staged = run(
         root,
         &[
-            "config",
-            "--null",
-            "--file",
-            ".gitmodules",
-            "--get-regexp",
-            "^submodule\\..*\\.path$",
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
         ],
-        true,
     )?;
-    if result.status.code() == Some(1) {
-        return Ok(Vec::new());
+    let mut paths = BTreeSet::new();
+    for entry in index.split(|byte| *byte == 0) {
+        if entry.starts_with(b"160000 ")
+            && let Some(tab) = entry.iter().position(|byte| *byte == b'\t')
+        {
+            paths.insert(&entry[tab + 1..]);
+        }
     }
-    let bytes = checked(result)?;
-    Ok(bytes
-        .split(|ch| *ch == 0)
-        .filter_map(|line| {
-            let position = line.iter().position(|ch| *ch == b'\n')?;
-            let name = string(&line[position + 1..]);
-            let path = safe_relative(&name).ok()?;
-            let path = root.join(path);
-            path.join(".git").exists().then_some(path)
+    let mut entries = staged.split(|byte| *byte == 0);
+    while let (Some(header), Some(path)) = (entries.next(), entries.next()) {
+        if header.starts_with(b":160000 ") {
+            paths.insert(path);
+        }
+    }
+    Ok(paths
+        .into_iter()
+        .filter_map(|entry| {
+            let name = std::str::from_utf8(entry).ok()?;
+            let path = root.join(safe_relative(name).ok()?);
+            let available = path.join(".git").exists()
+                && run(&path, &["rev-parse", "--show-prefix"])
+                    .is_ok_and(|prefix| trim(&prefix).is_empty());
+            Some(Submodule { path, available })
         })
         .collect())
 }
@@ -808,6 +830,80 @@ mod tests {
     fn rejects_paths_outside_the_worktree() {
         assert!(safe_relative("../outside").is_err());
         assert!(safe_relative("Assets/config.xlsx").is_ok());
+    }
+
+    #[test]
+    fn discovers_gitlinks_and_checks_for_a_local_submodule_worktree() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let parent = sandbox.path().join("parent");
+        let source = sandbox.path().join("source");
+        let git = |root: &Path, args: &[&str]| checked(output(root, args, false)?);
+        for repo in [&parent, &source] {
+            std::fs::create_dir(repo)?;
+            git(repo, &["init", "--initial-branch=main"])?;
+            git(repo, &["config", "user.name", "Refdesk test"])?;
+            git(repo, &["config", "user.email", "test@example.invalid"])?;
+            git(repo, &["config", "commit.gpgSign", "false"])?;
+            git(repo, &["config", "core.hooksPath", "disabled-hooks"])?;
+        }
+        let local = "deps/共用 库";
+        git(&source, &["commit", "--allow-empty", "-m", "child"])?;
+        let oid = trim(&run(&source, &["rev-parse", "HEAD"])?);
+        git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                source.to_str().unwrap(),
+                local,
+            ],
+        )?;
+        git(
+            &parent,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &oid,
+                "unpopulated",
+            ],
+        )?;
+        git(
+            &parent,
+            &[
+                "config",
+                "--file",
+                ".gitmodules",
+                "submodule.fake.path",
+                "fake",
+            ],
+        )?;
+        std::fs::create_dir(parent.join("fake"))?;
+        git(&parent.join("fake"), &["init"])?;
+        assert_eq!(
+            submodules(&parent)?
+                .into_iter()
+                .map(|module| (module.path, module.available))
+                .collect::<Vec<_>>(),
+            vec![
+                (parent.join(local), true),
+                (parent.join("unpopulated"), false)
+            ],
+        );
+
+        git(&parent, &["commit", "-m", "parent"])?;
+        git(&parent, &["update-index", "--force-remove", "--", local])?;
+        assert_eq!(submodules(&parent)?.len(), 2);
+        git(&parent, &["commit", "-m", "remove link"])?;
+        let modules = submodules(&parent)?;
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].path, parent.join("unpopulated"));
+        assert!(!modules[0].available);
+        Ok(())
     }
 
     #[test]
