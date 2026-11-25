@@ -388,11 +388,20 @@ impl Desk {
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        const REPO_ROW_HEIGHT: f32 = 23.0;
+        const REPO_ICON_SIZE: f32 = 16.0;
         let mut select = None;
         let mut forget = None;
         let repositories = self.repository_rows();
         let repo_limit = (ui.available_height() * 0.40).clamp(84.0, 290.0);
-        let repo_h = (repositories.len().max(2) as f32 * 40.0).clamp(84.0, repo_limit);
+        let repo_h = if repositories.is_empty() {
+            42.0
+        } else {
+            let gaps = repositories.len() - 1;
+            (repositories.len() as f32 * REPO_ROW_HEIGHT
+                + gaps as f32 * ui.spacing().item_spacing.y)
+                .min(repo_limit)
+        };
         ui.horizontal(|ui| {
             heading(ui, "仓库", Some(repositories.len()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -457,23 +466,28 @@ impl Desk {
                     } else {
                         "子模块未检出"
                     };
-                    let (rect, response) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), REPO_ROW_HEIGHT),
+                        Sense::click(),
+                    );
                     if active || response.hovered() {
                         ui.painter()
                             .rect_filled(rect, 4.0, if active { SELECTION } else { HOVER });
                     }
                     if active {
-                        let y = (rect.top() + 7.0)..=(rect.bottom() - 7.0);
+                        let y = (rect.top() + 4.0)..=(rect.bottom() - 4.0);
                         ui.painter()
                             .vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, ACCENT));
                     }
-                    let symbol = Rect::from_min_size(
-                        rect.left_top() + Vec2::new(8.0 + indent, 7.0),
-                        Vec2::splat(22.0),
+                    let symbol = Rect::from_center_size(
+                        pos2(
+                            rect.left() + 6.0 + indent + REPO_ICON_SIZE / 2.0,
+                            rect.center().y,
+                        ),
+                        Vec2::splat(REPO_ICON_SIZE),
                     );
                     ui.painter()
-                        .rect_filled(symbol, 5.0, if active { SELECTION } else { SHADE });
+                        .rect_filled(symbol, 4.0, if active { SELECTION } else { SHADE });
                     ui.painter().text(
                         symbol.center(),
                         Align2::CENTER_CENTER,
@@ -482,37 +496,40 @@ impl Desk {
                             .unwrap_or('R')
                             .to_uppercase()
                             .collect::<String>(),
-                        FontId::proportional(11.0),
+                        FontId::proportional(10.0),
                         if active { ACCENT } else { MUTE },
                     );
-                    let name_rect =
-                        Rect::from_min_max(rect.min, pos2(rect.right() - 4.0, rect.top() + 19.0));
-                    let detail_rect = Rect::from_min_max(
-                        pos2(rect.left(), rect.top() + 17.0),
-                        rect.max - Vec2::new(4.0, 1.0),
+                    let name_color = if available { INK } else { MUTE };
+                    let detail_color = if !available {
+                        RED
+                    } else if active {
+                        ACCENT
+                    } else {
+                        MUTE
+                    };
+                    let text_rect = Rect::from_min_max(
+                        pos2(symbol.right() + 6.0, rect.top()),
+                        pos2(rect.right() - 4.0, rect.bottom()),
                     );
-                    paint(
-                        ui,
-                        name_rect,
-                        rect.left() + 37.0 + indent,
-                        name,
+                    let mut label = LayoutJob::simple_singleline(
+                        name.to_owned(),
                         FontId::proportional(13.0),
-                        if available { INK } else { MUTE },
+                        name_color,
                     );
-                    paint(
-                        ui,
-                        detail_rect,
-                        rect.left() + 37.0 + indent,
-                        detail,
-                        FontId::proportional(11.0),
-                        if !available {
-                            RED
-                        } else if active {
-                            ACCENT
-                        } else {
-                            MUTE
-                        },
+                    label.append(
+                        &format!(" ({detail})"),
+                        0.0,
+                        egui::TextFormat::simple(FontId::proportional(11.0), detail_color),
                     );
+                    label.wrap.max_width = text_rect.width().max(0.0);
+                    label.wrap.max_rows = 1;
+                    label.wrap.break_anywhere = true;
+                    let painter = ui.painter().with_clip_rect(text_rect);
+                    let galley = painter.layout_job(label);
+                    let text_pos = Align2::LEFT_CENTER
+                        .anchor_size(pos2(text_rect.left(), rect.center().y), galley.size())
+                        .min;
+                    painter.galley(text_pos, galley, name_color);
                     if available && response.clicked() {
                         select = Some(path.clone());
                     }
@@ -528,7 +545,7 @@ impl Desk {
                             ui.close_menu();
                         }
                     });
-                    response.on_hover_text(path.display().to_string());
+                    response.on_hover_text(format!("{name} ({detail})\n{}", path.display()));
                 }
             });
         if let Some(path) = select {
