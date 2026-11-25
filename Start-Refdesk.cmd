@@ -1,6 +1,5 @@
 @echo off
 setlocal
-set "REFDESK_CONFIG=%~dp0.local\settings.json"
 set "REFDESK_EXE=%~dp0artifacts\refdesk-current.exe"
 if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk-polish.exe"
 if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk-tracking.exe"

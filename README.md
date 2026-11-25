@@ -8,7 +8,11 @@ Refdesk 是 Windows 上的 Rust Git 桌面客户端。左边放仓库和分支�
 
     .\Start-Refdesk.cmd
 
-启动器把会话保存在项目的 .local/settings.json。直接运行 refdesk.exe 则使用系统的 Refdesk 配置目录，支持用 REFDESK_CONFIG 指定配置文件。程序需要 PATH 中有 Git。可重复用 --repo 指定工作树，用 --import-smartgit 导入本机 SmartGit 的 Diff Tools。
+启动器和直接运行 `refdesk.exe` 默认共用 `%APPDATA%\Refdesk\settings.json`，用它恢复已登记仓库和上次活动仓库。需要使用独立会话时，可通过 `REFDESK_CONFIG` 指定文件。
+
+从旧版启动器迁移时，若用户目录下还没有 `settings.json`，可将项目里的 `.local/settings.json` 整份复制过去，保留原有仓库、分支选择和 Diff Tools 设置。
+
+程序需要 PATH 中有 Git。可重复用 `--repo` 指定工作树，用 `--import-smartgit` 导入本机 SmartGit 的 Diff Tools。
 
 - 启动时先恢复上次选中的仓库。提交历史与工作树状态分别读取，当前提交图先就绪后，后台逐个预读其他登记仓库的历史。首次切过去再读取那个工作树的状态。
 - 点击或双击仓库切换当前视图。打开父仓库后，仓库树会自动列出它的子模块，点击已检出的子模块才加载其提交图和工作树。左上「···」可以登记关联 worktree 或关闭其他已登记仓库的后台预读。

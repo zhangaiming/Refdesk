@@ -23,7 +23,7 @@ cargo test --release --locked
 
 ## 界面与真实仓库
 
-用临时 `REFDESK_CONFIG` 隔离会话。单仓库可用 `--repo` 指定测试工作树。多仓库和预读场景可复制现有配置到临时路径，保留所需的工作树列表和活动仓库。直接启动本次构建的 exe。`Start-Refdesk.cmd` 会改用项目自己的 `.local/settings.json`。真实 banshu、common 和其他用户工作树用来验证读取与显示，写入场景在临时仓库测试。
+用临时 `REFDESK_CONFIG` 隔离会话。单仓库可用 `--repo` 指定测试工作树。多仓库和预读场景可复制现有配置到临时路径，保留所需的工作树列表和活动仓库。直接启动本次构建的 exe。验证 `Start-Refdesk.cmd` 时，先核对它选择的 EXE。启动器会将 `REFDESK_CONFIG` 传给 EXE。未设置该变量时，两个入口共用 `%APPDATA%\Refdesk\settings.json`。真实 banshu、common 和其他用户工作树用来验证读取与显示，写入场景在临时仓库测试。
 
 按 [DESIGN.md](../../../DESIGN.md) 比较同数据、同视口、同 DPI 的前后截图。常用视口为 `1480x850` 和 `930x610`，窄侧栏用 `184` 逻辑点。针对改动查看顶栏仓库名与分支名、表头与正文、树节点与缩进线、领先和落后的数字、标签省略及合并线路。
 

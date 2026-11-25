@@ -41,7 +41,7 @@ Copy-Item -LiteralPath $refdeskSource -Destination $refdeskPackage
 Get-FileHash -Algorithm SHA256 -LiteralPath $refdeskSource, $refdeskPackage
 ```
 
-确认两行 SHA-256 相同。交付 `artifacts` 下带版本号的 EXE 即可。直接双击该文件启动，应用使用 Windows 用户配置目录。项目根目录的 `Start-Refdesk.cmd` 使用独立的 `.local/settings.json`，其查找顺序见 [启动器](../Start-Refdesk.cmd)。
+确认两行 SHA-256 相同。交付 `artifacts` 下带版本号的 EXE 即可。直接双击 EXE 和通过项目启动器运行时，默认共用 `%APPDATA%\Refdesk\settings.json`。可设置 `REFDESK_CONFIG` 指定其他会话文件。本地启动器的 EXE 查找顺序见 [启动器](../Start-Refdesk.cmd)。
 
 构建时会用 Windows SDK 将 [多尺寸 ICO](../assets/refdesk.ico) 编译成 EXE 资源。应用启动时从嵌入的 [PNG](../assets/refdesk.png) 设置窗口图标。图标资源都嵌在 EXE 中。
 
