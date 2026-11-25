@@ -1,0 +1,7 @@
+schema: spec-driven
+
+context: |
+  Refdesk 是面向 Windows 的 Git 桌面客户端，使用 Rust、eframe 和 egui，界面与用户文档使用简体中文。
+  提交图是中央主视图。左侧是仓库和分支，右侧是提交和文件，下方是文本与 Excel 差异。界面约定见 DESIGN.md。
+  现有行为和协作约定见 README.md 与 AGENTS.md。构建和验收流程见项目内 refdesk-build 和 refdesk-verify Skill。
+  修改提交图时以 Git 真实父提交关系和引用为基准。使用临时仓库验证 Git 写入，使用隔离会话只读验收真实 banshu。
