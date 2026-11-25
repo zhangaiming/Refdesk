@@ -390,6 +390,8 @@ impl Desk {
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         const REPO_ROW_HEIGHT: f32 = 23.0;
         const REPO_ICON_SIZE: f32 = 16.0;
+        const REPO_INDENT: f32 = 14.0;
+        const MAX_REPO_DEPTH: usize = 4;
         let mut select = None;
         let mut forget = None;
         let repositories = self.repository_rows();
@@ -438,6 +440,8 @@ impl Desk {
             .min_scrolled_height(repo_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let guide_stroke = Stroke::new(1.0_f32, MUTE.gamma_multiply(0.26));
+                let mut guide_starts = [0.0; MAX_REPO_DEPTH];
                 if repositories.is_empty() {
                     ui.add_space(7.0);
                     if small_button(ui, "选择仓库文件夹…").clicked() {
@@ -447,7 +451,7 @@ impl Desk {
                 for row in &repositories {
                     let path = &row.path;
                     let available = row.submodule != Some(false);
-                    let indent = row.depth.min(4) as f32 * 14.0;
+                    let indent = row.depth.min(MAX_REPO_DEPTH) as f32 * REPO_INDENT;
                     let active = self.active.as_ref() == Some(path);
                     let name = path
                         .file_name()
@@ -486,6 +490,19 @@ impl Desk {
                         ),
                         Vec2::splat(REPO_ICON_SIZE),
                     );
+                    if (1..=MAX_REPO_DEPTH).contains(&row.depth) {
+                        let start = &mut guide_starts[row.depth - 1];
+                        let x = symbol.center().x - REPO_INDENT;
+                        let y = symbol.center().y;
+                        ui.painter().vline(x, *start..=y, guide_stroke);
+                        ui.painter()
+                            .hline(x..=(symbol.left() - 1.5), y, guide_stroke);
+                        // The next sibling continues from this elbow across any descendants.
+                        *start = y;
+                    }
+                    if row.depth < MAX_REPO_DEPTH {
+                        guide_starts[row.depth] = symbol.bottom() + 1.5;
+                    }
                     ui.painter()
                         .rect_filled(symbol, 4.0, if active { SELECTION } else { SHADE });
                     ui.painter().text(
