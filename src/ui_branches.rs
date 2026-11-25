@@ -1,11 +1,15 @@
 use crate::app::{Desk, Dialog};
-use crate::git::{HistoryScope, Operation, Reference};
-use crate::ui::{ACCENT, FAINT, MUTE, heading, small_button};
+use crate::git::{HistoryScope, Operation, Reference, TrackingState};
+use crate::ui::{
+    ACCENT, DETAIL_SIZE, FAINT, GOLD, GREEN, HOVER, INK, MUTE, SELECTION, centered_baseline,
+    compact_button, filter_field, fit_line, heading, paint_baseline, small_button,
+};
 use eframe::egui::{
-    self, Align, FontId, Layout, RichText, TextFormat, collapsing_header::CollapsingState,
-    text::LayoutJob,
+    self, Align, Color32, FontId, Galley, Layout, Painter, RichText, Sense, Stroke, Vec2,
+    collapsing_header::CollapsingState, pos2,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Default)]
 struct RefGroup<'a> {
@@ -48,6 +52,10 @@ impl<'a> RefGroup<'a> {
         }
     }
 }
+
+const BRANCH_NAME_SIZE: f32 = 13.0;
+const BRANCH_INSET: f32 = 3.0;
+const UPSTREAM_GAP: f32 = 4.0;
 
 const ROOTS: [(&str, &str, bool); 3] = [
     ("refs/heads/", "本地", true),
@@ -142,11 +150,14 @@ impl BranchView<'_> {
                 group.set_checked(&mut selection, checked);
                 self.action = Some(BranchAction::Filter(HistoryScope::Selected(selection)));
             }
+            ui.add_space(BRANCH_INSET);
             change_open = ui
                 .add(
-                    egui::Label::new(RichText::new(format!("{label}  {}", group.total)).size(12.0))
-                        .truncate()
-                        .sense(egui::Sense::click()),
+                    egui::Label::new(
+                        RichText::new(format!("{label}  {}", group.total)).size(BRANCH_NAME_SIZE),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
                 )
                 .clicked();
         });
@@ -177,54 +188,26 @@ impl BranchView<'_> {
         let short = label.rsplit('/').next().unwrap_or(label);
         let local = reference.name.starts_with("refs/heads/");
         let current = local && label == self.current;
-        let caption = if current {
-            format!("●  {short}")
-        } else {
-            short.into()
-        };
         let tooltip = reference.description();
         ui.push_id(&reference.name, |ui| {
             ui.horizontal(|ui| {
-                // Reserve the disclosure column so leaf choices line up with group choices.
-                ui.add_space(ui.spacing().indent);
+                // The current marker occupies the leaf's empty disclosure slot.
+                let indent = ui.spacing().indent;
+                let marker_x = ui.next_widget_position().x + indent / 2.0;
+                ui.add_space(indent);
                 let mut checked = self.selection.contains(&reference.name);
-                if ui
-                    .checkbox(&mut checked, "")
-                    .on_hover_text(&tooltip)
-                    .changed()
-                {
+                let checkbox = ui.checkbox(&mut checked, "").on_hover_text(&tooltip);
+                if checkbox.changed() {
                     self.toggle(&reference.name);
                 }
-                let font = FontId::proportional(12.0);
-                let color = if current { ACCENT } else { MUTE };
-                let mut row = LayoutJob::default();
-                row.append(&caption, 0.0, TextFormat::simple(font.clone(), color));
-                let mut counts = None;
-                let mut width = ui.available_width();
-                if let Some(upstream) = &reference.upstream {
-                    let name = upstream
-                        .same_branch_remote(reference)
-                        .unwrap_or_else(|| upstream.label());
-                    row.append(
-                        &format!("  {name}"),
-                        0.0,
-                        TextFormat::simple(font.clone(), FAINT),
+                if current {
+                    ui.painter().circle_filled(
+                        pos2(marker_x, checkbox.rect.center().y),
+                        2.4,
+                        ACCENT,
                     );
-                    let status = upstream.state.caption();
-                    let galley = ui.painter().layout_no_wrap(status, font, color);
-                    width = (width - galley.size().x - ui.spacing().item_spacing.x).max(0.0);
-                    counts = Some(galley);
                 }
-                let response = ui
-                    .allocate_ui_with_layout(
-                        egui::vec2(width, ui.spacing().interact_size.y),
-                        Layout::left_to_right(Align::Center),
-                        |ui| ui.add(egui::Label::new(row).truncate().sense(egui::Sense::click())),
-                    )
-                    .inner;
-                if let Some(counts) = counts {
-                    ui.label(counts).on_hover_text(&tooltip);
-                }
+                let response = branch_line(ui, reference, short, current);
                 if response.clicked() {
                     if ui.input(|input| input.modifiers.command) {
                         self.toggle(&reference.name);
@@ -252,6 +235,141 @@ impl BranchView<'_> {
     }
 }
 
+fn branch_line(
+    ui: &mut egui::Ui,
+    reference: &Reference,
+    name: &str,
+    current: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    let height = ui.spacing().interact_size.y;
+    let font = FontId::proportional(BRANCH_NAME_SIZE);
+    let remote_font = FontId::proportional(DETAIL_SIZE);
+    let color = if current { ACCENT } else { INK };
+    let name_width = ui
+        .painter()
+        .layout_no_wrap(name.into(), font.clone(), color)
+        .size()
+        .x;
+    let count_gap = 3.0;
+    let mut text_width = width - 2.0 * BRANCH_INSET;
+    let mut counts = Vec::new();
+    let mut remote = None;
+    let mut remote_on_second_line = false;
+    if let Some(upstream) = &reference.upstream {
+        let status = match upstream.state {
+            TrackingState::Counts { ahead, behind } if ahead > 0 && behind > 0 => {
+                vec![(format!("+{ahead}"), GREEN), (format!("−{behind}"), GOLD)]
+            }
+            state => vec![(state.caption(), tracking_color(state))],
+        };
+        counts = status
+            .into_iter()
+            .map(|(caption, color)| {
+                ui.painter()
+                    .layout_no_wrap(caption, FontId::monospace(DETAIL_SIZE), color)
+            })
+            .collect();
+        text_width -= counts
+            .iter()
+            .map(|count| count.size().x + count_gap)
+            .sum::<f32>();
+        let same = upstream.same_branch_remote(reference);
+        let label = same.unwrap_or_else(|| upstream.label());
+        let label_width = ui
+            .painter()
+            .layout_no_wrap(label.into(), remote_font.clone(), FAINT)
+            .size()
+            .x;
+        // A short branch and its two counts remain readable even in the
+        // smallest sidebar. An upstream with its own path can use a second line.
+        remote_on_second_line = same.is_none()
+            && name_width.min(52.0) + UPSTREAM_GAP + label_width.min(36.0) > text_width;
+        remote = Some(label);
+    }
+
+    let extra = if remote_on_second_line { 16.0 } else { 0.0 };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height + extra), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), reference.label())
+    });
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    if response.hovered() || current {
+        painter.rect_filled(
+            rect,
+            3.0,
+            if response.hovered() { HOVER } else { SELECTION },
+        );
+    }
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            3.0,
+            Stroke::new(1.0_f32, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let baseline = rect.top() + height / 2.0 + centered_baseline(&painter, font.clone());
+    let left = rect.left() + BRANCH_INSET;
+    let mut right = rect.right() - BRANCH_INSET;
+    for count in counts.into_iter().rev() {
+        right -= count.size().x;
+        paint_baseline(&painter, right, baseline, count, FAINT);
+        right -= count_gap;
+    }
+    let available = text_width.max(0.0);
+    let inline_remote = remote.filter(|_| !remote_on_second_line && available - name_width >= 22.0);
+    let branch = fit_line(&painter, name.into(), font, color, available);
+    let branch_width = branch.size().x;
+    paint_baseline(&painter, left, baseline, branch, color);
+    if let Some(remote) = inline_remote {
+        let start = left + branch_width + UPSTREAM_GAP;
+        let label = fit_upstream(&painter, remote, remote_font.clone(), right - start);
+        paint_baseline(&painter, start, baseline, label, FAINT);
+    }
+    if let Some(remote) = remote.filter(|_| remote_on_second_line) {
+        let available = rect.right() - BRANCH_INSET - left;
+        let label = fit_upstream(&painter, remote, remote_font, available);
+        painter.galley(
+            pos2(left, rect.top() + height + (extra - label.size().y) / 2.0),
+            label,
+            FAINT,
+        );
+    }
+    response
+}
+
+fn fit_upstream(painter: &Painter, upstream: &str, font: FontId, width: f32) -> Arc<Galley> {
+    let full = fit_line(painter, upstream.into(), font.clone(), FAINT, width);
+    if !full.elided {
+        return full;
+    }
+    if let Some((remote, path)) = upstream.split_once('/') {
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        for short in [
+            format!("{remote}/…/{leaf}"),
+            format!("{remote} · {leaf}"),
+            format!("…/{leaf}"),
+        ] {
+            let label = fit_line(painter, short, font.clone(), FAINT, width);
+            if !label.elided {
+                return label;
+            }
+        }
+    }
+    full
+}
+
+fn tracking_color(state: TrackingState) -> Color32 {
+    match state {
+        TrackingState::Counts { ahead, .. } if ahead > 0 => GREEN,
+        TrackingState::Counts { behind, .. } if behind > 0 => GOLD,
+        TrackingState::Gone => GOLD,
+        _ => FAINT,
+    }
+}
+
 impl Desk {
     pub(crate) fn branches(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let count = self
@@ -264,7 +382,7 @@ impl Desk {
             heading(ui, "分支", count);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 new = ui
-                    .add_enabled(count.is_some(), egui::Button::new("＋").small())
+                    .add_enabled(count.is_some(), compact_button("＋"))
                     .on_hover_text("新建并切换分支")
                     .clicked();
                 if small_button(ui, "全部")
@@ -276,9 +394,7 @@ impl Desk {
             });
         });
         ui.add(
-            egui::TextEdit::singleline(&mut self.branch_query)
-                .hint_text("筛选分支和标签…")
-                .desired_width(f32::INFINITY),
+            filter_field(&mut self.branch_query, "筛选分支和标签…").desired_width(f32::INFINITY),
         );
 
         if let Some(state) = self.state()
@@ -301,7 +417,7 @@ impl Desk {
                     let spacing = ui.spacing_mut();
                     spacing.indent = 13.0;
                     spacing.interact_size.y = 21.0;
-                    spacing.item_spacing.y = 3.0;
+                    spacing.item_spacing = Vec2::new(6.0, 3.0);
                     spacing.button_padding.y = 2.0;
                     let mut head = selection.contains("HEAD");
                     if ui

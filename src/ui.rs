@@ -1,37 +1,42 @@
 use crate::app::{Desk, Dialog};
 use crate::git::Operation;
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Stroke,
-    Vec2, pos2,
+    self, Align, Align2, Color32, FontId, Frame, Galley, Layout, Margin, Painter, Rect, RichText,
+    Sense, Stroke, Vec2, pos2, text::LayoutJob,
 };
 use std::path::PathBuf;
 
-pub(crate) const BASE: Color32 = Color32::from_rgb(17, 22, 30);
-pub(crate) const PANEL: Color32 = Color32::from_rgb(20, 27, 37);
-pub(crate) const SHADE: Color32 = Color32::from_rgb(28, 37, 50);
-pub(crate) const HOVER: Color32 = Color32::from_rgb(33, 58, 67);
-pub(crate) const BORDER: Color32 = Color32::from_rgb(42, 54, 70);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(104, 219, 188);
-pub(crate) const INK: Color32 = Color32::from_rgb(228, 235, 244);
-pub(crate) const MUTE: Color32 = Color32::from_rgb(151, 171, 194);
-pub(crate) const FAINT: Color32 = Color32::from_rgb(111, 135, 161);
-pub(crate) const RED: Color32 = Color32::from_rgb(244, 135, 145);
-pub(crate) const GREEN: Color32 = Color32::from_rgb(120, 225, 154);
-pub(crate) const GOLD: Color32 = Color32::from_rgb(237, 179, 103);
-pub(crate) const ROW: f32 = 27.0;
+pub(crate) const BASE: Color32 = Color32::from_rgb(24, 24, 23);
+pub(crate) const PANEL: Color32 = Color32::from_rgb(31, 31, 30);
+pub(crate) const CHROME: Color32 = Color32::from_rgb(37, 36, 34);
+pub(crate) const SHADE: Color32 = Color32::from_rgb(44, 43, 40);
+pub(crate) const HOVER: Color32 = Color32::from_rgb(50, 49, 46);
+pub(crate) const SELECTION: Color32 = Color32::from_rgb(52, 58, 49);
+pub(crate) const BORDER: Color32 = Color32::from_rgb(62, 60, 55);
+pub(crate) const DIVIDER: Color32 = Color32::from_rgb(37, 36, 34);
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(178, 205, 160);
+pub(crate) const INK: Color32 = Color32::from_rgb(236, 233, 225);
+pub(crate) const MUTE: Color32 = Color32::from_rgb(193, 187, 177);
+pub(crate) const FAINT: Color32 = Color32::from_rgb(166, 161, 151);
+pub(crate) const RED: Color32 = Color32::from_rgb(239, 149, 143);
+pub(crate) const GREEN: Color32 = Color32::from_rgb(151, 208, 155);
+pub(crate) const GOLD: Color32 = Color32::from_rgb(229, 183, 128);
+pub(crate) const ROW: f32 = 25.0;
+pub(crate) const DETAIL_SIZE: f32 = 12.0;
+pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
 
 pub fn install_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(8.0, 5.0);
     style.spacing.button_padding = Vec2::new(9.0, 4.0);
-    style.spacing.interact_size = Vec2::new(36.0, 26.0);
+    style.spacing.interact_size = Vec2::new(36.0, CONTROL_HEIGHT);
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(INK);
     style.visuals.window_fill = PANEL;
     style.visuals.panel_fill = BASE;
     style.visuals.extreme_bg_color = BASE;
     style.visuals.faint_bg_color = SHADE;
-    style.visuals.selection.bg_fill = HOVER;
+    style.visuals.selection.bg_fill = SELECTION;
     style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     style.visuals.widgets.inactive.bg_fill = SHADE;
     style.visuals.widgets.inactive.weak_bg_fill = SHADE;
@@ -39,8 +44,11 @@ pub fn install_theme(ctx: &egui::Context) {
     style.visuals.widgets.hovered.bg_fill = HOVER;
     style.visuals.widgets.hovered.weak_bg_fill = HOVER;
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(0.8_f32, ACCENT.gamma_multiply(0.48));
-    style.visuals.widgets.active.bg_fill = HOVER;
-    style.visuals.widgets.active.weak_bg_fill = HOVER;
+    style.visuals.widgets.active.bg_fill = SELECTION;
+    style.visuals.widgets.active.weak_bg_fill = SELECTION;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    style.visuals.widgets.open.bg_fill = SELECTION;
+    style.visuals.widgets.open.weak_bg_fill = SELECTION;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     for (role, size) in [
         (egui::TextStyle::Body, 14.0),
@@ -95,8 +103,89 @@ pub(crate) fn paint(ui: &egui::Ui, rect: Rect, x: f32, text: &str, font: FontId,
         );
 }
 
+pub(crate) fn fit_line(
+    painter: &egui::Painter,
+    text: String,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = LayoutJob::simple_singleline(text, font, color);
+    job.wrap.max_width = width.max(0.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    painter.layout_job(job)
+}
+
+pub(crate) fn centered_baseline(painter: &Painter, font: FontId) -> f32 {
+    let sample = painter.layout_no_wrap("Ag".into(), font, INK);
+    galley_baseline(&sample) - sample.size().y / 2.0
+}
+
+fn galley_baseline(galley: &Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(0.0, |glyph| glyph.pos.y)
+}
+
+pub(crate) fn paint_baseline(
+    painter: &Painter,
+    x: f32,
+    baseline: f32,
+    galley: std::sync::Arc<Galley>,
+    color: Color32,
+) {
+    painter.galley(pos2(x, baseline - galley_baseline(&galley)), galley, color);
+}
+
+pub(crate) fn compact_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).size(DETAIL_SIZE))
+        .min_size(Vec2::new(25.0, CONTROL_HEIGHT))
+}
+
 pub(crate) fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).size(12.0)).min_size(Vec2::new(25.0, 24.0)))
+    ui.add(compact_button(text))
+}
+
+pub(crate) fn filter_field<'a>(value: &'a mut String, hint: &str) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(value)
+        .hint_text(hint)
+        .margin(Margin::symmetric(6, 3))
+        .vertical_align(Align::Center)
+        .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+}
+
+fn toolbar_context_label(
+    ui: &mut egui::Ui,
+    galley: std::sync::Arc<Galley>,
+    baseline_offset: f32,
+    color: Color32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x, CONTROL_HEIGHT), Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
+    paint_baseline(
+        ui.painter(),
+        rect.left(),
+        rect.center().y + baseline_offset,
+        galley,
+        color,
+    );
+    response
+}
+
+fn toolbar_button(ui: &mut egui::Ui, name: &str, enabled: bool) -> egui::Response {
+    ui.scope(|ui| {
+        let idle = &mut ui.visuals_mut().widgets.inactive;
+        idle.weak_bg_fill = Color32::TRANSPARENT;
+        idle.bg_stroke = Stroke::NONE;
+        ui.add_enabled(enabled, compact_button(name))
+    })
+    .inner
 }
 
 fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
@@ -114,39 +203,50 @@ pub(crate) fn heading(ui: &mut egui::Ui, name: &str, count: Option<usize>) {
 }
 
 impl eframe::App for Desk {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        if self.is_capturing() {
+            input.events.push(egui::Event::PointerGone);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.events(ctx);
-        self.position_capture();
+        self.position_capture(ctx);
         self.background_status(ctx);
         self.prefetch(ctx);
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.refresh(ctx);
         }
+        let viewport = ctx.screen_rect().size();
+        let navigation_limit = (viewport.x * 0.27).clamp(221.0, 370.0);
+        let inspector_limit = (viewport.x * 0.33).clamp(240.0, 475.0);
+        let inspector_width = if viewport.x < 1080.0 { 240.0 } else { 278.0 };
+        let diff_height = (viewport.y * 0.30).clamp(165.0, 259.0);
         egui::TopBottomPanel::top("workbench")
-            .frame(panel(PANEL, 14, 8))
+            .frame(panel(CHROME, 14, 6))
             .show(ctx, |ui| self.toolbar(ui, ctx));
         egui::TopBottomPanel::bottom("status")
-            .frame(panel(PANEL, 12, 2))
+            .frame(panel(CHROME, 12, 2))
             .show(ctx, |ui| self.status_line(ui));
         egui::SidePanel::left("navigation")
             .resizable(true)
-            .default_width(221.0)
-            .width_range(184.0..=370.0)
+            .default_width(crate::timing::capture_sidebar().unwrap_or(221.0))
+            .width_range(184.0..=navigation_limit)
             .frame(panel(PANEL, 11, 9))
             .show(ctx, |ui| self.navigation(ui, ctx));
         egui::TopBottomPanel::bottom("diff-view")
             .resizable(true)
-            .default_height(259.0)
+            .default_height(diff_height)
             .height_range(135.0..=(ctx.screen_rect().height() * 0.57).max(135.0))
-            .frame(panel(BASE, 11, 8))
+            .frame(panel(PANEL, 11, 8))
             .show(ctx, |ui| {
                 ui.set_min_height(ui.available_height());
                 self.diff_panel(ui, ctx);
             });
         egui::SidePanel::right("commit-and-files")
             .resizable(true)
-            .default_width(278.0)
-            .width_range(220.0..=475.0)
+            .default_width(inspector_width)
+            .width_range(220.0..=inspector_limit)
             .frame(panel(PANEL, 11, 9))
             .show(ctx, |ui| self.inspector(ui, ctx));
         egui::CentralPanel::default()
@@ -174,9 +274,8 @@ impl Desk {
             .map(|history| history.branch.clone());
         let mut action = None;
         ui.horizontal(|ui| {
-            let (mark, _) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::hover());
-            ui.painter()
-                .rect_filled(mark, 7.0, Color32::from_rgb(31, 70, 69));
+            let (mark, _) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::hover());
+            ui.painter().rect_filled(mark, 5.0, SELECTION);
             let point = mark.center();
             for (a, b) in [
                 (point + Vec2::new(-5.0, -6.0), point + Vec2::new(-5.0, 6.0)),
@@ -187,24 +286,29 @@ impl Desk {
                 ui.painter().circle_filled(a, 2.0, ACCENT);
                 ui.painter().circle_filled(b, 2.0, ACCENT);
             }
-            ui.label(RichText::new("Refdesk").size(19.0).strong().color(INK));
+            ui.label(RichText::new("Refdesk").size(16.0).strong().color(INK));
             ui.separator();
             if let Some(root) = &active {
                 let label = root
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("仓库");
-                ui.add(egui::Label::new(RichText::new(label).strong().color(INK)).truncate())
+                let font = FontId::proportional(14.0);
+                let baseline = centered_baseline(ui.painter(), font.clone());
+                let name = fit_line(ui.painter(), label.into(), font, INK, 160.0);
+                toolbar_context_label(ui, name, baseline, INK)
                     .on_hover_text(root.display().to_string());
-            }
-            if let Some(branch) = branch {
-                ui.add(egui::Label::new(RichText::new(branch).color(ACCENT).size(12.0)).truncate());
+                if let Some(branch) = branch {
+                    let font = FontId::monospace(11.5);
+                    let label = fit_line(ui.painter(), branch.clone(), font, MUTE, 190.0);
+                    toolbar_context_label(ui, label, baseline, MUTE).on_hover_text(branch);
+                }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if small_button(ui, "Diff 工具").clicked() {
+                if ui.button(RichText::new("Diff 工具").size(12.0)).clicked() {
                     self.tools_open = true;
                 }
-                if small_button(ui, "刷新")
+                if toolbar_button(ui, "刷新", true)
                     .on_hover_text("刷新当前仓库（F5）")
                     .clicked()
                 {
@@ -216,10 +320,7 @@ impl Desk {
                     ("拉取", Operation::Pull),
                     ("获取", Operation::Fetch),
                 ] {
-                    if ui
-                        .add_enabled(can_run, egui::Button::new(RichText::new(title).size(12.0)))
-                        .clicked()
-                    {
+                    if toolbar_button(ui, title, can_run).clicked() {
                         action = Some((title, operation));
                     }
                 }
@@ -283,16 +384,15 @@ impl Desk {
                 .truncate(),
             )
             .on_hover_text(&self.status_message);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("Git · 本地工作区").color(FAINT).small());
-            });
         });
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut select = None;
         let mut forget = None;
-        let repo_h = (ui.available_height() * 0.38).clamp(102.0, 290.0);
+        let repo_limit = (ui.available_height() * 0.40).clamp(84.0, 290.0);
+        let repo_h =
+            (self.settings.repositories.len().max(2) as f32 * 40.0).clamp(84.0, repo_limit);
         ui.horizontal(|ui| {
             heading(ui, "仓库", Some(self.settings.repositories.len()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -371,24 +471,22 @@ impl Desk {
                         .map(|history| history.branch.as_str())
                         .unwrap_or("工作树");
                     let (rect, response) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
                     if active || response.hovered() {
                         ui.painter()
-                            .rect_filled(rect, 5.0, if active { HOVER } else { SHADE });
+                            .rect_filled(rect, 4.0, if active { SELECTION } else { HOVER });
+                    }
+                    if active {
+                        let y = (rect.top() + 7.0)..=(rect.bottom() - 7.0);
+                        ui.painter()
+                            .vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, ACCENT));
                     }
                     let symbol = Rect::from_min_size(
-                        rect.left_top() + Vec2::new(8.0 + indent, 9.0),
+                        rect.left_top() + Vec2::new(8.0 + indent, 7.0),
                         Vec2::splat(22.0),
                     );
-                    ui.painter().rect_filled(
-                        symbol,
-                        5.0,
-                        if active {
-                            Color32::from_rgb(45, 93, 90)
-                        } else {
-                            SHADE
-                        },
-                    );
+                    ui.painter()
+                        .rect_filled(symbol, 5.0, if active { SELECTION } else { SHADE });
                     ui.painter().text(
                         symbol.center(),
                         Align2::CENTER_CENTER,
@@ -401,9 +499,9 @@ impl Desk {
                         if active { ACCENT } else { MUTE },
                     );
                     let name_rect =
-                        Rect::from_min_max(rect.min, pos2(rect.right() - 4.0, rect.top() + 21.0));
+                        Rect::from_min_max(rect.min, pos2(rect.right() - 4.0, rect.top() + 19.0));
                     let detail_rect = Rect::from_min_max(
-                        pos2(rect.left(), rect.top() + 19.0),
+                        pos2(rect.left(), rect.top() + 17.0),
                         rect.max - Vec2::new(4.0, 1.0),
                     );
                     paint(

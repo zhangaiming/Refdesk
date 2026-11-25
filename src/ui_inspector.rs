@@ -1,6 +1,8 @@
 use crate::app::{Desk, Selection};
 use crate::git::{Area, Operation};
-use crate::ui::{ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, SHADE, heading, paint};
+use crate::ui::{
+    ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, SELECTION, SHADE, heading, paint,
+};
 use eframe::egui::{self, Align, FontId, Layout, RichText, Sense, Vec2};
 use std::path::Path;
 
@@ -146,6 +148,7 @@ impl Desk {
         let entries: Vec<_> = if worktree {
             [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)]
                 .into_iter()
+                .filter(|(_, area)| files.iter().any(|file| file.area == *area))
                 .flat_map(|(name, area)| {
                     std::iter::once((Some(name), None)).chain(
                         files
@@ -191,7 +194,7 @@ impl Desk {
                             ui.painter().rect_filled(
                                 rect,
                                 4.0,
-                                if is_selected { HOVER } else { SHADE },
+                                if is_selected { SELECTION } else { HOVER },
                             );
                         }
                         let color = match file.code {

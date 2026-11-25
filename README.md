@@ -26,7 +26,7 @@ Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。windows-gnu 工具�
     cargo fmt --check
     cargo clippy --locked --all-targets -- -D warnings
 
-发行构建在 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-tracking.exe，便于桌面版运行时重编译。需要新演示仓库时，安装 Python openpyxl 后执行 python scripts/make-demo.py。
+发行构建在 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。需要新演示仓库时，安装 Python openpyxl 后执行 python scripts/make-demo.py。
 
 ## 0.1 范围
 

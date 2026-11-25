@@ -61,9 +61,29 @@ impl Timings {
     }
 }
 
+pub(crate) fn capture_viewport() -> Option<[f32; 2]> {
+    std::env::var_os("REFDESK_CAPTURE")?;
+    let setting = std::env::var("REFDESK_CAPTURE_VIEWPORT").ok()?;
+    let (width, height) = setting.split_once('x')?;
+    let dimensions = [width.parse::<f32>().ok()?, height.parse::<f32>().ok()?];
+    ((930.0..=3000.0).contains(&dimensions[0]) && (610.0..=2000.0).contains(&dimensions[1]))
+        .then_some(dimensions)
+}
+
+pub(crate) fn capture_sidebar() -> Option<f32> {
+    std::env::var_os("REFDESK_CAPTURE")?;
+    std::env::var("REFDESK_CAPTURE_SIDEBAR")
+        .ok()?
+        .parse::<f32>()
+        .ok()
+        .filter(|width| (184.0..=221.0).contains(width))
+}
+
 pub(crate) struct FrameCapture {
     path: std::path::PathBuf,
     pub commit: Option<String>,
+    pub branch_query: Option<String>,
+    scale: Option<f32>,
     requested: bool,
 }
 
@@ -72,8 +92,21 @@ impl FrameCapture {
         Some(Self {
             path: std::env::var_os("REFDESK_CAPTURE")?.into(),
             commit: std::env::var("REFDESK_CAPTURE_COMMIT").ok(),
+            branch_query: std::env::var("REFDESK_CAPTURE_BRANCH").ok(),
+            scale: std::env::var("REFDESK_CAPTURE_SCALE")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|scale| (1.0..=2.5).contains(scale)),
             requested: false,
         })
+    }
+
+    pub fn adjust_scale(&mut self, ctx: &eframe::egui::Context) {
+        if let Some(native) = ctx.native_pixels_per_point()
+            && let Some(scale) = self.scale.take()
+        {
+            ctx.set_zoom_factor(scale / native);
+        }
     }
 
     pub fn queue(&mut self, ctx: &eframe::egui::Context) {

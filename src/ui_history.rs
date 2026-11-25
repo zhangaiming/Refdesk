@@ -1,16 +1,20 @@
 use crate::app::{Desk, Selection};
 use crate::git::{Commit, History, HistoryScope, Reference};
 use crate::graph::{GraphRow, Span};
-use crate::ui::{ACCENT, BASE, BORDER, FAINT, HOVER, INK, MUTE, ROW, SHADE, paint, small_button};
-use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2, text::LayoutJob,
+use crate::ui::{
+    ACCENT, BASE, CONTROL_HEIGHT, DETAIL_SIZE, DIVIDER, FAINT, HOVER, INK, MUTE, ROW, SELECTION,
+    SHADE, centered_baseline, filter_field, fit_line, paint_baseline, small_button,
 };
+use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
+
+const SUBJECT_SIZE: f32 = 14.0;
+const GRAPH_INSET: f32 = 9.0;
 
 const PALETTE: [Color32; 8] = [
-    Color32::from_rgb(85, 207, 169),
-    Color32::from_rgb(117, 153, 246),
-    Color32::from_rgb(227, 151, 89),
-    Color32::from_rgb(190, 130, 226),
+    ACCENT,
+    Color32::from_rgb(144, 178, 222),
+    Color32::from_rgb(226, 180, 131),
+    Color32::from_rgb(191, 148, 215),
     Color32::from_rgb(245, 196, 91),
     Color32::from_rgb(118, 201, 226),
     Color32::from_rgb(236, 132, 152),
@@ -51,7 +55,7 @@ impl Desk {
         let mut next = false;
         let mut previous = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("提交图").color(INK).size(17.0).strong());
+            ui.label(RichText::new("提交图").color(INK).size(16.0).strong());
             if let Some(tip) = &filter_tip {
                 clear_filter = small_button(ui, &filter_label).on_hover_text(tip).clicked();
             } else {
@@ -67,12 +71,17 @@ impl Desk {
                 {
                     head = true;
                 }
-                let edit = ui.add_sized(
-                    [166.0, 26.0],
-                    egui::TextEdit::singleline(&mut self.search)
-                        .id(id)
-                        .hint_text("筛选提交…  Ctrl+F"),
-                );
+                let edit = ui
+                    .add_sized(
+                        [
+                            (ui.available_width()
+                                - if self.search.is_empty() { 0.0 } else { 60.0 })
+                            .clamp(64.0, 176.0),
+                            CONTROL_HEIGHT,
+                        ],
+                        filter_field(&mut self.search, "筛选提交…").id(id),
+                    )
+                    .on_hover_text("筛选提交（Ctrl+F）");
                 if shortcut {
                     edit.request_focus();
                 }
@@ -152,8 +161,10 @@ impl Desk {
             search_row = Some(hits[next]);
             scroll_to = search_row;
         }
-        let graph_width = graph_width(ui.available_width(), state.graph.lanes);
-        table_header(ui, graph_width);
+        let width = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let graph_width = graph_width(width, state.graph.lanes);
+        table_header(ui, width, graph_width);
+        let baseline_offset = centered_baseline(ui.painter(), FontId::proportional(SUBJECT_SIZE));
         let has_more = state
             .history
             .as_ref()
@@ -182,12 +193,12 @@ impl Desk {
             }
             scroll.show_rows(ui, ROW, rows + 1, |ui, visible| {
                 for index in visible {
-                    let (rect, response) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::click());
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(width, ROW), Sense::click());
                     if index == 0 {
                         let selected = matches!(self.selection, Selection::Worktree);
-                        row_fill(ui, rect, selected, response.hovered(), false);
-                        let dot = pos2(rect.left() + 9.0, rect.center().y);
+                        row_fill(ui, rect, selected, &response, false);
+                        let dot = pos2(rect.left() + GRAPH_INSET, rect.center().y);
                         if head_index.is_some() {
                             worktree_link(ui, dot, pos2(dot.x, rect.bottom()));
                         }
@@ -196,14 +207,14 @@ impl Desk {
                             2.0,
                             ACCENT,
                         );
-                        paint(
-                            ui,
-                            rect,
-                            rect.left() + graph_width + 4.0,
-                            "工作树 / 暂存区",
-                            FontId::proportional(14.0),
+                        let columns = HistoryColumns::new(rect, graph_width);
+                        let baseline = rect.center().y + baseline_offset;
+                        let label = ui.painter().layout_no_wrap(
+                            "工作树 / 暂存区".into(),
+                            FontId::proportional(SUBJECT_SIZE),
                             INK,
                         );
+                        paint_baseline(ui.painter(), columns.subject.left(), baseline, label, INK);
                         let summary = if state.status_busy && !state.has_status {
                             "读取状态…".into()
                         } else if let Some(0) = working {
@@ -211,13 +222,22 @@ impl Desk {
                         } else {
                             format!("{} 条变更", working.unwrap_or_default())
                         };
-                        paint(
-                            ui,
-                            rect,
-                            rect.right() - 130.0,
-                            &summary,
-                            FontId::proportional(12.0),
+                        let status = ui.painter().layout_no_wrap(
+                            summary,
+                            FontId::proportional(DETAIL_SIZE),
                             MUTE,
+                        );
+                        paint_baseline(
+                            ui.painter(),
+                            rect.right() - HistoryColumns::END_INSET - status.size().x,
+                            baseline,
+                            status,
+                            MUTE,
+                        );
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.bottom(),
+                            Stroke::new(1.0_f32, DIVIDER),
                         );
                         if response.clicked() {
                             click = Some(Click::Worktree);
@@ -236,12 +256,12 @@ impl Desk {
                         Selection::Worktree => false,
                     };
                     let matched = hits.binary_search(&(index - 1)).is_ok();
-                    row_fill(ui, rect, selected, response.hovered(), matched);
+                    row_fill(ui, rect, selected, &response, matched);
                     if let Some(graph) = state.graph.rows.get(index - 1) {
                         if let Some(head) = head_index
                             && index <= head + 1
                         {
-                            let x = rect.left() + 9.0;
+                            let x = rect.left() + GRAPH_INSET;
                             let end = if index == head + 1 {
                                 pos2(
                                     lane_x(rect, graph_width, state.graph.lanes, graph.lane),
@@ -373,71 +393,97 @@ fn matches_search(commit: &Commit, history: &History, needle: &str) -> bool {
 }
 
 fn graph_width(width: f32, lanes: usize) -> f32 {
-    (31.0 + lanes as f32 * 13.0).clamp(53.0, (width * 0.38).max(53.0))
+    (35.0 + lanes.max(1) as f32 * 12.0).clamp(47.0, (width * 0.28).max(47.0))
 }
 
-fn table_header(ui: &mut egui::Ui, graph_width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, SHADE);
-    paint(
-        ui,
-        rect,
-        rect.left() + 10.0,
-        "DAG",
-        FontId::monospace(10.0),
-        MUTE,
-    );
-    paint(
-        ui,
-        rect,
-        rect.left() + graph_width + 4.0,
-        "提交消息",
-        FontId::proportional(12.0),
-        MUTE,
-    );
-    if rect.width() >= 630.0 {
-        for (offset, name) in [(238.0, "作者"), (115.0, "日期"), (65.0, "SHA")] {
-            paint(
-                ui,
-                rect,
-                rect.right() - offset,
-                name,
-                FontId::proportional(11.0),
-                MUTE,
-            );
+struct HistoryColumns {
+    subject: Rect,
+    author: Option<Rect>,
+    date: Option<Rect>,
+    sha: Option<Rect>,
+}
+
+impl HistoryColumns {
+    const END_INSET: f32 = 10.0;
+
+    fn new(rect: Rect, graph_width: f32) -> Self {
+        let mut right = rect.right() - Self::END_INSET;
+        let mut column = |width| {
+            let bounds = Rect::from_x_y_ranges((right - width)..=right, rect.y_range());
+            right -= width + 14.0;
+            bounds
+        };
+        let sha = (rect.width() >= 465.0).then(|| column(72.0));
+        let date = (rect.width() >= 550.0).then(|| column(42.0));
+        let author = (rect.width() >= 660.0).then(|| column(102.0));
+        let left = rect.left() + graph_width + 4.0;
+        let subject = Rect::from_x_y_ranges(left..=right.max(left), rect.y_range());
+        Self {
+            subject,
+            author,
+            date,
+            sha,
         }
-    } else if rect.width() >= 420.0 {
-        paint(
-            ui,
-            rect,
-            rect.right() - 65.0,
-            "SHA",
-            FontId::proportional(11.0),
-            MUTE,
+    }
+}
+
+fn table_header(ui: &mut egui::Ui, width: f32, graph_width: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW), Sense::hover());
+    let columns = HistoryColumns::new(rect, graph_width);
+    let painter = ui.painter();
+    let font = FontId::proportional(DETAIL_SIZE);
+    let baseline = rect.center().y + centered_baseline(painter, font.clone());
+    painter.rect_filled(rect, 3.0, SHADE);
+    let graph = Rect::from_min_max(pos2(rect.left() + GRAPH_INSET, rect.top()), rect.max);
+    for (column, label, align, color) in [
+        (Some(graph), "图", Align::Min, MUTE),
+        (Some(columns.subject), "提交消息", Align::Min, INK),
+        (columns.author, "作者", Align::Min, MUTE),
+        (columns.date, "日期", Align::Max, MUTE),
+        (columns.sha, "SHA", Align::Max, MUTE),
+    ] {
+        if let Some(column) = column {
+            let galley = painter.layout_no_wrap(label.into(), font.clone(), color);
+            let x = align
+                .align_size_within_range(galley.size().x, column.x_range())
+                .min;
+            paint_baseline(painter, x, baseline, galley, color);
+        }
+    }
+}
+
+fn row_fill(ui: &egui::Ui, rect: Rect, selected: bool, response: &egui::Response, matched: bool) {
+    let painter = ui.painter();
+    if selected || response.hovered() || matched {
+        let fill = if selected {
+            SELECTION
+        } else if response.hovered() {
+            HOVER
+        } else {
+            SHADE
+        };
+        painter.rect_filled(rect, 3.0, fill);
+    }
+    if selected {
+        let y = (rect.top() + 3.0)..=(rect.bottom() - 3.0);
+        painter.vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, ACCENT));
+    }
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            3.0,
+            Stroke::new(1.0_f32, ACCENT),
+            egui::StrokeKind::Inside,
         );
     }
 }
 
-fn row_fill(ui: &egui::Ui, rect: Rect, selected: bool, hovered: bool, matched: bool) {
-    if selected || hovered || matched {
-        let color = if selected {
-            HOVER
-        } else if hovered {
-            SHADE
-        } else {
-            Color32::from_rgb(37, 53, 57)
-        };
-        ui.painter().rect_filled(rect, 3.0, color);
-    }
-    if selected {
-        ui.painter()
-            .vline(rect.left(), rect.y_range(), Stroke::new(2.0_f32, ACCENT));
-    }
+fn lane_gap(width: f32, lanes: usize) -> f32 {
+    ((width - 28.0) / lanes.max(1) as f32).min(12.0)
 }
 
 fn lane_x(rect: Rect, width: f32, lanes: usize, lane: usize) -> f32 {
-    let gap = ((width - 34.0) / lanes.max(1) as f32).clamp(2.0, 13.0);
-    rect.left() + 23.0 + lane as f32 * gap
+    rect.left() + 21.0 + lane as f32 * lane_gap(width, lanes)
 }
 
 fn worktree_link(ui: &egui::Ui, a: egui::Pos2, b: egui::Pos2) {
@@ -465,24 +511,24 @@ fn draw_rails(
     merge: bool,
     head: bool,
 ) {
+    let gap = lane_gap(width, lanes);
     let x = |lane: usize| lane_x(rect, width, lanes, lane);
     let y = |span: Span| match span {
         Span::Top => rect.top(),
         Span::Middle => rect.center().y,
         Span::Bottom => rect.bottom(),
     };
-    let painter = ui
-        .painter()
-        .with_clip_rect(rect.intersect(Rect::from_min_max(
-            rect.min,
-            pos2(rect.left() + width, rect.bottom()),
-        )));
+    let painter = ui.painter().with_clip_rect(Rect::from_x_y_ranges(
+        rect.left()..=(rect.left() + width),
+        ui.clip_rect().y_range(),
+    ));
+    let stroke_width = (gap * 0.4).clamp(0.75, 1.6);
     for rail in &graph.rails {
         let a = pos2(x(rail.from), y(rail.start));
         let b = pos2(x(rail.to), y(rail.end));
         let color = PALETTE[rail.color % PALETTE.len()].gamma_multiply(0.94);
         if rail.from == rail.to {
-            painter.line_segment([a, b], Stroke::new(1.75_f32, color));
+            painter.line_segment([a, b], Stroke::new(stroke_width, color));
         } else {
             let bend = (b.y - a.y) * 0.48;
             painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
@@ -494,17 +540,18 @@ fn draw_rails(
                 ],
                 false,
                 Color32::TRANSPARENT,
-                Stroke::new(1.75_f32, color),
+                Stroke::new(stroke_width, color),
             ));
         }
     }
     let point = pos2(x(graph.lane), rect.center().y);
+    let radius = (gap * 0.36).clamp(1.15, 3.25);
     let color = PALETTE[graph.color % PALETTE.len()];
     if head {
         painter.circle_stroke(point, 6.0, Stroke::new(1.2_f32, ACCENT));
     }
     if merge {
-        let t = 4.3;
+        let t = radius + 1.0;
         painter.add(egui::Shape::convex_polygon(
             vec![
                 point + Vec2::new(0.0, -t),
@@ -516,7 +563,7 @@ fn draw_rails(
             Stroke::NONE,
         ));
     } else {
-        let radius = if head { 3.6 } else { 3.2 };
+        let radius = if head { 3.6 } else { radius };
         painter.circle_filled(point, radius, BASE);
         painter.circle_stroke(point, radius, Stroke::new(1.55_f32, color));
     }
@@ -576,110 +623,134 @@ fn draw_commit(
     dim: bool,
     lane_color: Option<Color32>,
 ) {
-    let mut text_x = rect.left() + graph_width + 4.0;
-    let subject_end = if rect.width() >= 630.0 {
-        rect.right() - 249.0
-    } else if rect.width() >= 420.0 {
-        rect.right() - 75.0
-    } else {
-        rect.right() - 5.0
-    };
-    let badge_limit = (text_x + 285.0).min(subject_end - 95.0);
-    let text_clip = Rect::from_min_max(
-        pos2(text_x, rect.top()),
-        pos2(subject_end.max(text_x), rect.bottom()),
-    );
+    let columns = HistoryColumns::new(rect, graph_width);
     let painter = ui
         .painter()
-        .with_clip_rect(text_clip.intersect(ui.clip_rect()));
+        .with_clip_rect(columns.subject.intersect(ui.clip_rect()));
     let head = history.head.as_ref() == Some(&commit.id);
     let branches = graph_references_at(history, &commit.id);
     let badges = head
-        .then(|| ("HEAD".to_owned(), String::new(), ACCENT))
+        .then(|| ("HEAD".to_owned(), None, String::new(), ACCENT))
         .into_iter()
         .chain(branches.into_iter().take(3).map(|branch| {
             let (label, counts) = graph_label(branch);
+            let compact = branch
+                .upstream
+                .as_ref()
+                .and_then(|upstream| upstream.same_branch_remote(branch))
+                .zip(branch.label().rsplit_once('/'))
+                .map(|(remote, (_, leaf))| format!("{remote} · {leaf}"));
             let color = if branch.name.starts_with("refs/tags/") {
                 PALETTE[2]
             } else {
                 lane_color.unwrap_or(MUTE)
             };
-            (label, counts, color)
+            (label, compact, counts, color)
         }));
-    let font = FontId::proportional(11.0);
-    for (label, counts, color) in badges {
-        let suffix =
-            (!counts.is_empty()).then(|| painter.layout_no_wrap(counts, font.clone(), color));
-        let suffix_width = suffix.as_ref().map_or(0.0, |galley| galley.size().x + 6.0);
-        let label_width = ((badge_limit - text_x - 10.0) - suffix_width).min(210.0);
-        if label_width < 22.0 {
+    let font = FontId::proportional(DETAIL_SIZE);
+    // The subject starts at a fixed column on every row. Ref labels use only
+    // the space they need at its trailing edge, leaving room for the message.
+    let subject_width = columns.subject.width();
+    let label_fraction = if subject_width < 340.0 { 0.47 } else { 0.52 };
+    let remaining = (subject_width * label_fraction).min(300.0);
+    let badge_inset = 5.0;
+    let badge_gap = 4.0;
+    let suffix_gap = 5.0;
+    let mut used = 0.0;
+    let mut labels = Vec::new();
+    for (label, compact, counts, color) in badges {
+        let suffix = (!counts.is_empty())
+            .then(|| painter.layout_no_wrap(counts, FontId::monospace(DETAIL_SIZE), color));
+        let suffix_width = suffix
+            .as_ref()
+            .map_or(0.0, |galley| galley.size().x + suffix_gap);
+        let gap = if labels.is_empty() { 0.0 } else { badge_gap };
+        let width = (remaining - used - gap - 2.0 * badge_inset - suffix_width).min(210.0);
+        if width < 22.0 {
             break;
         }
-        let mut job = LayoutJob::simple_singleline(label, font.clone(), color);
-        job.wrap.max_width = label_width;
-        job.wrap.max_rows = 1;
-        job.wrap.break_anywhere = true;
-        let galley = painter.layout_job(job);
-        let width = galley.size().x;
-        let badge = Rect::from_min_size(
-            pos2(text_x, rect.center().y - 8.5),
-            Vec2::new(width + suffix_width + 10.0, 17.0),
-        );
-        painter.rect_filled(badge, 4.0, color.gamma_multiply(0.13));
-        let label_pos = pos2(badge.left() + 5.0, badge.center().y - galley.size().y / 2.0);
-        painter.galley(label_pos, galley, color);
-        if let Some(suffix) = suffix {
-            let pos = pos2(
-                label_pos.x + width + 6.0,
-                badge.center().y - suffix.size().y / 2.0,
-            );
-            painter.galley(pos, suffix, color);
+        let mut label = fit_line(&painter, label, font.clone(), color, width);
+        if label.elided
+            && let Some(compact) = compact
+        {
+            let shorter = fit_line(&painter, compact, font.clone(), color, width);
+            if !shorter.elided {
+                label = shorter;
+            }
         }
-        text_x = badge.right() + 5.0;
+        let badge_width = label.size().x + suffix_width + 2.0 * badge_inset;
+        used += gap + badge_width;
+        labels.push((label, suffix, badge_width, color));
     }
-    painter.text(
-        pos2(text_x, rect.center().y),
-        Align2::LEFT_CENTER,
-        &commit.subject,
-        FontId::proportional(14.0),
-        if dim { FAINT } else { INK },
+
+    let subject_color = if dim { FAINT } else { INK };
+    let subject = fit_line(
+        &painter,
+        commit.subject.clone(),
+        FontId::proportional(SUBJECT_SIZE),
+        subject_color,
+        columns.subject.width() - used - 5.0,
     );
-    if rect.width() >= 630.0 {
-        let author = Rect::from_min_max(
-            pos2(rect.right() - 238.0, rect.top()),
-            pos2(rect.right() - 123.0, rect.bottom()),
+    let y = rect.center().y;
+    let baseline = y + centered_baseline(&painter, FontId::proportional(SUBJECT_SIZE));
+    paint_baseline(
+        &painter,
+        columns.subject.left(),
+        baseline,
+        subject,
+        subject_color,
+    );
+    let mut x = columns.subject.right() - used;
+    for (label, suffix, width, color) in labels {
+        let badge = Rect::from_min_size(pos2(x, y - 8.5), Vec2::new(width, 17.0));
+        painter.rect_filled(badge, 3.0, color.gamma_multiply(0.11));
+        painter.rect_stroke(
+            badge,
+            3.0,
+            Stroke::new(0.7_f32, color.gamma_multiply(0.42)),
+            egui::StrokeKind::Inside,
         );
-        paint(
-            ui,
-            author,
-            author.left(),
-            &commit.author,
-            FontId::proportional(12.0),
-            MUTE,
-        );
-        paint(
-            ui,
-            rect,
-            rect.right() - 115.0,
-            commit.date.get(5..).unwrap_or(&commit.date),
-            FontId::proportional(11.0),
-            MUTE,
-        );
+        let label_x = x + badge_inset;
+        let suffix_x = label_x + label.size().x + suffix_gap;
+        paint_baseline(&painter, label_x, baseline, label, color);
+        if let Some(suffix) = suffix {
+            paint_baseline(&painter, suffix_x, baseline, suffix, color);
+        }
+        x += width + badge_gap;
     }
-    if rect.width() >= 420.0 {
-        paint(
-            ui,
-            rect,
-            rect.right() - 70.0,
-            &commit.short,
-            FontId::monospace(10.5),
-            FAINT,
+
+    if let Some(author) = columns.author {
+        let name = fit_line(
+            ui.painter(),
+            commit.author.clone(),
+            FontId::proportional(DETAIL_SIZE),
+            MUTE,
+            author.width(),
         );
+        paint_baseline(ui.painter(), author.left(), baseline, name, MUTE);
+    }
+    for (column, value) in [
+        (columns.date, commit.date.get(5..).unwrap_or(&commit.date)),
+        (columns.sha, commit.short.as_str()),
+    ] {
+        if let Some(column) = column {
+            let painter = ui
+                .painter()
+                .with_clip_rect(column.intersect(ui.clip_rect()));
+            let value = painter.layout_no_wrap(value.into(), FontId::monospace(DETAIL_SIZE), FAINT);
+            paint_baseline(
+                &painter,
+                column.right() - value.size().x,
+                baseline,
+                value,
+                FAINT,
+            );
+        }
     }
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
-        Stroke::new(0.4_f32, BORDER.gamma_multiply(0.55)),
+        Stroke::new(0.75_f32, DIVIDER),
     );
 }
 

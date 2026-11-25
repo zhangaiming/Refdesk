@@ -1,7 +1,9 @@
 @echo off
 setlocal
 set "REFDESK_CONFIG=%~dp0.local\settings.json"
-set "REFDESK_EXE=%~dp0artifacts\refdesk-tracking.exe"
+set "REFDESK_EXE=%~dp0artifacts\refdesk-current.exe"
+if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk-polish.exe"
+if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk-tracking.exe"
 if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk-branches.exe"
 if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0artifacts\refdesk.exe"
 if not exist "%REFDESK_EXE%" set "REFDESK_EXE=%~dp0target\release\refdesk.exe"

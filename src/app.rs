@@ -690,7 +690,17 @@ impl Desk {
         }
     }
 
-    pub fn position_capture(&mut self) {
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.frame_capture.is_some()
+    }
+
+    pub fn position_capture(&mut self, ctx: &egui::Context) {
+        if let Some(capture) = &mut self.frame_capture {
+            capture.adjust_scale(ctx);
+            if let Some(query) = capture.branch_query.take() {
+                self.branch_query = query;
+            }
+        }
         let Some(target) = self
             .frame_capture
             .as_mut()

@@ -37,7 +37,7 @@ fn main() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 850.0])
+            .with_inner_size(timing::capture_viewport().unwrap_or([1480.0, 850.0]))
             .with_position([56.0, 62.0])
             .with_min_inner_size([930.0, 610.0]),
         renderer: eframe::Renderer::Glow,
