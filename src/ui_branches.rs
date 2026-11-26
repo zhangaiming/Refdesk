@@ -420,8 +420,14 @@ impl Desk {
                     spacing.item_spacing = Vec2::new(6.0, 3.0);
                     spacing.button_padding.y = 2.0;
                     let mut head = selection.contains("HEAD");
+                    let label = format!("HEAD · {}", history.branch);
                     if ui
-                        .checkbox(&mut head, format!("HEAD · {}", history.branch))
+                        .scope(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            ui.checkbox(&mut head, &label)
+                        })
+                        .inner
+                        .on_hover_text(label)
                         .changed()
                     {
                         view.toggle("HEAD");

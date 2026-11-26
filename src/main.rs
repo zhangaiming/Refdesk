@@ -15,6 +15,8 @@ mod ui_dialogs;
 mod ui_diff;
 mod ui_history;
 mod ui_inspector;
+#[cfg(windows)]
+mod window_chrome;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -51,12 +53,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |context| {
             ui::install_theme(&context.egui_ctx);
-            Ok(Box::new(app::Desk::new(
-                &context.egui_ctx,
-                paths,
-                import,
-                started,
-            )))
+            Ok(Box::new(app::Desk::new(context, paths, import, started)))
         }),
     ) {
         let _ = rfd::MessageDialog::new()

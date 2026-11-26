@@ -1878,12 +1878,14 @@ dependencies = [
  "embed-resource",
  "globset",
  "png",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "serde_yaml",
  "similar",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

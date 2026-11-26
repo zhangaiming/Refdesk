@@ -74,6 +74,8 @@ pub(crate) enum Dialog {
 }
 
 pub(crate) struct Desk {
+    #[cfg(windows)]
+    pub window_chrome: Option<crate::window_chrome::WindowChrome>,
     pub settings: Settings,
     pub active: Option<PathBuf>,
     pub repos: HashMap<PathBuf, Repository>,
@@ -122,11 +124,12 @@ fn readable<T>(result: Result<T>) -> Outcome<T> {
 
 impl Desk {
     pub fn new(
-        ctx: &egui::Context,
+        creation: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
         import_tools: bool,
         started: Instant,
     ) -> Self {
+        let ctx = &creation.egui_ctx;
         let (tasks, work) = unbounded::<Task>();
         let (events, inbox) = unbounded();
         for index in 0..4 {
@@ -184,6 +187,8 @@ impl Desk {
         });
         let status_is_error = warning.is_some();
         let mut desk = Self {
+            #[cfg(windows)]
+            window_chrome: crate::window_chrome::WindowChrome::install(creation),
             settings,
             active: None,
             repos: HashMap::new(),

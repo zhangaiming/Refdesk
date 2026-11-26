@@ -2,7 +2,7 @@ use crate::app::{Desk, Dialog};
 use crate::git::Operation;
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Galley, Layout, Margin, Painter, Rect, RichText,
-    Sense, Stroke, Vec2, pos2, text::LayoutJob,
+    Sense, Stroke, UiBuilder, Vec2, pos2, text::LayoutJob,
 };
 use std::path::PathBuf;
 
@@ -24,6 +24,22 @@ pub(crate) const GOLD: Color32 = Color32::from_rgb(229, 183, 128);
 pub(crate) const ROW: f32 = 25.0;
 pub(crate) const DETAIL_SIZE: f32 = 12.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
+const TOOLBAR_HEIGHT: f32 = 40.0;
+const TITLE_HEIGHT: f32 = 34.0;
+const TITLE_BUTTON_HEIGHT: f32 = 24.0;
+const WINDOW_BUTTON_WIDTH: f32 = 46.0;
+
+pub(crate) struct WindowButtons {
+    pub maximized: bool,
+    pub maximize_hovered: bool,
+    pub maximize_pressed: bool,
+}
+
+pub(crate) struct ToolbarRegions {
+    pub drag: Rect,
+    pub controls: [Rect; 3],
+    pub maximize: Option<Rect>,
+}
 
 pub fn install_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -157,25 +173,19 @@ pub(crate) fn filter_field<'a>(value: &'a mut String, hint: &str) -> egui::TextE
         .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
 }
 
-fn toolbar_context_label(
-    ui: &mut egui::Ui,
-    galley: std::sync::Arc<Galley>,
-    baseline_offset: f32,
-    color: Color32,
-) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(galley.size().x, CONTROL_HEIGHT), Sense::hover());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
-    });
-    paint_baseline(
-        ui.painter(),
-        rect.left(),
-        rect.center().y + baseline_offset,
-        galley,
-        color,
-    );
-    response
+fn toolbar_mark(ui: &mut egui::Ui) {
+    let (mark, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+    ui.painter().rect_filled(mark, 4.0, SELECTION);
+    let point = mark.center();
+    for (a, b) in [
+        (point + Vec2::new(-4.0, -5.0), point + Vec2::new(-4.0, 5.0)),
+        (point + Vec2::new(-4.0, 2.0), point + Vec2::new(4.0, -4.0)),
+    ] {
+        ui.painter()
+            .line_segment([a, b], Stroke::new(1.5_f32, ACCENT));
+        ui.painter().circle_filled(a, 1.7, ACCENT);
+        ui.painter().circle_filled(b, 1.7, ACCENT);
+    }
 }
 
 fn toolbar_button(ui: &mut egui::Ui, name: &str, enabled: bool) -> egui::Response {
@@ -183,9 +193,113 @@ fn toolbar_button(ui: &mut egui::Ui, name: &str, enabled: bool) -> egui::Respons
         let idle = &mut ui.visuals_mut().widgets.inactive;
         idle.weak_bg_fill = Color32::TRANSPARENT;
         idle.bg_stroke = Stroke::NONE;
-        ui.add_enabled(enabled, compact_button(name))
+        ui.add_enabled(enabled, title_button(name))
     })
     .inner
+}
+
+fn title_button(text: &str) -> egui::Button<'_> {
+    compact_button(text).min_size(Vec2::new(25.0, TITLE_BUTTON_HEIGHT))
+}
+
+fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused: bool) -> Rect {
+    use egui::{ViewportCommand, WidgetInfo, WidgetType};
+
+    let maximize_label = if buttons.maximized {
+        "还原"
+    } else {
+        "最大化"
+    };
+    let items = [
+        ("最小化", ViewportCommand::Minimized(true)),
+        (
+            maximize_label,
+            ViewportCommand::Maximized(!buttons.maximized),
+        ),
+        ("关闭", ViewportCommand::Close),
+    ];
+    let mut maximize_rect = Rect::NOTHING;
+    for (index, (label, command)) in items.into_iter().enumerate() {
+        let rect = Rect::from_min_size(
+            pos2(area.left() + index as f32 * WINDOW_BUTTON_WIDTH, area.top()),
+            Vec2::new(WINDOW_BUTTON_WIDTH, area.height()),
+        );
+        if index == 1 {
+            maximize_rect = rect;
+        }
+        let response = ui.interact(
+            rect,
+            ui.id().with(("window-controls", index)),
+            Sense::click(),
+        );
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+        if response.clicked() {
+            ui.ctx().send_viewport_cmd(command);
+        }
+        let pressed =
+            response.is_pointer_button_down_on() || (index == 1 && buttons.maximize_pressed);
+        let hovered = response.hovered() || (index == 1 && buttons.maximize_hovered);
+        let close = index == 2;
+        let painter = ui.painter();
+        if hovered || pressed {
+            let fill = match (close, pressed) {
+                (true, true) => Color32::from_rgb(170, 35, 24),
+                (true, false) => Color32::from_rgb(196, 43, 28),
+                (false, true) => SELECTION,
+                (false, false) => HOVER,
+            };
+            painter.rect_filled(rect, 0.0, fill);
+        }
+        if response.has_focus() {
+            painter.rect_stroke(
+                rect.shrink(2.0),
+                2.0,
+                Stroke::new(1.0_f32, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let ink = if close && (hovered || pressed) {
+            Color32::WHITE
+        } else if focused || hovered {
+            INK
+        } else {
+            MUTE
+        };
+        let stroke = Stroke::new(1.0_f32, ink);
+        let center = rect.center();
+        let glyph = Rect::from_center_size(center, Vec2::splat(10.0));
+        match index {
+            0 => {
+                painter.hline(glyph.x_range(), center.y, stroke);
+            }
+            1 if buttons.maximized => {
+                let front = Rect::from_center_size(center + Vec2::new(-1.0, 1.0), Vec2::splat(8.0));
+                let back = front.translate(Vec2::new(2.0, -2.0));
+                painter.add(egui::Shape::line(
+                    vec![
+                        pos2(back.left(), front.top()),
+                        back.left_top(),
+                        back.right_top(),
+                        back.right_bottom(),
+                        pos2(front.right(), back.bottom()),
+                    ],
+                    stroke,
+                ));
+                painter.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
+            }
+            1 => {
+                painter.rect_stroke(glyph, 0.0, stroke, egui::StrokeKind::Inside);
+            }
+            _ => {
+                painter.line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
+                painter.line_segment([glyph.left_bottom(), glyph.right_top()], stroke);
+            }
+        }
+        if index != 1 {
+            response.on_hover_text(label);
+        }
+    }
+    maximize_rect
 }
 
 fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
@@ -203,6 +317,10 @@ pub(crate) fn heading(ui: &mut egui::Ui, name: &str, count: Option<usize>) {
 }
 
 impl eframe::App for Desk {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        BASE.to_normalized_gamma_f32()
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
         if self.is_capturing() {
             input.events.push(egui::Event::PointerGone);
@@ -222,9 +340,26 @@ impl eframe::App for Desk {
         let inspector_limit = (viewport.x * 0.33).clamp(240.0, 475.0);
         let inspector_width = if viewport.x < 1080.0 { 240.0 } else { 278.0 };
         let diff_height = (viewport.y * 0.30).clamp(165.0, 259.0);
-        egui::TopBottomPanel::top("workbench")
-            .frame(panel(CHROME, 14, 6))
-            .show(ctx, |ui| self.toolbar(ui, ctx));
+        #[cfg(windows)]
+        let caption = self.window_chrome.as_ref().map(|chrome| chrome.buttons());
+        #[cfg(not(windows))]
+        let caption: Option<WindowButtons> = None;
+        let toolbar_height = if caption.is_some() {
+            TITLE_HEIGHT
+        } else {
+            TOOLBAR_HEIGHT
+        };
+        let toolbar = egui::TopBottomPanel::top("workbench")
+            .exact_height(toolbar_height)
+            .show_separator_line(false)
+            .frame(Frame::new())
+            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption));
+        #[cfg(windows)]
+        if let Some(chrome) = &self.window_chrome {
+            chrome.set_toolbar_regions(toolbar.inner, ctx.pixels_per_point());
+        }
+        #[cfg(not(windows))]
+        let _ = toolbar;
         egui::TopBottomPanel::bottom("status")
             .frame(panel(CHROME, 12, 2))
             .show(ctx, |ui| self.status_line(ui));
@@ -262,70 +397,83 @@ impl eframe::App for Desk {
 }
 
 impl Desk {
-    fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        height: f32,
+        caption: Option<WindowButtons>,
+    ) -> ToolbarRegions {
         let active = self.active.clone();
         let can_run = active
             .as_ref()
             .is_some_and(|root| !self.operations.contains(root))
             && self.state().is_some_and(|state| state.history.is_some());
-        let branch = self
-            .state()
-            .and_then(|state| state.history.as_ref())
-            .map(|history| history.branch.clone());
+        let spacing = ui.spacing_mut();
+        spacing.interact_size.y = TITLE_BUTTON_HEIGHT;
+        spacing.button_padding.y = 2.0;
+        let (row, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        ui.painter().rect_filled(row, 0.0, CHROME);
+
+        let start = row.left() + 14.0;
+        let caption_x = row.right()
+            - if caption.is_some() {
+                WINDOW_BUTTON_WIDTH * 3.0
+            } else {
+                0.0
+            };
+        let end = caption_x - if caption.is_some() { 8.0 } else { 14.0 };
+        let control_half_height = TITLE_BUTTON_HEIGHT / 2.0;
+        let center_y = row.center().y;
+        let content = Rect::from_min_max(
+            pos2(start, center_y - control_half_height),
+            pos2(end, center_y + control_half_height),
+        );
+        let mut actions = ui.new_child(
+            UiBuilder::new()
+                .id_salt("toolbar-actions")
+                .max_rect(content)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        actions.spacing_mut().item_spacing.x = 4.0;
+        toolbar_mark(&mut actions);
+        actions.add_space(8.0);
         let mut action = None;
-        ui.horizontal(|ui| {
-            let (mark, _) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::hover());
-            ui.painter().rect_filled(mark, 5.0, SELECTION);
-            let point = mark.center();
-            for (a, b) in [
-                (point + Vec2::new(-5.0, -6.0), point + Vec2::new(-5.0, 6.0)),
-                (point + Vec2::new(-5.0, 2.0), point + Vec2::new(5.0, -5.0)),
-            ] {
-                ui.painter()
-                    .line_segment([a, b], Stroke::new(1.6_f32, ACCENT));
-                ui.painter().circle_filled(a, 2.0, ACCENT);
-                ui.painter().circle_filled(b, 2.0, ACCENT);
+        for (title, operation) in [
+            ("获取", Operation::Fetch),
+            ("拉取", Operation::Pull),
+            ("推送", Operation::Push),
+        ] {
+            if toolbar_button(&mut actions, title, can_run).clicked() {
+                action = Some((title, operation));
             }
-            ui.label(RichText::new("Refdesk").size(16.0).strong().color(INK));
-            ui.separator();
-            if let Some(root) = &active {
-                let label = root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("仓库");
-                let font = FontId::proportional(14.0);
-                let baseline = centered_baseline(ui.painter(), font.clone());
-                let name = fit_line(ui.painter(), label.into(), font, INK, 160.0);
-                toolbar_context_label(ui, name, baseline, INK)
-                    .on_hover_text(root.display().to_string());
-                if let Some(branch) = branch {
-                    let font = FontId::monospace(11.5);
-                    let label = fit_line(ui.painter(), branch.clone(), font, MUTE, 190.0);
-                    toolbar_context_label(ui, label, baseline, MUTE).on_hover_text(branch);
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button(RichText::new("Diff 工具").size(12.0)).clicked() {
-                    self.tools_open = true;
-                }
-                if toolbar_button(ui, "刷新", true)
-                    .on_hover_text("刷新当前仓库（F5）")
-                    .clicked()
-                {
-                    self.refresh(ctx);
-                }
-                ui.separator();
-                for (title, operation) in [
-                    ("推送", Operation::Push),
-                    ("拉取", Operation::Pull),
-                    ("获取", Operation::Fetch),
-                ] {
-                    if toolbar_button(ui, title, can_run).clicked() {
-                        action = Some((title, operation));
-                    }
-                }
-            });
-        });
+        }
+        if toolbar_button(&mut actions, "刷新", true)
+            .on_hover_text("刷新当前仓库（F5）")
+            .clicked()
+        {
+            self.refresh(ctx);
+        }
+
+        let mut tools = ui.new_child(
+            UiBuilder::new()
+                .id_salt("toolbar-tools")
+                .max_rect(content)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        let diff_tools = tools.add(title_button("Diff 工具"));
+        if diff_tools.clicked() {
+            self.tools_open = true;
+        }
+        let caption_area = Rect::from_min_max(pos2(caption_x, row.top()), row.max);
+        let maximize =
+            caption.map(|buttons| window_buttons(ui, caption_area, buttons, self.focused));
+        ui.painter().hline(
+            row.x_range(),
+            row.bottom() - 0.5,
+            Stroke::new(1.0_f32, BORDER),
+        );
         if let (Some(root), Some((title, operation))) = (active, action) {
             match operation {
                 Operation::Fetch => self.operate(ctx, root, operation),
@@ -347,6 +495,15 @@ impl Desk {
                 }
                 _ => {}
             }
+        }
+        let action_bounds = actions.min_rect();
+        ToolbarRegions {
+            drag: Rect::from_min_max(
+                pos2(action_bounds.right() + 8.0, row.top()),
+                pos2(diff_tools.rect.left() - 8.0, row.bottom() - 1.0),
+            ),
+            controls: [action_bounds, diff_tools.rect, caption_area],
+            maximize,
         }
     }
 
