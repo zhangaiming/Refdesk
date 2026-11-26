@@ -5,7 +5,7 @@ use crate::history::{SearchDirection, matches_search};
 use crate::theme;
 use crate::ui::{
     CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, galley_baseline,
-    paint_baseline, small_button,
+    heading, paint_baseline, small_button,
 };
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
@@ -45,13 +45,11 @@ impl Desk {
         let mut head = false;
         let mut next = false;
         let mut previous = false;
+        ui.horizontal_wrapped(|ui| {
+            heading(ui, "提交图", None);
+            self.repository_toolbar(ui, ctx);
+        });
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("提交图")
-                    .color(colors.text)
-                    .size(16.0)
-                    .strong(),
-            );
             if let Some(tip) = &filter_tip {
                 clear_filter = small_button(ui, &filter_label).on_hover_text(tip).clicked();
             } else {

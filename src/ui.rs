@@ -13,6 +13,7 @@ pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
 const TOOLBAR_HEIGHT: f32 = 40.0;
 const TITLE_HEIGHT: f32 = 34.0;
 const TITLE_BUTTON_HEIGHT: f32 = 24.0;
+const TITLE_BUTTON_MIN_WIDTH: f32 = 25.0;
 const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 const SPLITTER_HEIGHT: f32 = 8.0;
 
@@ -209,18 +210,8 @@ fn toolbar_mark(ui: &mut egui::Ui) {
     }
 }
 
-fn toolbar_button(ui: &mut egui::Ui, name: &str, enabled: bool) -> egui::Response {
-    ui.scope(|ui| {
-        let idle = &mut ui.visuals_mut().widgets.inactive;
-        idle.weak_bg_fill = Color32::TRANSPARENT;
-        idle.bg_stroke = Stroke::NONE;
-        ui.add_enabled(enabled, title_button(name))
-    })
-    .inner
-}
-
 fn title_button(text: &str) -> egui::Button<'_> {
-    compact_button(text).min_size(Vec2::new(25.0, TITLE_BUTTON_HEIGHT))
+    compact_button(text).min_size(Vec2::new(TITLE_BUTTON_MIN_WIDTH, TITLE_BUTTON_HEIGHT))
 }
 
 enum AppearanceAction {
@@ -476,23 +467,23 @@ impl eframe::App for Desk {
         let caption = self.window_chrome.as_ref().map(|chrome| chrome.buttons());
         #[cfg(not(windows))]
         let caption: Option<WindowButtons> = None;
-        let toolbar_height = if caption.is_some() {
+        let title_height = if caption.is_some() {
             TITLE_HEIGHT
         } else {
             TOOLBAR_HEIGHT
         };
         let title = egui::TopBottomPanel::top("workbench")
-            .exact_height(toolbar_height)
+            .exact_height(title_height)
             .show_separator_line(false)
             .frame(Frame::new())
-            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption));
-        let (toolbar, next_theme) = title.inner;
+            .show(ctx, |ui| self.title_bar(ui, title_height, caption));
+        let (title_regions, next_theme) = title.inner;
         #[cfg(windows)]
         if let Some(chrome) = &self.window_chrome {
-            chrome.set_toolbar_regions(toolbar, ctx.pixels_per_point());
+            chrome.set_toolbar_regions(title_regions, ctx.pixels_per_point());
         }
         #[cfg(not(windows))]
-        let _ = toolbar;
+        let _ = title_regions;
         let status = egui::TopBottomPanel::bottom("status")
             .show_separator_line(false)
             .frame(panel(colors.chrome, 13, 3))
@@ -541,7 +532,7 @@ impl eframe::App for Desk {
                     });
                 ui.set_style(content_style);
                 egui::CentralPanel::default()
-                    .frame(panel(colors.base, 11, 9))
+                    .frame(panel(colors.base, 11, 10))
                     .show_inside(ui, |ui| self.history_panel(ui, ctx));
                 (
                     navigation.response.rect,
@@ -618,19 +609,13 @@ impl eframe::App for Desk {
 }
 
 impl Desk {
-    fn toolbar(
+    fn title_bar(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
         height: f32,
         caption: Option<WindowButtons>,
     ) -> (ToolbarRegions, Option<AppearanceAction>) {
-        let colors = theme::palette(ctx);
-        let active = self.active.clone();
-        let can_run = active
-            .as_ref()
-            .is_some_and(|root| !self.operations.contains(root))
-            && self.state().is_some_and(|state| state.history.is_some());
+        let colors = theme::palette(ui.ctx());
         let spacing = ui.spacing_mut();
         spacing.interact_size.y = TITLE_BUTTON_HEIGHT;
         spacing.button_padding.y = 2.0;
@@ -652,35 +637,17 @@ impl Desk {
             pos2(start, center_y - control_half_height),
             pos2(end, center_y + control_half_height),
         );
-        let mut actions = ui.new_child(
+        let mut mark = ui.new_child(
             UiBuilder::new()
-                .id_salt("toolbar-actions")
+                .id_salt("title-mark")
                 .max_rect(content)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        actions.spacing_mut().item_spacing.x = 4.0;
-        toolbar_mark(&mut actions);
-        actions.add_space(8.0);
-        let mut action = None;
-        for (title, operation) in [
-            ("获取", Operation::Fetch),
-            ("拉取", Operation::Pull),
-            ("推送", Operation::Push),
-        ] {
-            if toolbar_button(&mut actions, title, can_run).clicked() {
-                action = Some((title, operation));
-            }
-        }
-        if toolbar_button(&mut actions, "刷新", true)
-            .on_hover_text("刷新当前仓库（F5）")
-            .clicked()
-        {
-            self.refresh(ctx);
-        }
+        toolbar_mark(&mut mark);
 
         let mut tools = ui.new_child(
             UiBuilder::new()
-                .id_salt("toolbar-tools")
+                .id_salt("title-tools")
                 .max_rect(content)
                 .layout(Layout::right_to_left(Align::Center)),
         );
@@ -693,6 +660,73 @@ impl Desk {
         let caption_area = Rect::from_min_max(pos2(caption_x, row.top()), row.max);
         let maximize =
             caption.map(|buttons| window_buttons(ui, caption_area, buttons, self.focused));
+        let mark_bounds = mark.min_rect();
+        let regions = ToolbarRegions {
+            drag: Rect::from_min_max(
+                pos2(mark_bounds.right() + 8.0, row.top()),
+                pos2(tools_bounds.left() - 8.0, row.bottom() - 1.0),
+            ),
+            controls: [mark_bounds, tools_bounds, caption_area],
+            maximize,
+        };
+        (regions, appearance.inner)
+    }
+
+    pub(crate) fn repository_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let active = self.active.clone();
+        let can_run = active
+            .as_ref()
+            .is_some_and(|root| !self.operations.contains(root))
+            && self.state().is_some_and(|state| state.history.is_some());
+        let operations = [
+            ("获取", Operation::Fetch),
+            ("拉取", Operation::Pull),
+            ("推送", Operation::Push),
+        ];
+        let refresh_label = "刷新";
+        let gap = 4.0;
+        let padding = ui.spacing().button_padding.x;
+        let width = ui.fonts(|fonts| {
+            operations
+                .iter()
+                .map(|(label, _)| *label)
+                .chain([refresh_label])
+                .map(|label| {
+                    let text = fonts.layout_no_wrap(
+                        label.into(),
+                        FontId::proportional(DETAIL_SIZE),
+                        Color32::PLACEHOLDER,
+                    );
+                    (text.size().x + 2.0 * padding).max(TITLE_BUTTON_MIN_WIDTH)
+                })
+                .sum::<f32>()
+        }) + (operations.len() + 1) as f32 * gap;
+        ui.add_space((ui.available_size_before_wrap().x - width).max(0.0));
+
+        let mut action = None;
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, TITLE_BUTTON_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                let spacing = ui.spacing_mut();
+                spacing.interact_size.y = TITLE_BUTTON_HEIGHT;
+                spacing.button_padding.y = 2.0;
+                spacing.item_spacing.x = gap;
+                for (title, operation) in operations {
+                    if ui.add_enabled(can_run, title_button(title)).clicked() {
+                        action = Some((title, operation));
+                    }
+                }
+                ui.add_space(gap);
+                if ui
+                    .add(title_button(refresh_label))
+                    .on_hover_text("刷新当前仓库（F5）")
+                    .clicked()
+                {
+                    self.refresh(ctx);
+                }
+            },
+        );
         if let (Some(root), Some((title, operation))) = (active, action) {
             match operation {
                 Operation::Fetch => self.operate(ctx, root, operation),
@@ -715,16 +749,6 @@ impl Desk {
                 _ => {}
             }
         }
-        let action_bounds = actions.min_rect();
-        let regions = ToolbarRegions {
-            drag: Rect::from_min_max(
-                pos2(action_bounds.right() + 8.0, row.top()),
-                pos2(tools_bounds.left() - 8.0, row.bottom() - 1.0),
-            ),
-            controls: [action_bounds, tools_bounds, caption_area],
-            maximize,
-        };
-        (regions, appearance.inner)
     }
 
     fn status_line(&self, ui: &mut egui::Ui) {
