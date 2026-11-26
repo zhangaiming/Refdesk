@@ -448,6 +448,8 @@ mod tests {
             (ThemeId::CoolDark, "cool-dark"),
             (ThemeId::CoolLight, "cool-light"),
             (ThemeId::WarmLight, "warm-light"),
+            (ThemeId::NeutralLight, "neutral-light"),
+            (ThemeId::NeutralDark, "neutral-dark"),
         ] {
             let settings = Settings {
                 theme,

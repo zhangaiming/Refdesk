@@ -7,15 +7,20 @@ pub(crate) enum ThemeId {
     CoolDark,
     CoolLight,
     WarmLight,
+    NeutralLight,
+    NeutralDark,
     #[default]
     #[serde(other)]
     WarmDark,
 }
 
 impl ThemeId {
-    pub(crate) const GROUPS: [(&'static str, [Self; 2]); 2] = [
-        ("亮色", [Self::CoolLight, Self::WarmLight]),
-        ("暗色", [Self::WarmDark, Self::CoolDark]),
+    pub(crate) const GROUPS: [(&'static str, [Self; 3]); 2] = [
+        (
+            "亮色",
+            [Self::CoolLight, Self::WarmLight, Self::NeutralLight],
+        ),
+        ("暗色", [Self::WarmDark, Self::CoolDark, Self::NeutralDark]),
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -24,11 +29,13 @@ impl ThemeId {
             Self::CoolDark => "深蓝灰",
             Self::CoolLight => "冷白蓝",
             Self::WarmLight => "暖白棕",
+            Self::NeutralLight => "浅灰蓝",
+            Self::NeutralDark => "炭灰紫",
         }
     }
 
     pub(crate) fn is_dark(self) -> bool {
-        matches!(self, Self::WarmDark | Self::CoolDark)
+        matches!(self, Self::WarmDark | Self::CoolDark | Self::NeutralDark)
     }
 
     pub(crate) fn palette(self) -> &'static Palette {
@@ -37,6 +44,8 @@ impl ThemeId {
             Self::CoolDark => &COOL_DARK,
             Self::CoolLight => &COOL_LIGHT,
             Self::WarmLight => &WARM_LIGHT,
+            Self::NeutralLight => &NEUTRAL_LIGHT,
+            Self::NeutralDark => &NEUTRAL_DARK,
         }
     }
 
@@ -331,5 +340,91 @@ const WARM_LIGHT: Palette = Palette {
         rgb(0x24687C),
         rgb(0x9B3960),
         rgb(0x496A27),
+    ],
+};
+
+const NEUTRAL_LIGHT: Palette = Palette {
+    base: rgb(0xFFFFFF),
+    panel: rgb(0xF8F8F8),
+    chrome: rgb(0xF0F0F0),
+    control: rgb(0xE9E9E9),
+    hover: rgb(0xE8EFF5),
+    selection: rgb(0xCCE6FF),
+    border: rgb(0xC6C6C6),
+    divider: rgb(0xE4E4E4),
+    accent: rgb(0x225D93),
+    text: rgb(0x222222),
+    muted: rgb(0x50545A),
+    subtle: rgb(0x5B6066),
+    warning: rgb(0x7A4D12),
+    added: ChangeColors {
+        foreground: rgb(0x26633B),
+        background: rgb(0xE8F4E8),
+        border: rgb(0x6D9C78),
+    },
+    removed: ChangeColors {
+        foreground: rgb(0x972F35),
+        background: rgb(0xFFEDED),
+        border: rgb(0xC8787C),
+    },
+    splitter_hover: rgb(0x7794AF),
+    tree_guide: rgb(0xB3BBC2),
+    window_active_border: rgb(0x9CABB9),
+    close_hover: rgb(0xC42B1C),
+    close_pressed: rgb(0xAA2318),
+    close_foreground: Color32::WHITE,
+    shadow: 42,
+    lanes: [
+        rgb(0x34373B),
+        rgb(0x28638F),
+        rgb(0x934E25),
+        rgb(0x71519B),
+        rgb(0x7C5D18),
+        rgb(0x236E76),
+        rgb(0x9B3E63),
+        rgb(0x526727),
+    ],
+};
+
+const NEUTRAL_DARK: Palette = Palette {
+    base: rgb(0x282828),
+    panel: rgb(0x2C2C2C),
+    chrome: rgb(0x343332),
+    control: rgb(0x3C3B3A),
+    hover: rgb(0x404048),
+    selection: rgb(0x414A78),
+    border: rgb(0x585756),
+    divider: rgb(0x373737),
+    accent: rgb(0xCDD3FF),
+    text: rgb(0xEDEDEC),
+    muted: rgb(0xCBCACE),
+    subtle: rgb(0xC0BFC6),
+    warning: rgb(0xEAC18E),
+    added: ChangeColors {
+        foreground: rgb(0xACD6AA),
+        background: rgb(0x303E34),
+        border: rgb(0x729B78),
+    },
+    removed: ChangeColors {
+        foreground: rgb(0xF4B1AB),
+        background: rgb(0x432F2E),
+        border: rgb(0xB76E69),
+    },
+    splitter_hover: rgb(0x77799C),
+    tree_guide: rgb(0x56565C),
+    window_active_border: rgb(0x797789),
+    close_hover: rgb(0xC42B1C),
+    close_pressed: rgb(0xAA2318),
+    close_foreground: Color32::WHITE,
+    shadow: 104,
+    lanes: [
+        rgb(0xD6D6D7),
+        rgb(0x9FBDF0),
+        rgb(0xECB583),
+        rgb(0xCDB1EF),
+        rgb(0xE6CC80),
+        rgb(0x8CCDD3),
+        rgb(0xEDA0B5),
+        rgb(0xB8CE86),
     ],
 };

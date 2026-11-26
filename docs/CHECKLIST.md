@@ -60,6 +60,7 @@
 - [x] 在同一 banshu 窗口连续切换四套主题，保留选中的文本差异和当前仓库，核对主窗口边框颜色、Diff 工具弹窗、键盘焦点、标题栏拖动和最大化贴靠入口。重启后恢复已选配色。
 - [x] 在 banshu/common 比较 `battle_presentation_duration.xlsx` 的提交差异，逐套检查旧值和新值的填充、边框、文字和定位框。截图复核后降低了亮色下表单占位提示的视觉权重，并重新截图。
 - [x] Windows GNU Release 构建、格式检查、严格 Clippy、24 项 Release 测试和 OpenSpec 严格校验通过。会话测试覆盖四个 ID 往返及缺失、未知 ID 的兼容回退。
+- [x] 在 Windows GNU Release 的隔离样例仓库核对浅灰蓝和炭灰紫的菜单分组与即时切换，验证文本和 Excel 差异保留。实测浅灰蓝重启恢复，以及启动器按会话打开炭灰紫。Windows 150% 缩放下检查 930×610 和 1480×850 逻辑点的对应视口。格式检查、严格 Clippy、34 项 Release 测试和 7 项 OpenSpec 严格校验通过。
 
 ## 窗格接缝与分支分组
 
