@@ -31,3 +31,17 @@
 开始前检查 `git status --short --branch` 并保留用户已有的改动。提交时按任务范围显式添加文件，检查暂存差异。用户只要求提交时做本地提交，推送需要明确请求。本机配置、构建产物及包含真实项目数据的截图或日志留在本机。
 
 开始修改项目前，按 `refdesk-change-workflow` 建立或沿用对应的 OpenSpec change。每次提交前都用该 Skill 核对关联 change，已完成的直接同步适用的增量规格并归档，未完成的先确认处理方式。用户明确指定处理方式时依其指示。
+
+## GitHub 操作
+
+- 用 GitHub CLI（`gh`）操作 GitHub 的 PR、Issue 和 API，优先复用本机已登录的账户。推送前先 `fetch`，远端有新提交时再 `rebase`，避免用合并提交同步分支。
+- 对 `github.com` 的 Git HTTPS 操作在当前命令中使用 `gh` 凭据助手，并关闭交互提示。以下是拉取远端引用的 PowerShell 示例，同样的配置适用于 `git push`。
+
+  ```powershell
+  $env:GH_PROMPT_DISABLED = '1'
+  $env:GIT_TERMINAL_PROMPT = '0'
+  $env:GCM_INTERACTIVE = 'never'
+  git -c credential.helper= -c 'credential.https://github.com.helper=!gh auth git-credential' fetch origin
+  ```
+
+- 遇到认证错误时先检查 `gh auth status --hostname github.com`。确需重新授权时，说明具体错误并由用户完成登录。自动化命令禁止启动登录窗口、设备验证码流程或输出令牌。
