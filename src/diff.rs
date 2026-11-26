@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffTag, TextDiff};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::builtin_diff::{Issue, Snapshot};
+use crate::builtin_diff::{Cancellation, Issue, Snapshot};
 use crate::git::Compare;
 use crate::logging::{self, ReadLog};
+use crate::syntax::{self, Highlight};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Kind {
@@ -87,24 +90,41 @@ pub struct WorkbookDiff {
 pub(crate) struct TextDocument {
     text: String,
     pub lines: Vec<String>,
+    pub syntax: OnceLock<Highlight>,
 }
 
 impl TextDocument {
     pub fn parse(bytes: &[u8]) -> std::result::Result<Self, Issue> {
         let text = decode(bytes).ok_or(Issue::Binary(bytes.len()))?;
-        if bytes.len() > 2 * 1024 * 1024 || text.lines().count() > 30_000 {
+        if bytes.len() > 2 * 1024 * 1024 {
             return Err(Issue::PreviewLimit);
         }
         let text = text.replace("\r\n", "\n");
-        let lines = text.split_terminator('\n').map(display_line).collect();
-        Ok(Self { text, lines })
+        let source_lines = text.split_inclusive(['\n', '\r']);
+        if source_lines.clone().count() > 30_000 {
+            return Err(Issue::PreviewLimit);
+        }
+        let lines = source_lines.map(display_line).collect();
+        Ok(Self {
+            text,
+            lines,
+            syntax: OnceLock::new(),
+        })
+    }
+
+    pub fn highlight(&self, path: &Path, cancel: &Cancellation) -> bool {
+        syntax::highlight(path, &self.text, || cancel.requested())
+            .is_some_and(|syntax| !cancel.requested() && self.syntax.set(syntax).is_ok())
     }
 }
+
+type InlineChanges = [Vec<Range<usize>>; 2];
 
 pub(crate) struct TextChanges {
     pub lines: Vec<Line>,
     pub added: usize,
     pub removed: usize,
+    pub inline: BTreeMap<usize, InlineChanges>,
 }
 
 pub(crate) fn load_text(snapshot: Snapshot<'_>) -> std::result::Result<TextDocument, Issue> {
@@ -112,7 +132,7 @@ pub(crate) fn load_text(snapshot: Snapshot<'_>) -> std::result::Result<TextDocum
 }
 
 fn display_line(text: &str) -> String {
-    text.trim_end_matches('\n').replace('\t', "    ")
+    text.trim_end_matches(['\n', '\r']).replace('\t', "    ")
 }
 
 pub fn is_workbook(path: &str) -> bool {
@@ -134,6 +154,7 @@ pub(crate) fn is_workbook_pair(pair: &Compare) -> bool {
 pub(crate) fn compare_text(
     [left, right]: [Option<&TextDocument>; 2],
     log: &ReadLog,
+    cancel: &Cancellation,
 ) -> TextChanges {
     let (worktree, request) = (log.worktree, log.request);
     let old_text = left.map_or("", |document| document.text.as_str());
@@ -193,11 +214,67 @@ pub(crate) fn compare_text(
             });
         }
     }
+    let inline = inline_changes(&lines, Instant::now() + Duration::from_millis(80), cancel);
     TextChanges {
         lines,
         added,
         removed,
+        inline,
     }
+}
+
+const MAX_INLINE_LINE_BYTES: usize = 1024;
+
+fn inline_changes(
+    lines: &[Line],
+    deadline: Instant,
+    cancel: &Cancellation,
+) -> BTreeMap<usize, InlineChanges> {
+    let mut inline = BTreeMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.kind != Kind::Replace {
+            continue;
+        }
+        if cancel.requested() || Instant::now() >= deadline {
+            break;
+        }
+        if let (Some((_, old)), Some((_, new))) = (&line.old, &line.new)
+            && let Some(changes) = inline_line(old, new, deadline)
+            && Instant::now() < deadline
+        {
+            inline.insert(index, changes);
+        }
+    }
+    inline
+}
+
+fn inline_line(old: &str, new: &str, deadline: Instant) -> Option<InlineChanges> {
+    if old == new || old.len().max(new.len()) > MAX_INLINE_LINE_BYTES {
+        return None;
+    }
+    let diff = TextDiff::configure()
+        .deadline(deadline)
+        .diff_graphemes(old, new);
+    let mut changes: InlineChanges = Default::default();
+    let mut offsets = [0; 2];
+    let mut common_text = false;
+    let slices = [diff.old_slices(), diff.new_slices()];
+    for op in diff.ops() {
+        for (side, range) in [op.old_range(), op.new_range()].into_iter().enumerate() {
+            let parts = &slices[side][range];
+            let start = offsets[side];
+            let end = start + parts.iter().map(|part| part.len()).sum::<usize>();
+            offsets[side] = end;
+            if op.tag() == DiffTag::Equal {
+                common_text |= parts
+                    .iter()
+                    .any(|part| part.chars().any(|ch| !ch.is_whitespace()));
+            } else if start < end {
+                changes[side].push(start..end);
+            }
+        }
+    }
+    common_text.then_some(changes)
 }
 
 pub fn encoding(bytes: &[u8]) -> &'static str {
@@ -563,6 +640,61 @@ pub fn address(row: u32, col: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_changes_keep_unicode_graphemes_and_handle_one_sided_edits() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let old = "    战斗 👩‍💻 = 30";
+        let new = "    战斗 👩‍🎨 = 30!";
+        let [removed, added] = inline_line(old, new, deadline).unwrap();
+        let slices = |text: &str, ranges: Vec<Range<usize>>| {
+            ranges
+                .into_iter()
+                .map(|range| text[range].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slices(old, removed), ["👩‍💻"]);
+        assert_eq!(slices(new, added), ["👩‍🎨", "!"]);
+
+        let [removed, added] = inline_line("timeout = 30", "timeout = 60", deadline).unwrap();
+        assert_eq!(slices("timeout = 30", removed), ["3"]);
+        assert_eq!(slices("timeout = 60", added), ["6"]);
+        assert!(inline_line("old", "NEW", deadline).is_none());
+        assert!(inline_line("same", "same", deadline).is_none());
+        assert!(inline_line(&"a".repeat(MAX_INLINE_LINE_BYTES + 1), "ab", deadline).is_none());
+    }
+
+    #[test]
+    fn inline_changes_obey_the_comparison_budget_and_cancellation() {
+        let lines = [Line {
+            old: Some((1, "value 1".into())),
+            new: Some((1, "value 2".into())),
+            kind: Kind::Replace,
+        }];
+        let (sender, cancel) = Cancellation::new();
+        assert!(inline_changes(&lines, Instant::now(), &cancel).is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let ranges = inline_changes(&lines, deadline, &cancel);
+        assert_eq!(
+            &lines[0].old.as_ref().unwrap().1[ranges[&0][0][0].clone()],
+            "1"
+        );
+        drop(sender);
+        assert!(inline_changes(&lines, deadline, &cancel).is_empty());
+    }
+
+    #[test]
+    fn raw_lines_share_diff_line_boundaries_for_cr_and_crlf() {
+        let document = TextDocument::parse(b"first\r\n\tsecond\rthird\n").unwrap();
+        let diff = TextDiff::from_lines("", &document.text);
+        let visible: Vec<_> = diff
+            .new_slices()
+            .iter()
+            .map(|line| display_line(line))
+            .collect();
+        assert_eq!(document.lines, ["first", "    second", "third"]);
+        assert_eq!(visible, document.lines);
+    }
     #[test]
     fn absolute_excel_addresses_are_one_based() {
         assert_eq!(address(0, 0), "A1");

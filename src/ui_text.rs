@@ -1,10 +1,20 @@
-use crate::builtin_diff::{Cancellation, Column, DiffType, Display, Issue, Side, Snapshot};
+use crate::builtin_diff::{
+    Cancellation, Column, DiffType, Display, Issue, Side, SideDecoration, Snapshot,
+};
 use crate::diff::{self, Kind, Line, TextChanges, TextDocument};
 use crate::logging::ReadLog;
+use crate::syntax::{Role, Span};
 use crate::theme::{self, ChangeColors, Palette};
 use crate::ui::{compact_button, paint};
 use crate::ui_diff::{Panel, column_rect};
-use eframe::egui::{self, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
+use eframe::egui::{
+    self, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2, text::LayoutJob,
+    text::TextFormat,
+};
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
+
 const TEXT_ROW_HEIGHT: f32 = 20.0;
 
 #[derive(Clone, Copy, Default)]
@@ -55,6 +65,13 @@ fn text_diff_rows(lines: &[Line], changes_only: bool) -> (Vec<usize>, Vec<usize>
 pub(crate) struct TextView {
     navigation: TextDiffNavigation,
     scroll_version: u64,
+    rows: Option<TextRows>,
+}
+
+struct TextRows {
+    changes_only: bool,
+    indices: Vec<usize>,
+    blocks: Vec<usize>,
 }
 
 impl DiffType for TextView {
@@ -65,12 +82,22 @@ impl DiffType for TextView {
         diff::load_text(snapshot)
     }
 
+    fn side_decoration(snapshot: &Snapshot<'_>, data: &Arc<Self::Data>) -> Option<SideDecoration> {
+        if snapshot.is_gitlink {
+            return None;
+        }
+        let path = Path::new(snapshot.path).file_name()?.to_owned();
+        let data = Arc::clone(data);
+        let cancel = snapshot.cancel.clone();
+        Some(Box::new(move || data.highlight(Path::new(&path), &cancel)))
+    }
+
     fn compare(
         sides: [Option<&Self::Data>; 2],
         log: &ReadLog,
-        _: &Cancellation,
+        cancel: &Cancellation,
     ) -> Option<Self::Changes> {
-        Some(diff::compare_text(sides, log))
+        Some(diff::compare_text(sides, log, cancel))
     }
 
     fn show(
@@ -92,6 +119,21 @@ impl DiffType for TextView {
 }
 
 impl TextView {
+    fn update_rows(&mut self, changes: &TextChanges, changes_only: bool) {
+        if self
+            .rows
+            .as_ref()
+            .is_none_or(|rows| rows.changes_only != changes_only)
+        {
+            let (indices, blocks) = text_diff_rows(&changes.lines, changes_only);
+            self.rows = Some(TextRows {
+                changes_only,
+                indices,
+                blocks,
+            });
+        }
+    }
+
     pub fn show_text(
         &mut self,
         ui: &mut egui::Ui,
@@ -100,15 +142,17 @@ impl TextView {
         panel: &mut Panel<'_>,
     ) {
         let mut jump = None;
-        let mut row_indices = Vec::new();
         let colors = theme::palette(ui.ctx());
         panel.controls(ui, |ui, changes_only| {
-            let mut targets = (None, None);
             if let Some(changes) = changes {
-                let (indices, blocks) = text_diff_rows(&changes.lines, *changes_only);
-                row_indices = indices;
-                targets = self.navigation.targets(&blocks);
+                self.update_rows(changes, *changes_only);
+            } else {
+                self.rows = None;
             }
+            let targets = self
+                .rows
+                .as_ref()
+                .map_or((None, None), |rows| self.navigation.targets(&rows.blocks));
             if ui
                 .add_enabled(targets.0.is_some(), compact_button("↑"))
                 .on_hover_text("上一处变更")
@@ -132,7 +176,7 @@ impl TextView {
                 self.scroll_version += 1;
                 jump = None;
                 if let Some(changes) = changes {
-                    row_indices = text_diff_rows(&changes.lines, *changes_only).0;
+                    self.update_rows(changes, *changes_only);
                 }
             }
             if let Some(changes) = changes {
@@ -152,7 +196,8 @@ impl TextView {
                 .map(|text| text.lines.len())
                 .max()
                 .unwrap_or_default();
-            let count = changes.map_or(raw_count, |_| row_indices.len());
+            let rows = self.rows.as_ref();
+            let count = rows.map_or(raw_count, |rows| rows.indices.len());
             let focus = jump.or(self.navigation.focus);
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt(("text-diff", self.scroll_version))
@@ -164,7 +209,11 @@ impl TextView {
             ui.spacing_mut().item_spacing.y = 0.0;
             let output = scroll.show_rows(ui, TEXT_ROW_HEIGHT, count, |ui, visible| {
                 for index in visible {
-                    let line = changes.map(|changes| &changes.lines[row_indices[index]]);
+                    let aligned = changes.zip(rows).map(|(changes, rows)| {
+                        let row_index = rows.indices[index];
+                        (&changes.lines[row_index], changes.inline.get(&row_index))
+                    });
+                    let line = aligned.map(|(line, _)| line);
                     let (rect, response) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT),
                         Sense::click(),
@@ -199,7 +248,14 @@ impl TextView {
                             ),
                         };
                         if let Some(entry) = entry {
-                            code(ui, bounds, entry, &colors, change);
+                            let syntax = sides[column.index()]
+                                .ready()
+                                .and_then(|doc| doc.syntax.get())
+                                .map_or(&[][..], |syntax| syntax.line(entry.0));
+                            let inline = aligned
+                                .and_then(|(_, inline)| inline)
+                                .map_or(&[][..], |inline| inline[column.index()].as_slice());
+                            code(ui, bounds, entry, &colors, change, syntax, inline);
                             if response.clicked()
                                 && response
                                     .interact_pointer_pos()
@@ -235,6 +291,8 @@ fn code(
     (number, text): (usize, &str),
     colors: &Palette,
     change: Option<(ChangeColors, char)>,
+    syntax: &[Span],
+    inline: &[Range<usize>],
 ) {
     let gutter = Rect::from_min_max(rect.min, pos2(rect.left() + 49.0, rect.bottom()));
     let (gutter_text, gutter_color) = if let Some((change, sign)) = change {
@@ -256,14 +314,83 @@ fn code(
         FontId::monospace(11.0),
         gutter_color,
     );
-    paint(
-        ui,
-        rect,
-        rect.left() + 54.0,
-        text,
-        FontId::monospace(12.0),
-        colors.text,
-    );
+    let x = rect.left() + 54.0;
+    let content = Rect::from_min_max(pos2(x, rect.top()), rect.max);
+    if syntax.is_empty() && inline.is_empty() {
+        paint(ui, content, x, text, FontId::monospace(12.0), colors.text);
+    } else {
+        let inline_background = change.map_or(Color32::TRANSPARENT, |(change, _)| {
+            change.background.lerp_to_gamma(change.border, 0.26)
+        });
+        let painter = ui
+            .painter()
+            .with_clip_rect(content.intersect(ui.clip_rect()));
+        let galley =
+            painter.layout_job(code_layout(text, colors, syntax, inline, inline_background));
+        let origin = pos2(x, rect.center().y - galley.size().y * 0.5);
+        painter.galley(origin, galley, colors.text);
+    }
+}
+
+fn code_layout(
+    text: &str,
+    colors: &Palette,
+    syntax: &[Span],
+    inline: &[Range<usize>],
+    inline_background: Color32,
+) -> LayoutJob {
+    let mut job = LayoutJob {
+        break_on_newline: false,
+        ..Default::default()
+    };
+    let mut syntax = syntax.iter().peekable();
+    let mut inline = inline.iter().peekable();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = text.len();
+        let mut foreground = colors.text;
+        let mut background = Color32::TRANSPARENT;
+        if let Some(span) = syntax.peek() {
+            if start < span.range.start {
+                end = span.range.start;
+            } else {
+                end = span.range.end;
+                foreground = match span.role {
+                    Role::Keyword => colors.accent,
+                    Role::String => colors.added.foreground,
+                    Role::Comment => colors.muted,
+                    Role::Literal => colors.warning,
+                    Role::Type => colors.accent.lerp_to_gamma(colors.text, 0.38),
+                };
+            }
+        }
+        if let Some(range) = inline.peek() {
+            if start < range.start {
+                end = end.min(range.start);
+            } else {
+                end = end.min(range.end);
+                background = inline_background;
+            }
+        }
+        job.append(
+            &text[start..end],
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(12.0),
+                color: foreground,
+                background,
+                ..Default::default()
+            },
+        );
+        start = end;
+        if syntax.peek().is_some_and(|span| span.range.end == end) {
+            syntax.next();
+        }
+        if inline.peek().is_some_and(|range| range.end == end) {
+            inline.next();
+        }
+    }
+    job
 }
 
 #[cfg(test)]

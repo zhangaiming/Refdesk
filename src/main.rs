@@ -12,6 +12,7 @@ mod history;
 mod image_diff;
 mod logging;
 mod settings;
+mod syntax;
 mod tasks;
 mod theme;
 mod timing;

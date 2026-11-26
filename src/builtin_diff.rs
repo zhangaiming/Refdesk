@@ -83,11 +83,12 @@ impl Cancellation {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Snapshot<'a> {
     pub root: &'a Path,
     pub path: &'a str,
     pub version: &'a Version,
-    gitlink: bool,
+    pub is_gitlink: bool,
     pub log: &'a ReadLog,
     pub cancel: &'a Cancellation,
 }
@@ -108,7 +109,7 @@ impl<'a> Snapshot<'a> {
             root,
             path,
             version,
-            gitlink,
+            is_gitlink: gitlink,
             log,
             cancel,
         }
@@ -119,7 +120,7 @@ impl<'a> Snapshot<'a> {
             self.root,
             self.version,
             self.path,
-            self.gitlink,
+            self.is_gitlink,
             self.cancel,
         )
         .map_err(|error| {
@@ -161,6 +162,12 @@ pub(crate) trait DiffType: Default + 'static {
     type Changes: Send + 'static;
 
     fn load(snapshot: Snapshot<'_>) -> Result<Self::Data, Issue>;
+    fn side_decoration(
+        _snapshot: &Snapshot<'_>,
+        _data: &Arc<Self::Data>,
+    ) -> Option<SideDecoration> {
+        None
+    }
 
     fn compare(
         _sides: [Option<&Self::Data>; 2],
@@ -186,6 +193,8 @@ pub(crate) trait DiffType: Default + 'static {
         panel: &mut Panel<'_>,
     );
 }
+
+pub(crate) type SideDecoration = Box<dyn FnOnce() -> bool + Send>;
 
 pub(crate) struct Registration {
     pub matches: fn(&Compare) -> bool,
@@ -377,57 +386,68 @@ fn run<T: DiffType>(
     publish: impl Fn(Update<T::Data, T::Changes>) + Sync,
 ) {
     let Request {
-        root, pair, log, ..
+        root,
+        pair,
+        log,
+        ctx,
     } = request;
     let started = Instant::now();
-    let load = |column: Column| {
-        if cancel.requested() {
-            return Side::Loading;
-        }
-        let snapshot = Snapshot::new(root, pair, column, log, cancel);
-        let side = if matches!(snapshot.version, Version::Empty) {
-            Side::Absent
-        } else {
-            match T::load(snapshot) {
-                Ok(data) => Side::Ready(Arc::new(data)),
-                Err(issue) => {
-                    if !cancel.requested() && !matches!(issue, Issue::Binary(_)) {
-                        let ReadLog {
-                            worktree, request, ..
-                        } = *log;
-                        tracing::warn!(worktree, request, ?column, ?issue, "diff_side_failed");
+    let failed = std::thread::scope(|scope| {
+        let load = |column: Column| {
+            if cancel.requested() {
+                return Side::Loading;
+            }
+            let snapshot = Snapshot::new(root, pair, column, log, cancel);
+            let side = if matches!(snapshot.version, Version::Empty) {
+                Side::Absent
+            } else {
+                match T::load(snapshot) {
+                    Ok(data) => Side::Ready(Arc::new(data)),
+                    Err(issue) => {
+                        if !cancel.requested() && !matches!(issue, Issue::Binary(_)) {
+                            let ReadLog {
+                                worktree, request, ..
+                            } = *log;
+                            tracing::warn!(worktree, request, ?column, ?issue, "diff_side_failed");
+                        }
+                        Side::Failed(issue)
                     }
-                    Side::Failed(issue)
+                }
+            };
+            if !cancel.requested() {
+                publish(Update::Side(column, side.map(Arc::clone)));
+                if let Some(data) = side.ready()
+                    && let Some(decorate) = T::side_decoration(&snapshot, data)
+                {
+                    scope.spawn(move || {
+                        if !cancel.requested() && decorate() && !cancel.requested() {
+                            ctx.request_repaint();
+                        }
+                    });
                 }
             }
+            side
         };
-        if !cancel.requested() {
-            publish(Update::Side(column, side.map(Arc::clone)));
-        }
-        side
-    };
-    let sides = std::thread::scope(|scope| {
-        let left = scope.spawn(|| load(Column::Left));
+        let left = scope.spawn(move || load(Column::Left));
         let right = load(Column::Right);
-        [left.join().expect("left diff loader"), right]
+        let sides = [left.join().expect("left diff loader"), right];
+        let failed = sides.iter().any(|side| matches!(side, Side::Failed(_)));
+        if !cancel.requested() {
+            let changes = if failed {
+                None
+            } else {
+                T::compare(
+                    sides.each_ref().map(|side| side.ready().map(Arc::as_ref)),
+                    log,
+                    cancel,
+                )
+            };
+            if !cancel.requested() {
+                publish(Update::Compared(changes));
+            }
+        }
+        failed
     });
-    if cancel.requested() {
-        log.complete(started, "canceled");
-        return;
-    }
-    let failed = sides.iter().any(|side| matches!(side, Side::Failed(_)));
-    let changes = if failed {
-        None
-    } else {
-        T::compare(
-            sides.each_ref().map(|side| side.ready().map(Arc::as_ref)),
-            log,
-            cancel,
-        )
-    };
-    if !cancel.requested() {
-        publish(Update::Compared(changes));
-    }
     let result = if cancel.requested() {
         "canceled"
     } else if failed {
@@ -490,7 +510,7 @@ mod tests {
             cancel: &Cancellation,
         ) -> Option<Self::Changes> {
             gate(COMPARE, cancel).ok()?;
-            Some(diff::compare_text(sides, log))
+            Some(diff::compare_text(sides, log, cancel))
         }
 
         fn show(
@@ -536,6 +556,46 @@ mod tests {
     fn receive<T: DiffType>(session: &mut Session<T>) {
         let delivery = session.inbox.recv_timeout(DEADLINE).unwrap();
         session.apply(&egui::Context::default(), delivery);
+    }
+
+    #[test]
+    fn text_highlights_each_snapshot_by_its_own_path_with_or_without_a_peer() -> anyhow::Result<()>
+    {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path();
+        std::fs::write(root.join("source.rs"), "fn main() { let value = 3500; }\n")?;
+        std::fs::write(root.join("right.txt"), "fn main() { let value = 4200; }\n")?;
+
+        let ctx = egui::Context::default();
+        let mut rename = request(root, 1);
+        rename.pair.left_path = "source.rs".into();
+        let (mut session, job) = create::<TextView>(rename);
+        job();
+        session.poll(&ctx);
+        assert!(session.sides[0].ready().unwrap().syntax.get().is_some());
+        assert!(session.sides[1].ready().unwrap().syntax.get().is_none());
+        assert!(session.changes.as_ref().unwrap().inline.contains_key(&0));
+
+        for nonempty in Column::BOTH {
+            let mut single = request(root, 2);
+            single.pair.left_path = "source.rs".into();
+            single.pair.right_path = "source.rs".into();
+            let empty = match nonempty {
+                Column::Left => &mut single.pair.right,
+                Column::Right => &mut single.pair.left,
+            };
+            *empty = Version::Empty;
+            let (mut session, job) = create::<TextView>(single);
+            job();
+            session.poll(&ctx);
+            let index = nonempty.index();
+            assert!(session.sides[index].ready().unwrap().syntax.get().is_some());
+            assert!(matches!(session.sides[1 - index], Side::Absent));
+            let changes = session.changes.as_ref().unwrap();
+            assert_eq!((changes.added, changes.removed), (index, 1 - index));
+            assert!(changes.inline.is_empty());
+        }
+        Ok(())
     }
 
     #[test]

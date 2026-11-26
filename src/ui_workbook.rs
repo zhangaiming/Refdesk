@@ -65,6 +65,7 @@ impl DiffType for SheetView {
                     _ => None,
                 }),
                 log,
+                cancel,
             )))
         } else {
             None
