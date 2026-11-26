@@ -417,9 +417,9 @@ impl HistoryColumns {
             right -= width + 14.0;
             bounds
         };
-        let sha = (rect.width() >= 465.0).then(|| column(72.0));
-        let date = (rect.width() >= 550.0).then(|| column(42.0));
-        let author = (rect.width() >= 660.0).then(|| column(102.0));
+        let sha = (rect.width() >= 660.0).then(|| column(72.0));
+        let date = (rect.width() >= 465.0).then(|| column(42.0));
+        let author = (rect.width() >= 550.0).then(|| column(102.0));
         let left = rect.left() + graph_width + 4.0;
         let subject = Rect::from_x_y_ranges(left..=right.max(left), rect.y_range());
         Self {
