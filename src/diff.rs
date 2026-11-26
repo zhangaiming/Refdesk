@@ -7,7 +7,8 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::git::{self, Compare};
+use crate::git::{self, Compare, Version};
+use crate::image_diff::ImageDiff;
 use crate::logging::{self, ReadLog};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -83,14 +84,16 @@ pub struct WorkbookDiff {
     pub total: usize,
 }
 
-#[derive(Debug)]
 pub enum Content {
+    LoadingText,
+    LoadingWorkbook,
     Text {
         lines: Vec<Line>,
         added: usize,
         removed: usize,
     },
     Sheet(WorkbookDiff),
+    Image(ImageDiff),
     Binary {
         left: usize,
         right: usize,
@@ -110,31 +113,37 @@ pub fn is_workbook(path: &str) -> bool {
         })
 }
 
+pub(crate) fn is_workbook_pair(pair: &Compare) -> bool {
+    !pair.left_gitlink && !pair.right_gitlink && is_workbook(&pair.right_path)
+}
+
+pub(crate) fn read_snapshot(
+    root: &Path,
+    version: &Version,
+    path: &str,
+    gitlink: bool,
+    log: &ReadLog,
+) -> Result<Vec<u8>> {
+    let (worktree, request) = (log.worktree, log.request);
+    git::diff_snapshot(root, version, path, gitlink).inspect_err(|error| {
+        let (error_kind, exit_code) = git::error_kind(error);
+        tracing::warn!(
+            worktree,
+            request,
+            error_kind,
+            exit_code,
+            "diff_snapshot_failed"
+        );
+    })
+}
+
 pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> Result<Content> {
     let (worktree, request) = (log.worktree, log.request);
-    let snapshot = |version, path, gitlink| {
-        git::diff_snapshot(root, version, path, gitlink).inspect_err(|error| {
-            let (error_kind, exit_code) = git::error_kind(error);
-            tracing::warn!(
-                worktree,
-                request,
-                error_kind,
-                exit_code,
-                "diff_snapshot_failed"
-            );
-        })
-    };
-    let old = snapshot(&pair.left, pair.left_path.as_str(), pair.left_gitlink)?;
-    let new = snapshot(&pair.right, pair.right_path.as_str(), pair.right_gitlink)?;
+    let old = read_snapshot(root, &pair.left, &pair.left_path, pair.left_gitlink, log)?;
+    let new = read_snapshot(root, &pair.right, &pair.right_path, pair.right_gitlink, log)?;
     let (left_bytes, right_bytes) = (old.len(), new.len());
     let lfs = |bytes: &[u8]| bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n");
-    if !force_text
-        && !pair.left_gitlink
-        && !pair.right_gitlink
-        && is_workbook(&pair.right_path)
-        && !lfs(&old)
-        && !lfs(&new)
-    {
+    if !force_text && is_workbook_pair(pair) && !lfs(&old) && !lfs(&new) {
         #[cfg(windows)]
         let workbook = crate::workbook_worker::compare(&old, &new, log)?;
         #[cfg(not(windows))]

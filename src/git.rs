@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryScope {
@@ -969,6 +971,134 @@ pub fn diff_snapshot(
     };
     ensure!(oid(&id), "无效的子模块提交标识");
     Ok(format!("Subproject commit {id}\n").into_bytes())
+}
+
+pub(crate) struct LfsPointer<'a> {
+    oid: &'a str,
+    size: u64,
+}
+
+impl<'a> LfsPointer<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Option<Self>> {
+        const VERSION: &str = "version https://git-lfs.github.com/spec/v1";
+        if !bytes.starts_with(VERSION.as_bytes()) {
+            return Ok(None);
+        }
+        ensure!(bytes.len() <= 1024, "无效的 Git LFS 指针");
+        let mut lines = std::str::from_utf8(bytes)
+            .context("无效的 Git LFS 指针")?
+            .lines();
+        ensure!(lines.next() == Some(VERSION), "无效的 Git LFS 指针");
+        let oid_line = lines.find(|line| !line.starts_with("ext-"));
+        let oid = oid_line
+            .and_then(|line| line.strip_prefix("oid sha256:"))
+            .filter(|oid| {
+                oid.len() == 64
+                    && oid
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .context("无效的 Git LFS 对象标识")?;
+        let size = lines
+            .next()
+            .and_then(|line| line.strip_prefix("size "))
+            .and_then(|size| size.parse().ok())
+            .context("无效的 Git LFS 对象大小")?;
+        ensure!(lines.next().is_none(), "无效的 Git LFS 指针");
+        Ok(Some(Self { oid, size }))
+    }
+
+    pub fn read(&self, dir: &Path) -> Result<Option<Vec<u8>>> {
+        ensure!(self.size <= MAX_SNAPSHOT, "Git LFS 图片文件超过 64 MiB");
+        let oid = self.oid;
+        let path = dir.join(&oid[..2]).join(&oid[2..4]).join(oid);
+        let metadata = match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            result => result.context("无法读取 Git LFS 对象信息")?,
+        };
+        ensure!(
+            metadata.is_file() && metadata.len() == self.size,
+            "本地 Git LFS 对象大小不符"
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(self.size + 1).read_to_end(&mut bytes))
+            .context("无法读取 Git LFS 对象")?;
+        ensure!(bytes.len() as u64 == self.size, "本地 Git LFS 对象大小不符");
+        Ok(Some(bytes))
+    }
+}
+
+pub(crate) fn lfs_object_dir(root: &Path) -> Result<PathBuf> {
+    let common_dir = run(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let config = output(root, &["config", "--null", "--get", "lfs.storage"], true)?;
+    let storage = if config.status.code() == Some(1) {
+        String::new()
+    } else {
+        string(&checked(config)?).trim_end_matches('\0').to_owned()
+    };
+    let storage = if storage.is_empty() { "lfs" } else { &storage };
+    Ok(PathBuf::from(trim(&common_dir))
+        .join(storage)
+        .join("objects"))
+}
+
+pub(crate) fn download_lfs_object(
+    root: &Path,
+    path: &str,
+    pointer: &[u8],
+    canceled: &AtomicBool,
+) -> Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(15);
+    const CANCELED: &str = "Git LFS 下载已取消";
+    const FAILED: &str = "无法下载 Git LFS 对象";
+    ensure!(!canceled.load(Ordering::Relaxed), CANCELED);
+    // Git LFS smudge also attempts to install hooks. Keep those inside the temporary directory.
+    let hooks = tempfile::tempdir().context(FAILED)?;
+    let mut hooks_config = OsString::from("core.hooksPath=");
+    hooks_config.push(hooks.path());
+    let mut child = command(Some(root), true)
+        .arg("-c")
+        .arg(hooks_config)
+        .args(["lfs", "smudge", "--", path])
+        .env("GCM_INTERACTIVE", "never")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("GIT_LFS_PROGRESS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context(FAILED)?;
+    let started = Instant::now();
+    let result = (|| {
+        #[cfg(windows)]
+        let _job = crate::window_job::assign(&child, Default::default()).context(FAILED)?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(pointer)
+            .context(FAILED)?;
+        loop {
+            ensure!(!canceled.load(Ordering::Relaxed), CANCELED);
+            if let Some(status) = child.try_wait().context(FAILED)? {
+                ensure!(status.success(), FAILED);
+                return Ok(());
+            }
+            ensure!(started.elapsed() < TIMEOUT, "Git LFS 下载超时");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 pub fn base_snapshot(root: &Path, pair: &Compare) -> Result<Vec<u8>> {

@@ -3,15 +3,13 @@ use crate::git::MAX_SNAPSHOT;
 use crate::logging::{self, ReadLog};
 use anyhow::{Context, Result, ensure};
 use std::io::{BufReader, BufWriter, Read, Write, stdin, stdout};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::OwnedHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
 };
 
 pub(crate) const ARGUMENT: &str = "--workbook-diff-worker";
@@ -155,37 +153,22 @@ pub(crate) fn run() -> Result<()> {
 }
 
 fn limit_process(child: &Child) -> Result<OwnedHandle> {
-    // Own the job handle before assigning the process so every exit closes it.
-    unsafe {
-        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let job = OwnedHandle::from_raw_handle(handle);
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_PROCESS_TIME
-            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        limits.BasicLimitInformation.PerProcessUserTimeLimit = MAX_CPU_TIME;
-        limits.ProcessMemoryLimit = MAX_MEMORY;
-        if SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            std::mem::size_of_val(&limits) as u32,
-        ) == 0
-            || AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(job)
-    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_PROCESS_TIME;
+    limits.BasicLimitInformation.PerProcessUserTimeLimit = MAX_CPU_TIME;
+    limits.ProcessMemoryLimit = MAX_MEMORY;
+    Ok(crate::window_job::assign(child, limits)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
 
     #[test]
     fn windows_job_limits_the_parser_before_input() -> Result<()> {
@@ -209,6 +192,10 @@ mod tests {
         drop(job);
         child.wait()?;
         assert_ne!(queried, 0);
+        assert_ne!(
+            limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            0
+        );
         assert_eq!(limits.ProcessMemoryLimit, MAX_MEMORY);
         assert_eq!(
             limits.BasicLimitInformation.PerProcessUserTimeLimit,

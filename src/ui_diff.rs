@@ -1,5 +1,6 @@
 use crate::app::Desk;
 use crate::diff::{Content, Kind, Line, is_workbook};
+use crate::image_diff::{ImageDiff, ImageSide};
 use crate::theme::{self, ChangeColors, Palette};
 use crate::ui::{compact_button, paint, small_button};
 use eframe::egui::{self, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
@@ -69,6 +70,15 @@ impl Desk {
             .data(|data| data.get_temp(navigation_id))
             .filter(|state: &TextDiffNavigation| state.reset == self.diff_reset)
             .unwrap_or_default();
+        let image_view_id = ui.id().with("image-diff-view");
+        let mut image_view = ui
+            .data(|data| data.get_temp::<ImageView>(image_view_id))
+            .filter(|state| state.reset == self.diff_reset)
+            .unwrap_or_default();
+        if let Some(Content::Image(images)) = &mut self.content {
+            images.left.upload(ctx);
+            images.right.upload(ctx);
+        }
         let workbook = self
             .file
             .as_ref()
@@ -80,9 +90,6 @@ impl Desk {
                     egui::Label::new(RichText::new(path).size(12.0).color(colors.muted)).truncate(),
                 )
                 .on_hover_text(path);
-            }
-            if self.diff_busy {
-                ui.spinner();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(tool) = &selected_tool {
@@ -97,18 +104,50 @@ impl Desk {
                 }
                 if workbook && let Some(Content::Sheet(_)) = self.content {
                     toggle = small_button(ui, "比较原始文件").clicked();
+                } else if matches!(self.content, Some(Content::LoadingWorkbook)) {
+                    ui.add_enabled(false, compact_button("比较原始文件"));
                 } else if workbook && self.force_text {
                     toggle = small_button(ui, "单元格对比").clicked();
                 }
-                if let Some(Content::Text { lines, .. }) = &self.content {
+                if let Some(Content::Image(images)) = &self.content {
+                    let (label, hint) = if image_view.actual_size {
+                        ("适应窗格", "以相同比例显示两张完整图片")
+                    } else {
+                        ("100%", "查看原始像素尺寸，拖动图片可同步平移")
+                    };
+                    if ui
+                        .add_enabled(
+                            image_canvas_size(images) != Vec2::ZERO,
+                            compact_button(label),
+                        )
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        image_view.actual_size = !image_view.actual_size;
+                        image_view.pan = Vec2::ZERO;
+                    }
+                }
+                if matches!(
+                    self.content,
+                    Some(Content::Text { .. } | Content::LoadingText)
+                ) {
                     save = ui
-                        .checkbox(&mut self.settings.changes_only, "仅显示变更")
+                        .add_enabled(
+                            matches!(self.content, Some(Content::Text { .. })),
+                            egui::Checkbox::new(&mut self.settings.changes_only, "仅显示变更"),
+                        )
                         .changed();
                     if save {
                         navigation = TextDiffNavigation::default();
                     }
-                    let (indices, changes) = text_diff_rows(lines, self.settings.changes_only);
-                    let (previous, next) = navigation.targets(&changes);
+                    let (previous, next) = if let Some(Content::Text { lines, .. }) = &self.content
+                    {
+                        let (indices, changes) = text_diff_rows(lines, self.settings.changes_only);
+                        text_rows = Some(indices);
+                        navigation.targets(&changes)
+                    } else {
+                        (None, None)
+                    };
                     if ui
                         .add_enabled(next.is_some(), compact_button("↓"))
                         .on_hover_text("下一处变更")
@@ -123,7 +162,6 @@ impl Desk {
                     {
                         jump = previous;
                     }
-                    text_rows = Some(indices);
                 }
             });
         });
@@ -147,17 +185,34 @@ impl Desk {
             });
             return;
         }
-        if let Some(error) = &self.diff_error {
-            ui.add_space(8.0);
-            ui.colored_label(colors.removed.foreground, error);
-            return;
-        }
         let Some(pair) = self.comparison.as_ref() else {
             return;
         };
         let mut full_line = None;
         if let Some(content) = self.content.as_ref() {
             match (content, text_rows) {
+                (Content::LoadingText | Content::LoadingWorkbook, _) => {
+                    let left = pair.left.title();
+                    let right = pair.right.title();
+                    if matches!(content, Content::LoadingWorkbook) {
+                        crate::ui_workbook::pending_header(ui, left, right);
+                    } else {
+                        diff_header(
+                            ui,
+                            &format!("旧版本  ·  {left}"),
+                            &format!("新版本  ·  {right}"),
+                        );
+                    }
+                    if let Some(error) = &self.diff_error {
+                        ui.colored_label(colors.removed.foreground, error);
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(
+                            ui.available_size().max(Vec2::ZERO),
+                            Sense::hover(),
+                        );
+                        paint_loading(ui, rect);
+                    }
+                }
                 (
                     Content::Text {
                         lines,
@@ -270,6 +325,11 @@ impl Desk {
                         pair.right.title(),
                     );
                 }
+                (Content::Image(images), _) => {
+                    image_view.show(ui, images, pair.left.title(), pair.right.title());
+                    image_view.reset = self.diff_reset;
+                    ui.data_mut(|data| data.insert_temp(image_view_id, image_view));
+                }
                 (Content::Binary { left, right }, _) => {
                     ui.label(
                         RichText::new(format!(
@@ -288,6 +348,167 @@ impl Desk {
             self.show_full_line = Some(value);
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ImageView {
+    reset: u64,
+    actual_size: bool,
+    pan: Vec2,
+}
+
+impl ImageView {
+    fn show(&mut self, ui: &mut egui::Ui, images: &ImageDiff, before: &str, after: &str) {
+        let title = |side: &str, version: &str, image: &ImageSide| match image {
+            ImageSide::Preview(texture) => {
+                let [width, height] = texture.size();
+                format!("{side}  ·  {version}     {width} × {height} px")
+            }
+            ImageSide::Absent => side.to_owned(),
+            _ => format!("{side}  ·  {version}"),
+        };
+        diff_header(
+            ui,
+            &title("旧版本", before, &images.left),
+            &title("新版本", after, &images.right),
+        );
+
+        let body = ui.available_size().max(Vec2::ZERO);
+        let viewport = Vec2::new(body.x / 2.0 - 16.0, body.y - 16.0).max(Vec2::ZERO);
+        let canvas = image_canvas_size(images);
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let mut scale = 1.0 / pixels_per_point;
+        if !self.actual_size && canvas != Vec2::ZERO {
+            scale = scale.min((viewport.x / canvas.x).min(viewport.y / canvas.y));
+        }
+        let canvas = canvas * scale;
+        let overflow = (canvas - viewport).max(Vec2::ZERO);
+        let can_pan = self.actual_size && overflow != Vec2::ZERO;
+        let sense = if can_pan {
+            Sense::drag()
+        } else {
+            Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(body, sense);
+        if can_pan {
+            self.pan = (self.pan - response.drag_delta()).clamp(Vec2::ZERO, overflow);
+            let cursor = if response.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            };
+            response.on_hover_cursor(cursor);
+        }
+
+        let colors = theme::palette(ui.ctx());
+        let (left, right) = halves(rect);
+        ui.painter().vline(
+            right.left(),
+            rect.y_range(),
+            Stroke::new(1.0_f32, colors.divider),
+        );
+        if viewport.x <= 0.0 || viewport.y <= 0.0 {
+            return;
+        }
+        let inset = (viewport - canvas).max(Vec2::ZERO) * 0.5;
+        for (column, image) in [(left, &images.left), (right, &images.right)] {
+            let bounds = column.shrink(8.0);
+            let origin = bounds.min + inset - self.pan;
+            let aligned = pos2(
+                (origin.x * pixels_per_point).round() / pixels_per_point,
+                (origin.y * pixels_per_point).round() / pixels_per_point,
+            );
+            paint_image(ui, bounds, image, aligned, scale, &colors);
+        }
+    }
+}
+
+fn image_canvas_size(images: &ImageDiff) -> Vec2 {
+    [&images.left, &images.right]
+        .into_iter()
+        .filter_map(|side| match side {
+            ImageSide::Preview(texture) => Some(texture.size_vec2()),
+            _ => None,
+        })
+        .fold(Vec2::ZERO, Vec2::max)
+}
+
+fn paint_image(
+    ui: &egui::Ui,
+    bounds: Rect,
+    side: &ImageSide,
+    origin: egui::Pos2,
+    scale: f32,
+    colors: &Palette,
+) {
+    let painter = ui.painter().with_clip_rect(bounds);
+    let (message, color) = match side {
+        ImageSide::Preview(texture) => {
+            let rect = Rect::from_min_size(origin, texture.size_vec2() * scale);
+            let visible = rect.intersect(painter.clip_rect());
+            if visible.is_positive() {
+                checkerboard(&painter, visible, origin, colors);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                painter.image(texture.id(), rect, uv, egui::Color32::WHITE);
+            }
+            return;
+        }
+        ImageSide::Loading => {
+            paint_loading(ui, bounds);
+            return;
+        }
+        ImageSide::Absent => ("此版本无图片", colors.muted),
+        ImageSide::Unavailable(message) => (message.as_str(), colors.warning),
+        ImageSide::Pixels(_) => return,
+    };
+    let text = painter.layout(
+        message.to_owned(),
+        FontId::proportional(13.0),
+        color,
+        bounds.width(),
+    );
+    painter.galley(bounds.center() - text.size() * 0.5, text, color);
+}
+
+fn paint_loading(ui: &egui::Ui, bounds: Rect) {
+    let color = theme::palette(ui.ctx()).muted;
+    let painter = ui.painter().with_clip_rect(bounds);
+    let text = painter.layout_no_wrap("加载中…".into(), FontId::proportional(13.0), color);
+    let mut position = bounds.center() - text.size() * 0.5;
+    const SPINNER_SIZE: f32 = 14.0;
+    const SPINNER_GAP: f32 = 7.0;
+    if bounds.width() >= text.size().x + SPINNER_SIZE + SPINNER_GAP
+        && bounds.height() >= SPINNER_SIZE
+    {
+        position.x += (SPINNER_SIZE + SPINNER_GAP) * 0.5;
+        let center = pos2(
+            position.x - SPINNER_GAP - SPINNER_SIZE * 0.5,
+            bounds.center().y,
+        );
+        egui::Spinner::new().color(color).paint_at(
+            ui,
+            Rect::from_center_size(center, Vec2::splat(SPINNER_SIZE)),
+        );
+    }
+    painter.galley(position, text, color);
+}
+
+fn checkerboard(painter: &egui::Painter, visible: Rect, origin: egui::Pos2, colors: &Palette) {
+    const CELL: f32 = 8.0;
+    let start = (visible.min - origin) / CELL;
+    let end = (visible.max - origin) / CELL;
+    let mut mesh = egui::Mesh::default();
+    mesh.add_colored_rect(visible, colors.control);
+    for row in start.y.floor() as i32..end.y.ceil() as i32 {
+        for col in start.x.floor() as i32..end.x.ceil() as i32 {
+            if (row + col) % 2 == 0 {
+                let cell = origin + Vec2::new(col as f32, row as f32) * CELL;
+                let tile = Rect::from_min_size(cell, Vec2::splat(CELL)).intersect(visible);
+                mesh.add_colored_rect(tile, colors.border);
+            }
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn halves(rect: Rect) -> (Rect, Rect) {

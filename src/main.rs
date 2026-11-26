@@ -8,6 +8,7 @@ mod diff;
 mod git;
 mod graph;
 mod history;
+mod image_diff;
 mod logging;
 mod settings;
 mod tasks;
@@ -22,6 +23,8 @@ mod ui_inspector;
 mod ui_workbook;
 #[cfg(windows)]
 mod window_chrome;
+#[cfg(windows)]
+mod window_job;
 #[cfg(windows)]
 mod workbook_worker;
 

@@ -3,6 +3,7 @@ use crate::git::{
     self, Change, Commit, Compare, Details, HistoryScope, Operation, Status, Submodule,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
+use crate::image_diff::{self, ImageColumn, ImageDiff, ImageSide};
 use crate::logging::{self, Presentation, ReadLog};
 use crate::settings::{self, Settings, Tool};
 use crate::tasks::{ReadKind, Scheduler};
@@ -28,13 +29,18 @@ enum Work<'a> {
     Write,
 }
 
+enum DiffUpdate {
+    Complete(Outcome<Content>),
+    Image(ImageColumn, ImageSide),
+}
+
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
     History(PathBuf, u64, Result<Option<HistoryView>>),
     HistorySearch(u64, u64, Outcome<SearchResult>),
     Status(PathBuf, u64, Result<Status>, Result<Vec<Submodule>>),
     Details(u64, u64, Selection, Outcome<Details>),
-    Diff(u64, u64, Outcome<Content>),
+    Diff(u64, u64, DiffUpdate),
     Operation(PathBuf, Option<String>, Outcome<String>),
     External(Outcome<TempDir>),
 }
@@ -157,6 +163,7 @@ pub(crate) struct Desk {
     requests: u64,
     details_request: u64,
     diff_request: u64,
+    diff_cancel: Option<Arc<AtomicBool>>,
     external_dirs: Vec<TempDir>,
     timings: Option<Timings>,
     presentation: Option<Presentation>,
@@ -298,6 +305,7 @@ impl Desk {
             requests: 0,
             details_request: 0,
             diff_request: 0,
+            diff_cancel: None,
             external_dirs: Vec::new(),
             timings: Timings::open(started),
             presentation: None,
@@ -1095,13 +1103,45 @@ impl Desk {
         };
         let request = self.next();
         self.diff_request = request;
-        self.content = None;
+        let canceled = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.diff_cancel.replace(canceled.clone()) {
+            previous.store(true, Ordering::Relaxed);
+        }
         self.diff_error = None;
+        self.show_full_line = None;
         self.diff_busy = true;
         self.diff_reset += 1;
         let force_text = self.force_text;
+        let image = !force_text && image_diff::supports_pair(&pair);
+        self.content = Some(if image {
+            Content::Image(ImageDiff::pending())
+        } else if !force_text && diff::is_workbook_pair(&pair) {
+            Content::LoadingWorkbook
+        } else {
+            Content::LoadingText
+        });
+        ctx.request_repaint();
         let path = root.clone();
         let log = ReadLog::queue("diff", &path, request);
+        if image {
+            let events = self.events.clone();
+            let ctx = ctx.clone();
+            self.tasks.latest(
+                ReadKind::Diff,
+                &path,
+                request,
+                Box::new(move || {
+                    let started = Instant::now();
+                    image_diff::load(&root, &pair, &log, &canceled, |column, image| {
+                        let update = DiffUpdate::Image(column, image);
+                        let _ = events.send(Event::Diff(log.worktree, request, update));
+                        ctx.request_repaint();
+                    });
+                    log.complete(started, "ok");
+                }),
+            );
+            return;
+        }
         self.submit(
             ctx,
             Work::Latest(ReadKind::Diff, &path, request),
@@ -1109,12 +1149,15 @@ impl Desk {
                 let started = Instant::now();
                 let result = readable(diff::compare(&root, &pair, force_text, &log));
                 log.complete(started, if result.is_ok() { "ok" } else { "failed" });
-                Event::Diff(log.worktree, request, result)
+                Event::Diff(log.worktree, request, DiffUpdate::Complete(result))
             },
         );
     }
 
     pub fn clear_diff(&mut self) {
+        if let Some(canceled) = self.diff_cancel.take() {
+            canceled.store(true, Ordering::Relaxed);
+        }
         if let Some(active) = &self.active {
             self.tasks.cancel(active, Some(ReadKind::Diff));
         }
@@ -1423,17 +1466,29 @@ impl Desk {
                         }
                     }
                 }
-                Event::Diff(worktree, request, result) => {
+                Event::Diff(worktree, request, update) => {
                     if request != self.diff_request {
                         tracing::debug!(kind = "diff", worktree, request, "read_stale");
                         continue;
                     }
-                    tracing::debug!(kind = "diff", worktree, request, "read_applied");
-                    self.diff_busy = false;
-                    match result {
-                        Ok(content) => self.content = Some(content),
-                        Err(error) => self.diff_error = Some(error),
+                    match update {
+                        DiffUpdate::Image(column, image) => {
+                            let Some(Content::Image(images)) = &mut self.content else {
+                                continue;
+                            };
+                            images.apply(column, image);
+                            if images.is_loading() {
+                                continue;
+                            }
+                        }
+                        DiffUpdate::Complete(result) => match result {
+                            Ok(content) => self.content = Some(content),
+                            Err(error) => self.diff_error = Some(error),
+                        },
                     }
+                    tracing::debug!(kind = "diff", worktree, request, "read_applied");
+                    self.diff_cancel = None;
+                    self.diff_busy = false;
                 }
                 Event::Operation(path, committed_message, result) => {
                     self.operations.remove(&path);

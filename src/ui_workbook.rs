@@ -43,8 +43,7 @@ impl SheetView {
             .min(workbook.sheets.len() - 1);
         let mut step = 0;
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("worksheet")
-                .width(115.0)
+            worksheet_picker()
                 .selected_text(&workbook.sheets[selected].name)
                 .show_ui(ui, |ui| {
                     for (index, sheet) in workbook.sheets.iter().enumerate() {
@@ -115,9 +114,28 @@ impl SheetView {
         let sheet = &workbook.sheets[selected];
         let focus = sheet.change(self.change);
         let jump = (changed_sheet || step != 0).then_some(focus).flatten();
-        diff_header(ui, &format!("旧版 · {left}"), &format!("新版 · {right}"));
+        version_header(ui, left, right);
         render_grid(ui, sheet, reset, focus, jump)
     }
+}
+
+fn worksheet_picker() -> egui::ComboBox {
+    egui::ComboBox::from_id_salt("worksheet").width(115.0)
+}
+
+fn version_header(ui: &mut egui::Ui, left: &str, right: &str) {
+    diff_header(ui, &format!("旧版 · {left}"), &format!("新版 · {right}"));
+}
+
+pub(crate) fn pending_header(ui: &mut egui::Ui, left: &str, right: &str) {
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(false, |ui| {
+            worksheet_picker()
+                .selected_text("工作表")
+                .show_ui(ui, |_| {});
+        });
+    });
+    version_header(ui, left, right);
 }
 
 fn render_grid(
