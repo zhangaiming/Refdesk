@@ -8,6 +8,7 @@ mod diff;
 mod git;
 mod graph;
 mod history;
+mod logging;
 mod settings;
 mod tasks;
 mod theme;
@@ -39,6 +40,10 @@ fn main() -> eframe::Result<()> {
     {
         std::process::exit(i32::from(workbook_worker::run().is_err()));
     }
+    let (runtime_log, log_warning) = match logging::RuntimeLog::open() {
+        Ok(log) => (log, None),
+        Err(error) => (None, Some(format!("无法初始化运行日志：{error}"))),
+    };
     while let Some(argument) = arguments.next() {
         if argument == "--repo" {
             if let Some(path) = arguments.next() {
@@ -66,14 +71,26 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |context| {
             ui::install_style(&context.egui_ctx);
-            Ok(Box::new(app::Desk::new(context, paths, import, started)))
+            let mut desk = app::Desk::new(context, paths, import, started);
+            if let Some(mut warning) = log_warning {
+                if !desk.status_message.is_empty() {
+                    warning.push('\n');
+                    warning.push_str(&desk.status_message);
+                }
+                desk.tell(warning, true);
+            }
+            Ok(Box::new(desk))
         }),
     ) {
+        tracing::error!(kind = "window_initialization", "app_start_failed");
         let _ = rfd::MessageDialog::new()
             .set_title("Refdesk 无法启动")
             .set_description(error.to_string())
             .show();
         return Err(error);
+    }
+    if let Some(log) = &runtime_log {
+        log.record_exit(started.elapsed());
     }
     Ok(())
 }

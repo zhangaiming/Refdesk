@@ -269,18 +269,80 @@ fn output(root: &Path, args: &[&str], read_only: bool) -> Result<Output> {
         .with_context(|| format!("无法执行 Git（{}）", root.display()))
 }
 
+#[derive(Debug)]
+struct GitExit {
+    code: Option<i32>,
+    message: String,
+}
+
+impl std::fmt::Display for GitExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GitExit {}
+
+pub(crate) fn error_kind(error: &anyhow::Error) -> (&'static str, Option<i32>) {
+    if let Some(exit) = error.downcast_ref::<GitExit>() {
+        ("git_exit", exit.code)
+    } else if error.downcast_ref::<std::io::Error>().is_some() {
+        ("io", None)
+    } else {
+        ("validation_or_parse", None)
+    }
+}
+
+pub(crate) fn log_version() {
+    if !tracing::enabled!(tracing::Level::INFO) {
+        return;
+    }
+    let version = command(None, true)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let output = std::str::from_utf8(&output.stdout).ok()?;
+            let version = output
+                .strip_prefix("git version ")?
+                .split_whitespace()
+                .next()?;
+            let digits = |part: &str| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit());
+            let (numeric, windows_build) = version
+                .split_once(".windows.")
+                .map_or((version, None), |(numeric, build)| (numeric, Some(build)));
+            if version.len() <= 32
+                && numeric.split('.').count() >= 2
+                && numeric.split('.').all(digits)
+                && windows_build.is_none_or(digits)
+            {
+                Some(version.to_owned())
+            } else {
+                None
+            }
+        });
+    if let Some(version) = version {
+        tracing::info!(version, "git_version");
+    } else {
+        tracing::warn!("git_version_unavailable");
+    }
+}
+
 fn checked(result: Output) -> Result<Vec<u8>> {
     if !result.status.success() {
         let message = String::from_utf8_lossy(&result.stderr);
         let stdout = String::from_utf8_lossy(&result.stdout);
-        bail!(
-            "{}",
-            if message.trim().is_empty() {
-                stdout.trim()
-            } else {
-                message.trim()
-            }
-        );
+        let message = if message.trim().is_empty() {
+            stdout.trim()
+        } else {
+            message.trim()
+        };
+        return Err(GitExit {
+            code: result.status.code(),
+            message: message.to_owned(),
+        }
+        .into());
     }
     Ok(result.stdout)
 }
@@ -903,6 +965,19 @@ pub enum Operation {
 }
 
 impl Operation {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Stage(_) => "stage",
+            Self::Unstage(_) => "unstage",
+            Self::Commit(_) => "commit",
+            Self::Switch(_) => "switch",
+            Self::Branch(_) => "branch_create",
+            Self::Fetch => "fetch",
+            Self::Pull => "pull",
+            Self::Push => "push",
+        }
+    }
+
     pub fn execute(&self, worktree: &Path) -> Result<String> {
         ensure!(
             root(worktree)?.canonicalize()? == worktree.canonicalize()?,

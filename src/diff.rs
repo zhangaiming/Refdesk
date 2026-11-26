@@ -5,9 +5,10 @@ use similar::{Algorithm, DiffTag, TextDiff};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::git::{self, Compare};
+use crate::logging::{self, ReadLog};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Kind {
@@ -109,9 +110,23 @@ pub fn is_workbook(path: &str) -> bool {
         })
 }
 
-pub fn compare(root: &Path, pair: &Compare, force_text: bool) -> Result<Content> {
-    let old = git::diff_snapshot(root, &pair.left, &pair.left_path, pair.left_gitlink)?;
-    let new = git::diff_snapshot(root, &pair.right, &pair.right_path, pair.right_gitlink)?;
+pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> Result<Content> {
+    let (worktree, request) = (log.worktree, log.request);
+    let snapshot = |version, path, gitlink| {
+        git::diff_snapshot(root, version, path, gitlink).inspect_err(|error| {
+            let (error_kind, exit_code) = git::error_kind(error);
+            tracing::warn!(
+                worktree,
+                request,
+                error_kind,
+                exit_code,
+                "diff_snapshot_failed"
+            );
+        })
+    };
+    let old = snapshot(&pair.left, pair.left_path.as_str(), pair.left_gitlink)?;
+    let new = snapshot(&pair.right, pair.right_path.as_str(), pair.right_gitlink)?;
+    let (left_bytes, right_bytes) = (old.len(), new.len());
     let lfs = |bytes: &[u8]| bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n");
     if !force_text
         && !pair.left_gitlink
@@ -121,30 +136,68 @@ pub fn compare(root: &Path, pair: &Compare, force_text: bool) -> Result<Content>
         && !lfs(&new)
     {
         #[cfg(windows)]
-        let workbook = crate::workbook_worker::compare(&old, &new)?;
+        let workbook = crate::workbook_worker::compare(&old, &new, log)?;
         #[cfg(not(windows))]
-        let workbook = compare_workbooks(&old, &new)?;
+        let workbook = compare_workbooks(&old, &new).inspect_err(|_| {
+            tracing::warn!(worktree, request, "workbook_compare_failed");
+        })?;
         return Ok(Content::Sheet(workbook));
     }
     let (Some(old_text), Some(new_text)) = (decode(&old), decode(&new)) else {
+        tracing::debug!(
+            worktree,
+            request,
+            kind = "binary",
+            left_bytes,
+            right_bytes,
+            "diff_input"
+        );
         return Ok(Content::Binary {
             left: old.len(),
             right: new.len(),
         });
     };
+    tracing::debug!(
+        worktree,
+        request,
+        kind = "text",
+        left_bytes,
+        right_bytes,
+        "diff_input"
+    );
     if old.len().max(new.len()) > 2 * 1024 * 1024
         || old_text.lines().count().max(new_text.lines().count()) > 30_000
     {
+        tracing::warn!(
+            worktree,
+            request,
+            kind = "text",
+            left_bytes,
+            right_bytes,
+            "diff_input_limit"
+        );
         return Ok(Content::Notice(
             "文件超过内置文本比较的上限，可以交给外部 diff 工具。".into(),
         ));
     }
     let old_text = old_text.replace("\r\n", "\n");
     let new_text = new_text.replace("\r\n", "\n");
+    let budget = Duration::from_millis(750);
+    let started = Instant::now();
     let result = TextDiff::configure()
         .algorithm(Algorithm::Patience)
-        .timeout(Duration::from_millis(750))
+        .timeout(budget)
         .diff_lines(&old_text, &new_text);
+    let elapsed = started.elapsed();
+    if elapsed >= budget {
+        // similar returns a diff even when it reaches its internal deadline.
+        tracing::warn!(
+            worktree,
+            request,
+            elapsed_ms = logging::millis(elapsed),
+            "text_diff_budget_reached"
+        );
+    }
     let mut lines = Vec::new();
     let mut added = 0;
     let mut removed = 0;

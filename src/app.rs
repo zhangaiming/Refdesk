@@ -3,6 +3,7 @@ use crate::git::{
     self, Change, Commit, Compare, Details, HistoryScope, Operation, Status, Submodule,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
+use crate::logging::{self, Presentation, ReadLog};
 use crate::settings::{self, Settings, Tool};
 use crate::tasks::{ReadKind, Scheduler};
 use crate::timing::{FrameCapture, Timings};
@@ -22,17 +23,17 @@ const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(25);
 
 enum Work<'a> {
     Read,
-    Latest(ReadKind, &'a Path),
+    Latest(ReadKind, &'a Path, u64),
     Write,
 }
 
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
-    History(PathBuf, u64, Outcome<Option<HistoryView>>),
-    HistorySearch(u64, Outcome<SearchResult>),
-    Status(PathBuf, u64, Outcome<Status>, Outcome<Vec<Submodule>>),
-    Details(u64, Selection, Outcome<Details>),
-    Diff(u64, Outcome<Content>),
+    History(PathBuf, u64, Result<Option<HistoryView>>),
+    HistorySearch(u64, u64, Outcome<SearchResult>),
+    Status(PathBuf, u64, Result<Status>, Result<Vec<Submodule>>),
+    Details(u64, u64, Selection, Outcome<Details>),
+    Diff(u64, u64, Outcome<Content>),
     Operation(PathBuf, Option<String>, Outcome<String>),
     External(Outcome<TempDir>),
 }
@@ -56,6 +57,10 @@ pub(crate) struct Repository {
     draft: String,
     status_request: u64,
     status_checked: Option<Instant>,
+    visible_history_request: Option<u64>,
+    visible_status_request: Option<u64>,
+    status_warning: Option<Instant>,
+    submodule_warning: Option<Instant>,
     refresh_on_focus: bool,
 }
 
@@ -150,6 +155,7 @@ pub(crate) struct Desk {
     diff_request: u64,
     external_dirs: Vec<TempDir>,
     timings: Option<Timings>,
+    presentation: Option<Presentation>,
     frame_capture: Option<FrameCapture>,
     tasks: Scheduler,
     events: Sender<Event>,
@@ -168,16 +174,21 @@ impl Desk {
         started: Instant,
     ) -> Self {
         let ctx = &creation.egui_ctx;
+        let restoring = Instant::now();
         let (events, inbox) = unbounded();
         let (mut settings, mut warning, writes_enabled) = match Settings::load() {
             Ok(settings) => (settings, None, true),
-            Err(error) => (Settings::default(), Some(error.to_string()), false),
+            Err(error) => {
+                tracing::warn!(action = "load", "settings_failed");
+                (Settings::default(), Some(error.to_string()), false)
+            }
         };
         normalize_repositories(&mut settings);
         for path in paths {
             let path = match git::root(&path) {
                 Ok(root) => root,
                 Err(error) => {
+                    tracing::warn!(origin = "command_line", "repository_add_failed");
                     warning
                         .get_or_insert_with(|| format!("无法打开 {}：{error:#}", path.display()));
                     continue;
@@ -188,6 +199,11 @@ impl Desk {
                 .iter()
                 .any(|old| same_path(old, &path))
             {
+                tracing::info!(
+                    worktree = logging::worktree_id(&path),
+                    origin = "command_line",
+                    "repository_added"
+                );
                 settings.repositories.push(path);
             }
         }
@@ -219,6 +235,11 @@ impl Desk {
                 .as_ref()
                 .is_some_and(|path| is_descendant(active, path))
         });
+        tracing::debug!(
+            repositories = settings.repositories.len(),
+            elapsed_ms = logging::millis(restoring.elapsed()),
+            "session_restored"
+        );
         let status_is_error = warning.is_some();
         settings.theme.apply(ctx);
         let mut desk = Self {
@@ -262,6 +283,7 @@ impl Desk {
             diff_request: 0,
             external_dirs: Vec::new(),
             timings: Timings::open(started),
+            presentation: None,
             frame_capture: FrameCapture::from_environment(),
             tasks: Scheduler::new(),
             events,
@@ -270,6 +292,7 @@ impl Desk {
         if let Some(path) = initial {
             desk.activate_path(ctx, path);
         }
+        desk.tasks.read(Box::new(git::log_version));
         desk
     }
 
@@ -292,7 +315,7 @@ impl Desk {
         });
         match work {
             Work::Read => self.tasks.read(task),
-            Work::Latest(kind, path) => self.tasks.latest(kind, path, task),
+            Work::Latest(kind, path, request) => self.tasks.latest(kind, path, request, task),
             Work::Write => self.tasks.write(task),
         }
     }
@@ -306,6 +329,7 @@ impl Desk {
         if self.writes_enabled
             && let Err(error) = self.settings.save()
         {
+            tracing::warn!(action = "save", "settings_failed");
             self.tell(format!("保存配置失败：{error:#}"), true);
         }
     }
@@ -486,7 +510,14 @@ impl Desk {
         self.editor =
             std::mem::take(&mut self.repos.get_mut(&path).expect("active repository").draft);
 
+        let activation = self.next();
         let state = self.repos.get_mut(&path).expect("active repository");
+        self.presentation = Some(Presentation::activate(
+            &path,
+            activation,
+            state.history.is_some(),
+            state.status.is_some(),
+        ));
         state.history_viewport = 0..2;
         if let Some(history) = &state.history {
             history.cache.set_active(true);
@@ -521,6 +552,7 @@ impl Desk {
             }
             self.cancel_history_search();
             self.active = None;
+            self.presentation = None;
             self.restore_active = None;
             self.settings.active = None;
             self.selection = Selection::Worktree;
@@ -536,7 +568,7 @@ impl Desk {
     }
 
     pub fn request_history(&mut self, ctx: &egui::Context, path: &Path) {
-        self.queue_history(ctx, path, false, None);
+        self.queue_history(ctx, path, "request", false, None);
     }
 
     fn deactivate_history(&mut self, path: &Path) {
@@ -557,6 +589,7 @@ impl Desk {
         &mut self,
         ctx: &egui::Context,
         path: &Path,
+        source: &'static str,
         check_superproject: bool,
         checked_refs: Option<usize>,
     ) {
@@ -601,27 +634,50 @@ impl Desk {
         let root = path.to_owned();
         let filter = state.filter.clone();
         let range = state.history_viewport.clone();
-        self.submit(ctx, Work::Latest(ReadKind::History, path), move || {
-            let result = readable((|| {
-                if check_superproject && git::has_superproject(&root)? {
-                    return Ok(None);
-                }
-                let cache = HistoryCache::open(&root, &filter, active)?;
-                let summary = cache.load_through(range.end.saturating_sub(1).max(1), &canceled)?;
-                let pages = if active {
-                    cache.window(range, summary, Default::default())?
-                } else {
-                    Default::default()
+        let log = ReadLog::queue("history", path, request);
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::History, path, request),
+            move || {
+                let started = Instant::now();
+                let result = (|| {
+                    if check_superproject && git::has_superproject(&root)? {
+                        return Ok(None);
+                    }
+                    let cache = HistoryCache::open(&root, &filter, active)?;
+                    let summary =
+                        cache.load_through(range.end.saturating_sub(1).max(1), &canceled)?;
+                    let pages = if active {
+                        cache.window(range, summary, Default::default())?
+                    } else {
+                        Default::default()
+                    };
+                    tracing::debug!(
+                        worktree = log.worktree,
+                        request,
+                        source,
+                        active,
+                        commits = summary.loaded,
+                        pages = pages.len(),
+                        "history_built"
+                    );
+                    Ok(Some(HistoryView {
+                        cache,
+                        summary,
+                        pages,
+                        generation: request,
+                    }))
+                })();
+                let outcome = match &result {
+                    Ok(Some(_)) => "ok",
+                    Ok(None) => "on_demand",
+                    Err(_) if canceled.load(Ordering::Relaxed) => "canceled",
+                    Err(_) => "failed",
                 };
-                Ok(Some(HistoryView {
-                    cache,
-                    summary,
-                    pages,
-                    generation: request,
-                }))
-            })());
-            Event::History(root, request, result)
-        });
+                log.complete(started, outcome);
+                Event::History(root, request, result)
+            },
+        );
     }
 
     fn request_status(&mut self, ctx: &egui::Context, path: &Path, force: bool) {
@@ -642,11 +698,23 @@ impl Desk {
         state.status_error = None;
         state.refresh_on_focus = false;
         let root = path.to_owned();
-        self.submit(ctx, Work::Latest(ReadKind::Status, path), move || {
-            let result = readable(git::status(&root));
-            let submodules = readable(git::submodules(&root));
-            Event::Status(root, request, result, submodules)
-        });
+        let log = ReadLog::queue("status", path, request);
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::Status, path, request),
+            move || {
+                let started = Instant::now();
+                let result = git::status(&root);
+                let submodules = git::submodules(&root);
+                let outcome = if result.is_ok() && submodules.is_ok() {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                log.complete(started, outcome);
+                Event::Status(root, request, result, submodules)
+            },
+        );
     }
 
     pub fn refresh(&mut self, ctx: &egui::Context) {
@@ -674,7 +742,7 @@ impl Desk {
         state.history_viewport = 0..2;
         self.graph_reset += 1;
         self.search_row = None;
-        self.queue_history(ctx, &path, false, Some(checked_refs));
+        self.queue_history(ctx, &path, "filter", false, Some(checked_refs));
         self.save();
     }
 
@@ -714,23 +782,45 @@ impl Desk {
         let pages = history.pages.clone();
         let generation = history.generation;
         let root = path.clone();
-        self.submit(ctx, Work::Latest(ReadKind::History, &path), move || {
-            let result = readable((|| {
-                let summary = if extend {
-                    cache.load_through(summary.page_count() + 1, &canceled)?
+        let log = ReadLog::queue("history", &path, request);
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::History, &path, request),
+            move || {
+                let started = Instant::now();
+                let result = (|| {
+                    let summary = if extend {
+                        cache.load_through(summary.page_count() + 1, &canceled)?
+                    } else {
+                        summary
+                    };
+                    let pages = cache.window(range, summary, pages)?;
+                    tracing::debug!(
+                        worktree = log.worktree,
+                        request,
+                        source = if extend { "more" } else { "cache_window" },
+                        commits = summary.loaded,
+                        pages = pages.len(),
+                        "history_window_loaded"
+                    );
+                    Ok(Some(HistoryView {
+                        cache,
+                        summary,
+                        pages,
+                        generation,
+                    }))
+                })();
+                let outcome = if result.is_ok() {
+                    "ok"
+                } else if canceled.load(Ordering::Relaxed) {
+                    "canceled"
                 } else {
-                    summary
+                    "failed"
                 };
-                let pages = cache.window(range, summary, pages)?;
-                Ok(Some(HistoryView {
-                    cache,
-                    summary,
-                    pages,
-                    generation,
-                }))
-            })());
-            Event::History(root, request, result)
-        });
+                log.complete(started, outcome);
+                Event::History(root, request, result)
+            },
+        );
         ctx.request_repaint();
     }
 
@@ -785,14 +875,22 @@ impl Desk {
         });
         let anchor = self.search_row;
         let query = query.to_owned();
+        let log = ReadLog::queue("history_search", &path, request);
         self.submit(
             ctx,
-            Work::Latest(ReadKind::HistorySearch, &path),
+            Work::Latest(ReadKind::HistorySearch, &path, request),
             move || {
-                Event::HistorySearch(
-                    request,
-                    readable(cache.search(&query, loaded, anchor, direction, &canceled)),
-                )
+                let started = Instant::now();
+                let result = readable(cache.search(&query, loaded, anchor, direction, &canceled));
+                let outcome = if result.is_ok() {
+                    "ok"
+                } else if canceled.load(Ordering::Relaxed) {
+                    "canceled"
+                } else {
+                    "failed"
+                };
+                log.complete(started, outcome);
+                Event::HistorySearch(log.worktree, request, result)
             },
         );
     }
@@ -848,45 +946,59 @@ impl Desk {
         self.details_busy = true;
         self.clear_diff();
         let path = root.clone();
-        self.submit(ctx, Work::Latest(ReadKind::Details, &path), move || {
-            let (left, right, right_position) = if let Some((commit, position)) = current {
-                let current_row = match position {
-                    Some((snapshot, index)) if snapshot == generation => Some(index),
-                    _ => match cache.position(loaded, &commit.id) {
-                        Ok(index) => index,
-                        Err(error) => {
-                            let selection = Selection::Commit {
-                                right: item,
-                                left: Some(commit),
-                                right_position: Some((generation, row)),
-                            };
-                            return Event::Details(request, selection, Err(format!("{error:#}")));
-                        }
-                    },
-                };
-                if current_row.is_some_and(|index| row < index) {
-                    (Some(commit), item, Some((generation, row)))
+        let log = ReadLog::queue("details", &path, request);
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::Details, &path, request),
+            move || {
+                let started = Instant::now();
+                let (left, right, right_position) = if let Some((commit, position)) = current {
+                    let current_row = match position {
+                        Some((snapshot, index)) if snapshot == generation => Some(index),
+                        _ => match cache.position(loaded, &commit.id) {
+                            Ok(index) => index,
+                            Err(error) => {
+                                let selection = Selection::Commit {
+                                    right: item,
+                                    left: Some(commit),
+                                    right_position: Some((generation, row)),
+                                };
+                                log.complete(started, "failed");
+                                return Event::Details(
+                                    log.worktree,
+                                    request,
+                                    selection,
+                                    Err(format!("{error:#}")),
+                                );
+                            }
+                        },
+                    };
+                    if current_row.is_some_and(|index| row < index) {
+                        (Some(commit), item, Some((generation, row)))
+                    } else {
+                        (
+                            Some(item),
+                            commit,
+                            current_row.map(|index| (generation, index)),
+                        )
+                    }
                 } else {
-                    (
-                        Some(item),
-                        commit,
-                        current_row.map(|index| (generation, index)),
-                    )
-                }
-            } else {
-                (None, item, Some((generation, row)))
-            };
-            let result = readable(git::details(&root, &right, left.as_deref()));
-            Event::Details(
-                request,
-                Selection::Commit {
-                    right,
-                    left,
-                    right_position,
-                },
-                result,
-            )
-        });
+                    (None, item, Some((generation, row)))
+                };
+                let result = readable(git::details(&root, &right, left.as_deref()));
+                log.complete(started, if result.is_ok() { "ok" } else { "failed" });
+                Event::Details(
+                    log.worktree,
+                    request,
+                    Selection::Commit {
+                        right,
+                        left,
+                        right_position,
+                    },
+                    result,
+                )
+            },
+        );
     }
 
     pub fn choose_file(&mut self, ctx: &egui::Context, file: Change) {
@@ -914,9 +1026,17 @@ impl Desk {
         self.diff_reset = request;
         let force_text = self.force_text;
         let path = root.clone();
-        self.submit(ctx, Work::Latest(ReadKind::Diff, &path), move || {
-            Event::Diff(request, readable(diff::compare(&root, &pair, force_text)))
-        });
+        let log = ReadLog::queue("diff", &path, request);
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::Diff, &path, request),
+            move || {
+                let started = Instant::now();
+                let result = readable(diff::compare(&root, &pair, force_text, &log));
+                log.complete(started, if result.is_ok() { "ok" } else { "failed" });
+                Event::Diff(log.worktree, request, result)
+            },
+        );
     }
 
     pub fn clear_diff(&mut self) {
@@ -939,10 +1059,43 @@ impl Desk {
             Operation::Commit(message) => Some(message.clone()),
             _ => None,
         };
+        let request = self.next();
+        let worktree = logging::worktree_id(&root);
+        let kind = operation.kind();
+        let queued = Instant::now();
+        tracing::info!(kind, worktree, request, "git_operation_requested");
         self.tell("正在运行 Git…", false);
         self.submit(ctx, Work::Write, move || {
-            let result = readable(operation.execute(&root));
-            Event::Operation(root, committed_message, result)
+            let started = Instant::now();
+            let queue_ms = logging::millis(started.duration_since(queued));
+            tracing::debug!(kind, worktree, request, queue_ms, "git_operation_started");
+            let result = operation.execute(&root);
+            let run_ms = logging::millis(started.elapsed());
+            match &result {
+                Ok(_) => tracing::info!(
+                    kind,
+                    worktree,
+                    request,
+                    queue_ms,
+                    run_ms,
+                    exit_code = 0,
+                    "git_operation_succeeded"
+                ),
+                Err(error) => {
+                    let (error_kind, exit_code) = git::error_kind(error);
+                    tracing::warn!(
+                        kind,
+                        worktree,
+                        request,
+                        queue_ms,
+                        run_ms,
+                        error_kind,
+                        exit_code,
+                        "git_operation_failed"
+                    );
+                }
+            }
+            Event::Operation(root, committed_message, readable(result))
         });
     }
 
@@ -950,10 +1103,16 @@ impl Desk {
         let (Some(root), Some(pair)) = (self.active.clone(), self.comparison.clone()) else {
             return;
         };
+        let request = self.next();
+        let worktree = logging::worktree_id(&root);
+        let queued = Instant::now();
         self.tell(format!("正在准备 {} 的两个版本…", tool.name), false);
         self.submit(ctx, Work::Read, move || {
-            Event::External(readable((|| {
+            let started = Instant::now();
+            let mut stage = "prepare";
+            let result = (|| {
                 let launch = settings::prepare_external(&root, &pair, &tool)?;
+                stage = "launch";
                 for invocation in &launch.commands {
                     let mut process = settings::start_external(&root, invocation)?;
                     // Reap tools independently. A detached GUI may read its snapshot later.
@@ -962,7 +1121,22 @@ impl Desk {
                     });
                 }
                 Ok(launch.dir)
-            })()))
+            })();
+            let queue_ms = logging::millis(started.duration_since(queued));
+            let run_ms = logging::millis(started.elapsed());
+            if result.is_ok() {
+                tracing::debug!(worktree, request, queue_ms, run_ms, "external_diff_started");
+            } else {
+                tracing::warn!(
+                    worktree,
+                    request,
+                    stage,
+                    queue_ms,
+                    run_ms,
+                    "external_diff_failed"
+                );
+            }
+            Event::External(readable(result))
         });
     }
 
@@ -986,6 +1160,11 @@ impl Desk {
                                 .iter()
                                 .any(|old| same_path(&path, old))
                             {
+                                tracing::info!(
+                                    worktree = logging::worktree_id(&path),
+                                    origin = if activate { "picker" } else { "discovery" },
+                                    "repository_added"
+                                );
                                 self.settings.repositories.push(path);
                                 added += 1;
                             }
@@ -1007,15 +1186,29 @@ impl Desk {
                             self.tell("没有新的工作树可以添加", false);
                         }
                     }
-                    Err(error) => self.tell(error, true),
+                    Err(error) => {
+                        tracing::warn!(
+                            origin = if activate { "picker" } else { "discovery" },
+                            "repository_add_failed"
+                        );
+                        self.tell(error, true);
+                    }
                 },
                 Event::History(path, request, result) => {
-                    let Some(state) = self.repos.get_mut(&path) else {
+                    let Some(state) = self
+                        .repos
+                        .get_mut(&path)
+                        .filter(|state| state.history_request == request)
+                    else {
+                        tracing::debug!(
+                            kind = "history",
+                            worktree = logging::worktree_id(&path),
+                            request,
+                            "read_stale"
+                        );
                         continue;
                     };
-                    if state.history_request != request {
-                        continue;
-                    }
+                    logging::read_applied("history", &path, request);
                     state.history_busy = false;
                     state.history_cancel = None;
                     let pending = state.history_pending_window.take();
@@ -1033,6 +1226,7 @@ impl Desk {
                                 self.tasks.read(Box::new(move || cache.pause_if_inactive()));
                             }
                             state.history = Some(history);
+                            state.visible_history_request = Some(request);
                         }
                         Ok(None) => {
                             state.history_on_demand = true;
@@ -1041,12 +1235,13 @@ impl Desk {
                             }
                         }
                         Err(error) => {
-                            state.history_error = Some(error);
+                            logging::read_failed("history", &path, request, &error);
+                            state.history_error = Some(format!("{error:#}"));
                             state.history_failed_window = pending;
                         }
                     }
                 }
-                Event::HistorySearch(request, result) => {
+                Event::HistorySearch(worktree, request, result) => {
                     if let Some(search) = &mut self.history_search
                         && search.request == request
                     {
@@ -1057,20 +1252,40 @@ impl Desk {
                             }
                             result.count
                         }));
+                        tracing::debug!(kind = "history_search", worktree, request, "read_applied");
+                    } else {
+                        tracing::debug!(kind = "history_search", worktree, request, "read_stale");
                     }
                 }
                 Event::Status(path, request, result, submodules) => {
-                    let Some(state) = self.repos.get_mut(&path) else {
+                    let Some(state) = self
+                        .repos
+                        .get_mut(&path)
+                        .filter(|state| state.status_request == request)
+                    else {
+                        tracing::debug!(
+                            kind = "status",
+                            worktree = logging::worktree_id(&path),
+                            request,
+                            "read_stale"
+                        );
                         continue;
                     };
-                    if state.status_request != request {
-                        continue;
-                    }
+                    logging::read_applied("status", &path, request);
                     state.status_busy = false;
                     state.status_checked = Some(Instant::now());
                     match result {
-                        Ok(status) => state.status = Some(status),
-                        Err(error) => state.status_error = Some(error),
+                        Ok(status) => {
+                            state.status = Some(status);
+                            state.visible_status_request = Some(request);
+                            state.status_warning = None;
+                        }
+                        Err(error) => {
+                            if logging::warn_periodic(&mut state.status_warning) {
+                                logging::read_failed("status", &path, request, &error);
+                            }
+                            state.status_error = Some(format!("{error:#}"));
+                        }
                     }
                     let updated = match submodules {
                         Ok(mut modules) => {
@@ -1085,11 +1300,15 @@ impl Desk {
                                 }
                             }
                             state.submodules = Some(modules);
+                            state.submodule_warning = None;
                             true
                         }
                         Err(error) => {
+                            if logging::warn_periodic(&mut state.submodule_warning) {
+                                logging::read_failed("submodules", &path, request, &error);
+                            }
                             self.tell(
-                                format!("无法读取 {} 的子模块：{error}", path.display()),
+                                format!("无法读取 {} 的子模块：{error:#}", path.display()),
                                 true,
                             );
                             false
@@ -1109,15 +1328,27 @@ impl Desk {
                         self.activate(ctx, path);
                     }
                 }
-                Event::Details(request, selection, result) if request == self.details_request => {
+                Event::Details(worktree, request, selection, result) => {
+                    if request != self.details_request {
+                        tracing::debug!(kind = "details", worktree, request, "read_stale");
+                        continue;
+                    }
                     self.selection = selection;
                     self.details_busy = false;
                     match result {
                         Ok(details) => self.details = Some(details),
-                        Err(error) => self.details_error = Some(error),
+                        Err(error) => {
+                            tracing::warn!(kind = "details", worktree, request, "read_failed");
+                            self.details_error = Some(error);
+                        }
                     }
                 }
-                Event::Diff(request, result) if request == self.diff_request => {
+                Event::Diff(worktree, request, result) => {
+                    if request != self.diff_request {
+                        tracing::debug!(kind = "diff", worktree, request, "read_stale");
+                        continue;
+                    }
+                    tracing::debug!(kind = "diff", worktree, request, "read_applied");
                     self.diff_busy = false;
                     match result {
                         Ok(content) => self.content = Some(content),
@@ -1164,7 +1395,6 @@ impl Desk {
                     }
                     Err(error) => self.tell(error, true),
                 },
-                _ => {}
             }
         }
     }
@@ -1222,17 +1452,23 @@ impl Desk {
                 capture.queue(ctx);
             }
         }
-        if let Some(timings) = &mut self.timings
-            && let Some(path) = &self.active
+        if let Some(path) = &self.active
             && let Some(repo) = self.repos.get(path)
         {
-            timings.presented(
-                path,
-                repo.history
-                    .as_ref()
-                    .is_some_and(HistoryView::ready_to_draw),
-                repo.status.is_some() && !repo.status_busy,
-            );
+            let graph_ready = repo
+                .history
+                .as_ref()
+                .is_some_and(HistoryView::ready_to_draw);
+            let status_ready = repo.status.is_some() && !repo.status_busy;
+            if let Some(timings) = &mut self.timings {
+                timings.presented(path, graph_ready, status_ready);
+            }
+            if let Some(presentation) = &mut self.presentation {
+                presentation.presented(
+                    repo.visible_history_request.filter(|_| graph_ready),
+                    repo.visible_status_request.filter(|_| status_ready),
+                );
+            }
         }
     }
 
@@ -1267,7 +1503,7 @@ impl Desk {
                 .repositories
                 .iter()
                 .any(|parent| is_descendant(&path, parent));
-            self.queue_history(ctx, &path, nested, None);
+            self.queue_history(ctx, &path, "prefetch", nested, None);
         }
     }
 

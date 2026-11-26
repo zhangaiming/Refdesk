@@ -1,10 +1,12 @@
 use crate::diff::{WorkbookDiff, compare_workbooks};
 use crate::git::MAX_SNAPSHOT;
+use crate::logging::{self, ReadLog};
 use anyhow::{Context, Result, ensure};
 use std::io::{BufReader, BufWriter, Read, Write, stdin, stdout};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::time::Instant;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
@@ -19,7 +21,9 @@ const MAX_CPU_TIME: i64 = 30 * 10_000_000; // 100 ns units
 const LIMIT_MESSAGE: &str = "工作簿超出内置比较的解析预算或无法读取，请使用外部工具";
 type Reply = std::result::Result<WorkbookDiff, String>;
 
-pub(crate) fn compare(left: &[u8], right: &[u8]) -> Result<WorkbookDiff> {
+pub(crate) fn compare(left: &[u8], right: &[u8], log: &ReadLog) -> Result<WorkbookDiff> {
+    let (worktree, request) = (log.worktree, log.request);
+    let started = Instant::now();
     let mut child = Command::new(std::env::current_exe()?)
         .arg(ARGUMENT)
         .stdin(Stdio::piped())
@@ -27,13 +31,34 @@ pub(crate) fn compare(left: &[u8], right: &[u8]) -> Result<WorkbookDiff> {
         .stderr(Stdio::null())
         .creation_flags(0x08000000)
         .spawn()
-        .context("无法启动工作簿解析进程")?;
+        .context("无法启动工作簿解析进程")
+        .inspect_err(|_| {
+            tracing::warn!(worktree, request, stage = "spawn", "workbook_worker_failed")
+        })?;
+    let pid = child.id();
+    tracing::debug!(
+        worktree,
+        request,
+        pid,
+        left_bytes = left.len(),
+        right_bytes = right.len(),
+        "workbook_worker_started"
+    );
     // The child waits for input until its memory and CPU limits are installed.
     let job = match limit_process(&child) {
         Ok(job) => job,
         Err(error) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let exit_code = child.wait().ok().and_then(|status| status.code());
+            tracing::warn!(
+                worktree,
+                request,
+                pid,
+                stage = "apply_limits",
+                exit_code,
+                run_ms = logging::millis(started.elapsed()),
+                "workbook_worker_failed"
+            );
             return Err(error).context("无法限制工作簿解析进程，请使用外部工具");
         }
     };
@@ -49,8 +74,52 @@ pub(crate) fn compare(left: &[u8], right: &[u8]) -> Result<WorkbookDiff> {
     if !bounded || reply.is_err() {
         let _ = child.kill();
     }
-    let status = child.wait()?;
+    let status = child.wait().inspect_err(|_| {
+        tracing::warn!(
+            worktree,
+            request,
+            pid,
+            stage = "wait",
+            run_ms = logging::millis(started.elapsed()),
+            "workbook_worker_failed"
+        );
+    })?;
     drop(job);
+    let exit_code = status.code();
+    let run_ms = logging::millis(started.elapsed());
+    let stage = if !bounded {
+        Some("output_limit")
+    } else if written.is_err() {
+        Some("write_input")
+    } else if !status.success() {
+        Some("process_exit")
+    } else if reply.is_err() {
+        Some("read_result")
+    } else if matches!(reply, Ok(Err(_))) {
+        Some("parse_workbook")
+    } else {
+        None
+    };
+    if let Some(stage) = stage {
+        tracing::warn!(
+            worktree,
+            request,
+            pid,
+            stage,
+            exit_code,
+            run_ms,
+            "workbook_worker_failed"
+        );
+    } else {
+        tracing::debug!(
+            worktree,
+            request,
+            pid,
+            exit_code,
+            run_ms,
+            "workbook_worker_finished"
+        );
+    }
     ensure!(status.success() && bounded, "{LIMIT_MESSAGE}");
     written.context(LIMIT_MESSAGE)?;
     reply.context(LIMIT_MESSAGE)?.map_err(anyhow::Error::msg)

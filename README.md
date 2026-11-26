@@ -22,6 +22,12 @@ Refdesk 是 Windows 上的 Rust Git 桌面客户端。左边放仓库和分支�
 - Excel 内置视图按坐标比较工作表、值和公式。「Excel Diff ↗」会用已匹配的外部规则打开两个文件版本。工具配置可以从 SmartGit 导入，也可以手动添加和排序。按从上到下的规则顺序匹配。
 - 标题栏「外观」提供冷白蓝、暖白棕两套亮色和暖灰绿、深蓝灰两套暗色。切换立即应用到工作台并保存到当前会话，首次使用默认暖灰绿。
 
+## 运行日志
+
+Windows 桌面版默认在 `%LOCALAPPDATA%\Refdesk\logs` 写入 INFO 级别日志。日志记录启动与退出、仓库激活、提交图和状态就绪、Git 操作及差异失败。文件名包含启动时间、进程 ID 和 UTC 日期，按日滚动，自动清理超过七天的已关闭日志。
+
+启动前可设置 `REFDESK_LOG_DIR` 指定日志目录，或设置 `REFDESK_LOG_LEVEL=DEBUG` 记录后台请求和缓存细节。支持 `TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR`、`OFF`。未设置或值无效时使用 INFO。日志只保存在本机，工作树用会话内的匿名编号表示。
+
 ## 构建和验证
 
 Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。使用 windows-gnu 工具链时需要 GNU Binutils。Windows x64 的工具链配置、Release EXE 打包和校验步骤见 [Windows 打包流程](docs/PACKAGING.md)。

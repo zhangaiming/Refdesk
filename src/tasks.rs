@@ -1,3 +1,4 @@
+use crate::logging;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,6 +14,18 @@ pub enum ReadKind {
     Diff,
 }
 
+impl ReadKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::HistorySearch => "history_search",
+            Self::Status => "status",
+            Self::Details => "details",
+            Self::Diff => "diff",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ReadKey {
     kind: ReadKind,
@@ -21,6 +34,7 @@ struct ReadKey {
 
 struct ReadTask {
     key: Option<ReadKey>,
+    request: u64,
     task: Task,
 }
 
@@ -95,19 +109,36 @@ impl Scheduler {
 
     pub fn read(&self, task: Task) {
         let mut queue = self.0.queue.lock().expect("task queue");
-        queue.reads.push_back(ReadTask { key: None, task });
+        queue.reads.push_back(ReadTask {
+            key: None,
+            request: 0,
+            task,
+        });
         self.0.read_ready.notify_one();
     }
 
-    pub fn latest(&self, kind: ReadKind, root: &Path, task: Task) {
+    pub fn latest(&self, kind: ReadKind, root: &Path, request: u64, task: Task) {
         let key = ReadKey {
             kind,
             root: root.to_owned(),
         };
         let mut queue = self.0.queue.lock().expect("task queue");
-        queue.reads.retain(|job| job.key.as_ref() != Some(&key));
+        queue.reads.retain(|job| {
+            let replaced = job.key.as_ref() == Some(&key);
+            if replaced {
+                tracing::debug!(
+                    kind = kind.name(),
+                    worktree = logging::worktree_id(root),
+                    request = job.request,
+                    replacement = request,
+                    "read_superseded"
+                );
+            }
+            !replaced
+        });
         queue.reads.push_back(ReadTask {
             key: Some(key),
+            request,
             task,
         });
         self.0.read_ready.notify_one();
@@ -116,9 +147,19 @@ impl Scheduler {
     pub fn cancel(&self, root: &Path, kind: Option<ReadKind>) {
         let mut queue = self.0.queue.lock().expect("task queue");
         queue.reads.retain(|job| {
-            job.key
-                .as_ref()
-                .is_none_or(|key| key.root != root || kind.is_some_and(|kind| key.kind != kind))
+            let Some(key) = &job.key else {
+                return true;
+            };
+            let canceled = key.root == root && kind.is_none_or(|kind| key.kind == kind);
+            if canceled {
+                tracing::debug!(
+                    kind = key.kind.name(),
+                    worktree = logging::worktree_id(root),
+                    request = job.request,
+                    "read_canceled"
+                );
+            }
+            !canceled
         });
     }
 
@@ -208,7 +249,12 @@ mod tests {
         let background = Path::new("background");
         let enqueue = |kind, path: &Path, marker| {
             let started = started.clone();
-            scheduler.latest(kind, path, Box::new(move || started.send(marker).unwrap()));
+            scheduler.latest(
+                kind,
+                path,
+                0,
+                Box::new(move || started.send(marker).unwrap()),
+            );
         };
         enqueue(ReadKind::History, background, "prefetch");
         enqueue(ReadKind::Diff, &active, "superseded");

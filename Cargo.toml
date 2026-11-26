@@ -20,6 +20,9 @@ serde_json = "1"
 serde_yaml = "0.9"
 similar = "2.7"
 tempfile = "3"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
