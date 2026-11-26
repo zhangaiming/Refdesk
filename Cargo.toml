@@ -11,6 +11,7 @@ calamine = "0.31"
 crossbeam-channel = "0.5"
 dirs = "6"
 eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
 globset = "0.4"
 png = "0.18"
 rfd = { version = "0.15", default-features = false }

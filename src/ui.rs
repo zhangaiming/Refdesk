@@ -29,6 +29,7 @@ pub(crate) struct ToolbarRegions {
 }
 
 pub fn install_style(ctx: &egui::Context) {
+    egui_extras::install_image_loaders(ctx);
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 5.0);
         style.spacing.button_padding = Vec2::new(9.0, 4.0);

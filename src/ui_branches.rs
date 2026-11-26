@@ -91,6 +91,42 @@ enum BranchAction {
     Switch(String),
 }
 
+fn branch_checkbox(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &str,
+    indeterminate: bool,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        let widgets = &mut ui.visuals_mut().widgets;
+        // Suppress egui's mark while retaining its box, text color and checkbox behavior.
+        for visuals in [
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
+        ] {
+            visuals.fg_stroke.width = 0.0;
+        }
+        let response = ui.add(egui::Checkbox::new(checked, label).indeterminate(indeterminate));
+        if ui.is_rect_visible(response.rect) && (indeterminate || *checked) {
+            let icon = if indeterminate {
+                egui::include_image!("../assets/icons/branch-mixed.svg")
+            } else {
+                egui::include_image!("../assets/icons/branch-checked.svg")
+            };
+            let (_, icon_rect) = ui.spacing().icon_rectangles(response.rect);
+            egui::Image::new(icon)
+                .tint(ui.style().interact(&response).fg_stroke.color)
+                .paint_at(ui, icon_rect);
+        }
+        response
+    })
+    .inner
+}
+
 struct BranchView<'a> {
     selection: &'a BTreeSet<String>,
     current: &'a str,
@@ -139,11 +175,8 @@ impl BranchView<'_> {
             } else {
                 "勾选或取消勾选此组及下级目录中的全部引用"
             };
-            if ui
-                .add(
-                    egui::Checkbox::new(&mut checked, "")
-                        .indeterminate(group.checked > 0 && group.checked < group.total),
-                )
+            let indeterminate = group.checked > 0 && group.checked < group.total;
+            if branch_checkbox(ui, &mut checked, "", indeterminate)
                 .on_hover_text(hint)
                 .changed()
             {
@@ -213,7 +246,7 @@ impl BranchView<'_> {
                 let marker_x = ui.next_widget_position().x + indent / 2.0;
                 ui.add_space(indent);
                 let mut checked = self.selection.contains(&reference.name);
-                let checkbox = ui.checkbox(&mut checked, "").on_hover_text(&tooltip);
+                let checkbox = branch_checkbox(ui, &mut checked, "", false).on_hover_text(&tooltip);
                 if checkbox.changed() {
                     self.toggle(&reference.name);
                 }
@@ -463,12 +496,7 @@ impl Desk {
                     spacing.button_padding.y = 2.0;
                     let mut head = selection.contains("HEAD");
                     let label = format!("HEAD · {}", history.branch);
-                    if ui
-                        .scope(|ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                            ui.checkbox(&mut head, &label)
-                        })
-                        .inner
+                    if branch_checkbox(ui, &mut head, &label, false)
                         .on_hover_text(label)
                         .changed()
                     {
