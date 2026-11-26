@@ -35,11 +35,8 @@ Windows 桌面版默认在 `%LOCALAPPDATA%\Refdesk\logs` 写入 INFO 级别日�
 Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。使用 windows-gnu 工具链时需要 GNU Binutils。Windows x64 的工具链配置、Release EXE 打包和校验步骤见 [Windows 打包流程](docs/PACKAGING.md)。
 
     cargo build --release --locked
-    cargo test --release --locked
-    cargo fmt --check
-    cargo clippy --locked --all-targets -- -D warnings
 
-上述 Release 构建输出到 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。需要新演示仓库时，安装 Python openpyxl 后执行 python scripts/make-demo.py。
+Release 构建输出到 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。单元测试、回归测试、Windows CI 和完整检查命令见 [测试与验收](docs/TESTING.md)。
 
 ## 0.1 范围
 

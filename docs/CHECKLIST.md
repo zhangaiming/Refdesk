@@ -68,3 +68,11 @@
 
 - [x] 用 3,205 条提交的临时仓库验证 Windows Release 首屏显示 300 条。通过 egui 验证滚动接近末尾时继续分页，读取到最后一条后停止。回滚和搜索能读回已换出的页，可跨页选择两条提交比较。
 - [x] 用含合并的 3,206 条提交的临时仓库验证 Git 顺序、跨页轨道与颜色、历史快照、缓存写入失败后重试，以及最后一页恰好 300 条时的终止判断。
+
+## Windows 自动化回归
+
+- [x] 在以 `903a9f2` 为基线的 `strengthen-test-regressions` 工作树，用 Rust 1.100.0 Windows GNU 和 Git 2.53.0.windows.1 运行 `cargo fmt --check`、`cargo clippy --release --locked --offline --all-targets -- -D warnings`、`cargo test --release --locked --offline` 和 `openspec validate --all --strict`。28 项 Release 测试和 7 项 OpenSpec 校验通过。
+- [x] 注入临时的系统与全局签名配置、命令级配置和外部 `GIT_DIR`。再次运行 27 项主程序 Release 测试，全部通过。演示仓库脚本在注入全局配置和 Git 环境变量时也能生成隔离样例。
+- [x] 本地裸仓库验证远端可快进时正常更新，分叉时拉取报错、本地 HEAD 保持原值。两份真实 XLSX 通过 Windows Release 解析子进程核对稀疏坐标、值、带缓存结果的公式和新增工作表。
+- [x] Windows CI 工作流通过 `actionlint` 静态检查。
+- [ ] GitHub 托管 Windows MSVC runner 首轮执行。

@@ -1,4 +1,5 @@
 """Create an isolated merge, linked worktree and Excel diff demo."""
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -7,7 +8,15 @@ from openpyxl import Workbook
 
 
 def git(root, *args):
-    subprocess.run(["git", "-C", str(root), *args], check=True)
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_ATTR_NOSYSTEM="1", GIT_TEMPLATE_DIR="", GIT_TERMINAL_PROMPT="0")
+    subprocess.run(
+        ["git", "-C", str(root), "-c", f"core.attributesFile={os.devnull}",
+         "-c", f"core.excludesFile={os.devnull}", *args],
+        env=env, check=True,
+    )
 
 
 def workbook(path, changed):

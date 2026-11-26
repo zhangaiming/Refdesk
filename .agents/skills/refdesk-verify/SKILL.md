@@ -9,13 +9,7 @@ description: 验证 Refdesk 的代码、Git 行为、Windows 界面、提交图�
 
 ## 代码与 Git 行为
 
-完整代码检查从仓库根目录执行。验收单个回归时，可以给 `cargo test` 加现有测试名。
-
-```powershell
-cargo fmt --check
-cargo clippy --release --locked --all-targets -- -D warnings
-cargo test --release --locked
-```
+从仓库根目录按 [测试与验收](../../../docs/TESTING.md) 运行定向测试和完整检查。本地和 Windows CI 使用同一组命令。
 
 - Git 写操作和特定拓扑用临时仓库。按变更核对合并的第一父和其他父边、多选的共同祖先去重、分支组筛选和跟踪引用的领先或落后数。
 - 文本、Excel、关联工作树和合并的手动验收，可用 [make-demo.py](../../../scripts/make-demo.py) 生成隔离样例。脚本需要 Git、Python 和 openpyxl。若改动外部 diff，核对两个文件参数和 Windows 含空格路径。

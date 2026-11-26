@@ -240,6 +240,9 @@ pub struct Details {
 
 fn command(root: Option<&Path>, read_only: bool) -> Command {
     let mut cmd = Command::new("git");
+    #[cfg(test)]
+    isolate_test_environment(&mut cmd);
+
     if let Some(root) = root {
         cmd.arg("-C").arg(root);
     }
@@ -260,6 +263,37 @@ fn command(root: Option<&Path>, read_only: bool) -> Command {
         cmd.creation_flags(0x08000000);
     }
     cmd
+}
+
+#[cfg(test)]
+fn isolate_test_environment(cmd: &mut Command) {
+    const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    // Inherited Git variables can redirect a fixture command to a different repository.
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TEMPLATE_DIR", "")
+        .env("LC_ALL", "C")
+        .args([
+            "-c",
+            &format!("core.attributesFile={NULL_DEVICE}"),
+            "-c",
+            &format!("core.excludesFile={NULL_DEVICE}"),
+        ]);
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_command(root: &Path) -> Command {
+    command(Some(root), false)
 }
 
 fn output(root: &Path, args: &[&str], read_only: bool) -> Result<Output> {
@@ -1363,6 +1397,57 @@ mod tests {
             assert_eq!(tracking.label(), upstream);
             assert_eq!(tracking.state, state);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pull_fast_forwards_and_rejects_divergence() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path();
+        let sender = root.join("sender");
+        let receiver = root.join("receiver with spaces");
+        let git = |worktree: &Path, args: &[&str]| checked(output(worktree, args, false)?);
+
+        git(
+            root,
+            &["init", "--bare", "--initial-branch=main", "origin.git"],
+        )?;
+        git(root, &["clone", "--", "origin.git", "sender"])?;
+        git(&sender, &["config", "user.name", "Refdesk test"])?;
+        git(&sender, &["config", "user.email", "test@example.invalid"])?;
+        git(&sender, &["commit", "--allow-empty", "-m", "base"])?;
+        git(&sender, &["push", "origin", "main"])?;
+        git(root, &["clone", "--", "origin.git", "receiver with spaces"])?;
+        git(&receiver, &["config", "user.name", "Refdesk test"])?;
+        git(&receiver, &["config", "user.email", "test@example.invalid"])?;
+        // Give plain git pull a merge policy so a missing --ff-only cannot pass accidentally.
+        git(&receiver, &["config", "pull.rebase", "false"])?;
+
+        git(&sender, &["commit", "--allow-empty", "-m", "remote update"])?;
+        git(&sender, &["push", "origin", "main"])?;
+        Operation::Pull.execute(&receiver)?;
+        let head = |worktree: &Path| run(worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(head(&receiver)?, head(&sender)?);
+
+        git(
+            &receiver,
+            &["commit", "--allow-empty", "-m", "local branch tip"],
+        )?;
+        let local_head = head(&receiver)?;
+        git(
+            &sender,
+            &["commit", "--allow-empty", "-m", "remote branch tip"],
+        )?;
+        git(&sender, &["push", "origin", "main"])?;
+
+        let error = Operation::Pull.execute(&receiver).unwrap_err();
+        assert!(error.to_string().contains("fast-forward"), "{error:#}");
+        assert_eq!(head(&receiver)?, local_head);
+        assert_eq!(
+            run(&receiver, &["rev-parse", "origin/main"])?,
+            head(&sender)?
+        );
+        assert!(run(&receiver, &["status", "--porcelain"])?.is_empty());
         Ok(())
     }
 

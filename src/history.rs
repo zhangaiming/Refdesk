@@ -343,7 +343,7 @@ pub fn matches_search(commit: &Commit, history: &History, needle: &str) -> bool 
 mod tests {
     use super::*;
     use crate::graph::Span;
-    use std::process::{Command, Output, Stdio};
+    use std::process::{Output, Stdio};
 
     const MAIN_COMMITS: usize = 3205;
 
@@ -457,9 +457,7 @@ mod tests {
 
     fn make_history(root: &Path) -> Result<()> {
         git(root, &["init", "--initial-branch=main"])?;
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(root)
+        let mut child = git::fixture_command(root)
             .args(["fast-import", "--quiet"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -498,13 +496,7 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) -> Result<Output> {
-        checked(
-            Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()?,
-        )
+        checked(git::fixture_command(root).args(args).output()?)
     }
 
     fn checked(output: Output) -> Result<Output> {
