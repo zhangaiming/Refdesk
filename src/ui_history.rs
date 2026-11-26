@@ -341,7 +341,21 @@ impl Desk {
                         for branch in graph_references_at(history, &commit.id) {
                             ui.label(branch.description());
                         }
-                        ui.label("Ctrl + 单击与当前提交比较");
+                        let hint = egui::WidgetText::from(
+                            RichText::new("Ctrl + 单击与当前提交比较").color(colors.subtle),
+                        )
+                        .into_galley(
+                            ui,
+                            None,
+                            ui.available_width(),
+                            egui::TextStyle::Small,
+                        );
+                        let width = ui.min_rect().width().max(hint.size().x);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, hint.size().y),
+                            egui::Layout::top_down(Align::RIGHT),
+                            |ui| ui.label(hint),
+                        );
                     });
                 }
             });
