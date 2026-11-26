@@ -848,24 +848,55 @@ impl Desk {
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         const REPO_ROW_HEIGHT: f32 = 23.0;
+        const ACTIVE_REPO_ROW_HEIGHT: f32 = 35.0;
+        const REPO_ROW_GAP: f32 = 2.0;
+        const REPO_GROUP_GAP: f32 = 6.0;
+        const MIN_REPO_HEIGHT: f32 = 123.5;
+        const MAX_REPO_HEIGHT: f32 = 359.0;
         const MIN_REPO_ROWS: usize = 4;
         const MAX_DEFAULT_REPO_ROWS: usize = 6;
         const MIN_BRANCH_HEIGHT: f32 = 180.0;
-        const REPO_ICON_SIZE: f32 = 16.0;
+        const REPO_INSET: f32 = 8.0;
         const REPO_INDENT: f32 = 14.0;
+        const REPO_ICON_SIZE: f32 = 16.0;
+        const REPO_ICON_GAP: f32 = 6.0;
         const MAX_REPO_DEPTH: usize = 4;
         let mut select = None;
         let mut forget = None;
         let repositories = self.repository_rows();
-        let gap = ui.spacing().item_spacing.y;
-        let row_stride = REPO_ROW_HEIGHT + gap;
-        let half_row = REPO_ROW_HEIGHT / 2.0;
-        let fit_rows = ((ui.available_height() * 0.40 - half_row) / row_stride).floor() as usize;
-        let default_limit =
-            fit_rows.clamp(MIN_REPO_ROWS, MAX_DEFAULT_REPO_ROWS) as f32 * row_stride + half_row;
-        let preferred_min = MIN_REPO_ROWS as f32 * row_stride + half_row;
-        let content_height = repositories.len() as f32 * row_stride - gap;
-        let default_height = content_height.clamp(preferred_min, default_limit);
+        let row_height = |active| {
+            if active {
+                ACTIVE_REPO_ROW_HEIGHT
+            } else {
+                REPO_ROW_HEIGHT
+            }
+        };
+        let group_spacing = |index, depth| {
+            if index > 0 && depth == 0 {
+                REPO_GROUP_GAP - REPO_ROW_GAP
+            } else {
+                0.0
+            }
+        };
+        let fit_rows = ((ui.available_height() * 0.40 - REPO_ROW_HEIGHT / 2.0)
+            / (REPO_ROW_HEIGHT + REPO_GROUP_GAP)) as usize;
+        let full_rows = fit_rows.clamp(MIN_REPO_ROWS, MAX_DEFAULT_REPO_ROWS);
+        let default_height = repositories
+            .iter()
+            .take(full_rows + 1)
+            .enumerate()
+            .map(|(index, row)| {
+                let spacing = if index == 0 { 0.0 } else { REPO_ROW_GAP };
+                let height = row_height(self.active.as_ref() == Some(&row.path));
+                let visible = if index == full_rows {
+                    height / 2.0
+                } else {
+                    height
+                };
+                spacing + group_spacing(index, row.depth) + visible
+            })
+            .sum::<f32>()
+            .max(MIN_REPO_HEIGHT);
         ui.horizontal(|ui| {
             heading(ui, "仓库", Some(repositories.len()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -897,12 +928,13 @@ impl Desk {
             });
         });
         let splitter_id = ui.id().with("repository-splitter");
-        let preferred_max = 2.0 * (MAX_DEFAULT_REPO_ROWS as f32 * row_stride + half_row);
+        let reveal_id = splitter_id.with("reveal-repository");
+        let reveal = ui.data_mut(|data| data.remove_temp::<PathBuf>(reveal_id));
         let repo_h = split_panel_height(
             ui,
             splitter_id,
             default_height,
-            (preferred_min..=preferred_max).into(),
+            (MIN_REPO_HEIGHT..=MAX_REPO_HEIGHT).into(),
             MIN_BRANCH_HEIGHT,
         );
         egui::ScrollArea::vertical()
@@ -911,6 +943,7 @@ impl Desk {
             .min_scrolled_height(repo_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = REPO_ROW_GAP;
                 let guide_stroke = Stroke::new(1.0_f32, colors.tree_guide);
                 let mut guide_starts = [0.0; MAX_REPO_DEPTH];
                 if repositories.is_empty() {
@@ -919,7 +952,8 @@ impl Desk {
                         self.choose_repository(ctx);
                     }
                 }
-                for row in &repositories {
+                for (index, row) in repositories.iter().enumerate() {
+                    ui.add_space(group_spacing(index, row.depth));
                     let path = &row.path;
                     let available = row.submodule != Some(false);
                     let indent = row.depth.min(MAX_REPO_DEPTH) as f32 * REPO_INDENT;
@@ -933,7 +967,9 @@ impl Desk {
                             .get(path)
                             .and_then(|repo| repo.history.as_ref())
                             .map(|history| history.cache.info.branch.as_str())
-                            .unwrap_or(if row.submodule.is_some() {
+                            .unwrap_or(if active {
+                                "分支未读取"
+                            } else if row.submodule.is_some() {
                                 "子模块"
                             } else {
                                 "工作树"
@@ -941,10 +977,15 @@ impl Desk {
                     } else {
                         "子模块未检出"
                     };
-                    let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), REPO_ROW_HEIGHT),
-                        Sense::click(),
-                    );
+                    let (_, rect) =
+                        ui.allocate_space(Vec2::new(ui.available_width(), row_height(active)));
+                    let response = ui.interact(rect, ui.id().with(path), Sense::click());
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, available, name)
+                    });
+                    if reveal.as_ref() == Some(path) || response.gained_focus() {
+                        response.scroll_to_me(None);
+                    }
                     if active || response.hovered() {
                         ui.painter().rect_filled(
                             rect,
@@ -964,77 +1005,64 @@ impl Desk {
                             Stroke::new(2.0_f32, colors.accent),
                         );
                     }
-                    let symbol = Rect::from_center_size(
-                        pos2(
-                            rect.left() + 6.0 + indent + REPO_ICON_SIZE / 2.0,
-                            rect.center().y,
-                        ),
-                        Vec2::splat(REPO_ICON_SIZE),
-                    );
+                    if response.has_focus() {
+                        ui.painter().rect_stroke(
+                            rect.shrink(0.5),
+                            4.0,
+                            Stroke::new(1.0_f32, colors.accent),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let icon_left = rect.left() + REPO_INSET + indent;
+                    let name_y = rect.top() + REPO_ROW_HEIGHT / 2.0;
                     if (1..=MAX_REPO_DEPTH).contains(&row.depth) {
                         let start = &mut guide_starts[row.depth - 1];
-                        let x = symbol.center().x - REPO_INDENT;
-                        let y = symbol.center().y;
-                        ui.painter().vline(x, *start..=y, guide_stroke);
+                        let x = icon_left - REPO_INDENT + 4.0;
+                        ui.painter().vline(x, *start..=name_y, guide_stroke);
                         ui.painter()
-                            .hline(x..=(symbol.left() - 1.5), y, guide_stroke);
+                            .hline(x..=(icon_left - 2.0), name_y, guide_stroke);
                         // The next sibling continues from this elbow across any descendants.
-                        *start = y;
+                        *start = name_y;
                     }
                     if row.depth < MAX_REPO_DEPTH {
-                        guide_starts[row.depth] = symbol.bottom() + 1.5;
+                        guide_starts[row.depth] = rect.bottom() - 2.0;
                     }
-                    ui.painter().rect_filled(
-                        symbol,
-                        4.0,
-                        if active {
-                            colors.selection
+                    let icon_rect = Rect::from_min_size(
+                        pos2(icon_left, name_y - REPO_ICON_SIZE / 2.0),
+                        Vec2::splat(REPO_ICON_SIZE),
+                    );
+                    if ui.is_rect_visible(icon_rect) {
+                        let icon_color = if active {
+                            colors.accent
+                        } else if available {
+                            colors.subtle
                         } else {
-                            colors.control
-                        },
-                    );
-                    ui.painter().text(
-                        symbol.center(),
-                        Align2::CENTER_CENTER,
-                        name.chars()
-                            .next()
-                            .unwrap_or('R')
-                            .to_uppercase()
-                            .collect::<String>(),
-                        FontId::proportional(10.0),
-                        if active { colors.accent } else { colors.muted },
-                    );
-                    let name_color = if available { colors.text } else { colors.muted };
-                    let detail_color = if !available {
-                        colors.removed.foreground
-                    } else if active {
-                        colors.accent
-                    } else {
-                        colors.muted
+                            colors.subtle.gamma_multiply(0.55)
+                        };
+                        egui::Image::new(egui::include_image!(
+                            "../assets/icons/repository-cube.svg"
+                        ))
+                        .tint(icon_color)
+                        .paint_at(ui, icon_rect);
+                    }
+                    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                    let text_left = icon_rect.right() + REPO_ICON_GAP;
+                    let text_width = rect.right() - REPO_INSET - text_left;
+                    let draw_text = |text: &str, size, y, color| {
+                        let galley = fit_line(
+                            &painter,
+                            text.into(),
+                            FontId::proportional(size),
+                            color,
+                            text_width,
+                        );
+                        painter.galley(pos2(text_left, y - galley.size().y / 2.0), galley, color);
                     };
-                    let text_rect = Rect::from_min_max(
-                        pos2(symbol.right() + 6.0, rect.top()),
-                        pos2(rect.right() - 4.0, rect.bottom()),
-                    );
-                    let mut label = LayoutJob::simple_singleline(
-                        name.to_owned(),
-                        FontId::proportional(13.0),
-                        name_color,
-                    );
-                    label.append(
-                        &format!(" ({detail})"),
-                        0.0,
-                        egui::TextFormat::simple(FontId::proportional(11.0), detail_color),
-                    );
-                    label.wrap.max_width = text_rect.width().max(0.0);
-                    label.wrap.max_rows = 1;
-                    label.wrap.break_anywhere = true;
-                    let painter = ui.painter().with_clip_rect(text_rect);
-                    let galley = painter.layout_job(label);
-                    let text_pos = Align2::LEFT_CENTER
-                        .anchor_size(pos2(text_rect.left(), rect.center().y), galley.size())
-                        .min;
-                    painter.galley(text_pos, galley, name_color);
+                    let name_color = if available { colors.text } else { colors.muted };
+                    draw_text(name, 13.0, name_y, name_color);
+                    if active {
+                        draw_text(detail, 11.0, name_y + 14.0, colors.muted);
+                    }
                     if available && response.clicked() {
                         select = Some(path.clone());
                     }
@@ -1050,11 +1078,22 @@ impl Desk {
                             ui.close_menu();
                         }
                     });
-                    response.on_hover_text(format!("{name} ({detail})\n{}", path.display()));
+                    response.on_hover_ui(|ui| {
+                        ui.label(name);
+                        if available {
+                            ui.label(detail);
+                        } else {
+                            ui.colored_label(colors.removed.foreground, detail);
+                        }
+                        ui.label(path.display().to_string());
+                    });
                 }
             });
         if let Some(path) = select {
+            // The activity switch adds a second line on the next frame.
+            ui.data_mut(|data| data.insert_temp(reveal_id, path.clone()));
             self.activate(ctx, path);
+            ctx.request_repaint();
         }
         if let Some(path) = forget {
             self.dialog = Some(Dialog::Forget(path));
