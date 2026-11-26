@@ -1,9 +1,8 @@
-use crate::diff::{self, Content};
+use crate::builtin_diff::{self, ActiveDiff};
 use crate::git::{
     self, Change, Commit, Compare, Details, HistoryScope, Operation, Status, Submodule,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
-use crate::image_diff::{self, ImageColumn, ImageDiff, ImageSide};
 use crate::logging::{self, Presentation, ReadLog};
 use crate::settings::{self, Settings, Tool};
 use crate::tasks::{ReadKind, Scheduler};
@@ -29,18 +28,12 @@ enum Work<'a> {
     Write,
 }
 
-enum DiffUpdate {
-    Complete(Outcome<Content>),
-    Image(ImageColumn, ImageSide),
-}
-
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
     History(PathBuf, u64, Result<Option<HistoryView>>),
     HistorySearch(u64, u64, Outcome<SearchResult>),
     Status(PathBuf, u64, Result<Status>, Result<Vec<Submodule>>),
     Details(u64, u64, Selection, Outcome<Details>),
-    Diff(u64, u64, DiffUpdate),
     Operation(PathBuf, Option<String>, Outcome<String>),
     External(Outcome<TempDir>),
 }
@@ -137,9 +130,7 @@ pub(crate) struct Desk {
     pub save_icon: egui::TextureHandle,
     pub file: Option<Change>,
     pub comparison: Option<Compare>,
-    pub content: Option<Content>,
-    pub diff_error: Option<String>,
-    pub diff_busy: bool,
+    pub diff: Option<Box<dyn ActiveDiff>>,
     pub editor: String,
     pub search: String,
     pub branch_query: String,
@@ -153,17 +144,13 @@ pub(crate) struct Desk {
     pub status_message: String,
     pub status_is_error: bool,
     pub operations: HashSet<PathBuf>,
-    pub sheet_view: crate::ui_workbook::SheetView,
     pub force_text: bool,
     pub show_full_line: Option<String>,
-    pub diff_reset: u64,
     pub graph_reset: u64,
     pub focused: bool,
     writes_enabled: bool,
     requests: u64,
     details_request: u64,
-    diff_request: u64,
-    diff_cancel: Option<Arc<AtomicBool>>,
     external_dirs: Vec<TempDir>,
     timings: Option<Timings>,
     presentation: Option<Presentation>,
@@ -279,9 +266,7 @@ impl Desk {
             save_icon: crate::ui::load_save_icon(ctx),
             file: None,
             comparison: None,
-            content: None,
-            diff_error: None,
-            diff_busy: false,
+            diff: None,
             editor: String::new(),
             search: String::new(),
             branch_query: String::new(),
@@ -296,16 +281,12 @@ impl Desk {
             status_is_error,
             writes_enabled,
             operations: HashSet::new(),
-            sheet_view: crate::ui_workbook::SheetView::default(),
             force_text: false,
             show_full_line: None,
-            diff_reset: 0,
             graph_reset: 0,
             focused: true,
             requests: 0,
             details_request: 0,
-            diff_request: 0,
-            diff_cancel: None,
             external_dirs: Vec::new(),
             timings: Timings::open(started),
             presentation: None,
@@ -1093,7 +1074,6 @@ impl Desk {
         let pair = git::compare(&file, self.details.as_ref(), head);
         self.file = Some(file);
         self.comparison = Some(pair);
-        self.sheet_view = crate::ui_workbook::SheetView::default();
         self.request_diff(ctx);
     }
 
@@ -1101,72 +1081,35 @@ impl Desk {
         let (Some(root), Some(pair)) = (self.active.clone(), self.comparison.clone()) else {
             return;
         };
-        let request = self.next();
-        self.diff_request = request;
-        let canceled = Arc::new(AtomicBool::new(false));
-        if let Some(previous) = self.diff_cancel.replace(canceled.clone()) {
-            previous.store(true, Ordering::Relaxed);
-        }
-        self.diff_error = None;
+        self.diff = None;
         self.show_full_line = None;
-        self.diff_busy = true;
-        self.diff_reset += 1;
-        let force_text = self.force_text;
-        let image = !force_text && image_diff::supports_pair(&pair);
-        self.content = Some(if image {
-            Content::Image(ImageDiff::pending())
-        } else if !force_text && diff::is_workbook_pair(&pair) {
-            Content::LoadingWorkbook
+        let request = self.next();
+        let registered = builtin_diff::registered(&pair);
+        let format = if self.force_text {
+            builtin_diff::text()
         } else {
-            Content::LoadingText
+            registered
+        };
+        let log = ReadLog::queue("diff", &root, request);
+        let (session, job) = format.start(builtin_diff::Request {
+            root: root.clone(),
+            pair,
+            log,
+            ctx: ctx.clone(),
         });
+        self.diff = Some(session);
+        self.tasks.latest(ReadKind::Diff, &root, request, job);
         ctx.request_repaint();
-        let path = root.clone();
-        let log = ReadLog::queue("diff", &path, request);
-        if image {
-            let events = self.events.clone();
-            let ctx = ctx.clone();
-            self.tasks.latest(
-                ReadKind::Diff,
-                &path,
-                request,
-                Box::new(move || {
-                    let started = Instant::now();
-                    image_diff::load(&root, &pair, &log, &canceled, |column, image| {
-                        let update = DiffUpdate::Image(column, image);
-                        let _ = events.send(Event::Diff(log.worktree, request, update));
-                        ctx.request_repaint();
-                    });
-                    log.complete(started, "ok");
-                }),
-            );
-            return;
-        }
-        self.submit(
-            ctx,
-            Work::Latest(ReadKind::Diff, &path, request),
-            move || {
-                let started = Instant::now();
-                let result = readable(diff::compare(&root, &pair, force_text, &log));
-                log.complete(started, if result.is_ok() { "ok" } else { "failed" });
-                Event::Diff(log.worktree, request, DiffUpdate::Complete(result))
-            },
-        );
     }
 
     pub fn clear_diff(&mut self) {
-        if let Some(canceled) = self.diff_cancel.take() {
-            canceled.store(true, Ordering::Relaxed);
-        }
+        self.diff = None;
         if let Some(active) = &self.active {
             self.tasks.cancel(active, Some(ReadKind::Diff));
         }
-        self.diff_request = self.next();
         self.file = None;
         self.comparison = None;
-        self.content = None;
-        self.diff_error = None;
-        self.diff_busy = false;
+        self.show_full_line = None;
     }
 
     pub fn operate(&mut self, ctx: &egui::Context, root: PathBuf, operation: Operation) {
@@ -1259,6 +1202,9 @@ impl Desk {
     }
 
     pub fn events(&mut self, ctx: &egui::Context) {
+        if let Some(diff) = &mut self.diff {
+            diff.poll(ctx);
+        }
         while let Ok(event) = self.inbox.try_recv() {
             match event {
                 Event::Added(result, activate) => match result {
@@ -1465,30 +1411,6 @@ impl Desk {
                             self.details_error = Some(error);
                         }
                     }
-                }
-                Event::Diff(worktree, request, update) => {
-                    if request != self.diff_request {
-                        tracing::debug!(kind = "diff", worktree, request, "read_stale");
-                        continue;
-                    }
-                    match update {
-                        DiffUpdate::Image(column, image) => {
-                            let Some(Content::Image(images)) = &mut self.content else {
-                                continue;
-                            };
-                            images.apply(column, image);
-                            if images.is_loading() {
-                                continue;
-                            }
-                        }
-                        DiffUpdate::Complete(result) => match result {
-                            Ok(content) => self.content = Some(content),
-                            Err(error) => self.diff_error = Some(error),
-                        },
-                    }
-                    tracing::debug!(kind = "diff", worktree, request, "read_applied");
-                    self.diff_cancel = None;
-                    self.diff_busy = false;
                 }
                 Event::Operation(path, committed_message, result) => {
                     self.operations.remove(&path);

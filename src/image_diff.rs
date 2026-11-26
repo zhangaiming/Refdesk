@@ -1,18 +1,12 @@
-use crate::diff;
-use crate::git::{self, Compare, LfsPointer, Version};
-use crate::logging::ReadLog;
-use anyhow::{Context, Result, ensure};
+use crate::builtin_diff::{Issue, Snapshot};
+use crate::git::{self, Compare, LfsPointer};
 use eframe::egui;
 use image::{ImageDecoder, ImageError, ImageFormat, ImageReader, Limits};
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
 
 const MAX_EDGE: u32 = 8192;
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
-const IMAGE_LIMIT: &str = "图片尺寸超过预览上限";
-
 fn supported_format(format: ImageFormat) -> bool {
     matches!(
         format,
@@ -37,144 +31,53 @@ pub(crate) fn supports_pair(pair: &Compare) -> bool {
         && (supports(&pair.left_path) || supports(&pair.right_path))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageColumn {
-    Left,
-    Right,
-}
-
-pub(crate) struct ImageDiff {
-    pub left: ImageSide,
-    pub right: ImageSide,
-}
-
-impl ImageDiff {
-    pub fn pending() -> Self {
-        Self {
-            left: ImageSide::Loading,
-            right: ImageSide::Loading,
-        }
-    }
-
-    pub fn apply(&mut self, column: ImageColumn, side: ImageSide) {
-        match column {
-            ImageColumn::Left => self.left = side,
-            ImageColumn::Right => self.right = side,
-        }
-    }
-
-    pub fn is_loading(&self) -> bool {
-        matches!(self.left, ImageSide::Loading) || matches!(self.right, ImageSide::Loading)
-    }
-}
-
-pub(crate) fn load(
-    root: &Path,
-    pair: &Compare,
-    log: &ReadLog,
-    canceled: &AtomicBool,
-    ready: impl Fn(ImageColumn, ImageSide) + Sync,
-) {
-    let object_dir = OnceLock::new();
-    let load_side = |column| {
-        let (version, path) = match column {
-            ImageColumn::Left => (&pair.left, &pair.left_path),
-            ImageColumn::Right => (&pair.right, &pair.right_path),
-        };
-        let snapshot = diff::read_snapshot(root, version, path, false, log);
-        ready(
-            column,
-            ImageSide::read(root, version, path, snapshot, &object_dir, canceled),
-        );
-    };
-    std::thread::scope(|scope| {
-        scope.spawn(|| load_side(ImageColumn::Left));
-        load_side(ImageColumn::Right);
-    });
-}
-
-pub(crate) enum ImageSide {
-    Loading,
-    Pixels(Arc<egui::ColorImage>),
-    Preview(egui::TextureHandle),
-    Absent,
-    Unavailable(String),
-}
-
-impl ImageSide {
-    fn read(
-        root: &Path,
-        version: &Version,
-        path: &str,
-        snapshot: Result<Vec<u8>>,
-        object_dir: &OnceLock<Result<PathBuf>>,
-        canceled: &AtomicBool,
-    ) -> Self {
-        if matches!(version, Version::Empty) {
-            return Self::Absent;
-        }
-        let decode = || {
-            let mut bytes = snapshot?;
-            if let Some(pointer) = LfsPointer::parse(&bytes)? {
-                let dir = object_dir
-                    .get_or_init(|| git::lfs_object_dir(root))
-                    .as_ref()
-                    .map_err(|_| anyhow::anyhow!("无法定位本地 Git LFS 缓存"))?;
-                bytes = if let Some(cached) = pointer.read(dir)? {
-                    cached
+pub(crate) fn load(snapshot: Snapshot<'_>) -> Result<egui::ColorImage, Issue> {
+    let mut bytes = snapshot.read()?;
+    if let Some(pointer) = LfsPointer::parse(&bytes).map_err(|_| Issue::LfsPointer)? {
+        let dir = git::lfs_object_dir(snapshot.root).map_err(|_| Issue::LfsCache)?;
+        let required = |pointer: &LfsPointer<'_>| {
+            pointer.read(&dir).map_err(|error| {
+                if error.is::<git::SnapshotLimit>() {
+                    Issue::SnapshotLimit
                 } else {
-                    git::download_lfs_object(root, path, &bytes, canceled)?;
-                    pointer
-                        .read(dir)?
-                        .context("Git LFS 对象未下载，可能被仓库设置跳过")?
-                };
-            }
-            decode_image(&bytes)
+                    Issue::LfsCache
+                }
+            })
         };
-        match decode() {
-            Ok(pixels) => Self::Pixels(Arc::new(pixels)),
-            Err(error) => Self::Unavailable(error.to_string()),
-        }
-    }
-
-    pub fn upload(&mut self, ctx: &egui::Context) {
-        let Self::Pixels(pixels) = self else { return };
-        let max_edge = ctx.input(|input| input.max_texture_side);
-        *self = if pixels.size.iter().any(|&size| size > max_edge) {
-            Self::Unavailable("图片尺寸超过当前显卡的纹理上限".into())
+        bytes = if let Some(cached) = required(&pointer)? {
+            cached
         } else {
-            Self::Preview(ctx.load_texture(
-                "image-diff",
-                egui::ImageData::Color(pixels.clone()),
-                egui::TextureOptions::LINEAR,
-            ))
+            git::download_lfs_object(snapshot.root, snapshot.path, &bytes, || {
+                snapshot.cancel.requested()
+            })
+            .map_err(|_| Issue::LfsDownload)?;
+            required(&pointer)?.ok_or(Issue::LfsMissing)?
         };
     }
+    decode_image(&bytes)
 }
 
-fn decode_image(bytes: &[u8]) -> Result<egui::ColorImage> {
+fn decode_image(bytes: &[u8]) -> Result<egui::ColorImage, Issue> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .context("无法识别图片格式")?;
-    ensure!(
-        reader.format().is_some_and(supported_format),
-        "无法识别图片格式"
-    );
+        .map_err(|_| Issue::Decode)?;
+    if !reader.format().is_some_and(supported_format) {
+        return Err(Issue::Decode);
+    }
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_EDGE);
     limits.max_image_height = Some(MAX_EDGE);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let image_error = |error| match error {
-        ImageError::Limits(_) => anyhow::anyhow!(IMAGE_LIMIT),
-        _ => anyhow::anyhow!("无法解码图片"),
+        ImageError::Limits(_) => Issue::PreviewLimit,
+        _ => Issue::Decode,
     };
     let decoder = reader.into_decoder().map_err(image_error)?;
     let (width, height) = decoder.dimensions();
-    ensure!(
-        width > 0 && height > 0 && u64::from(width) * u64::from(height) <= MAX_PIXELS,
-        IMAGE_LIMIT
-    );
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(Issue::PreviewLimit);
+    }
     let pixels = image::DynamicImage::from_decoder(decoder)
         .map_err(image_error)?
         .into_rgba8();
@@ -187,11 +90,12 @@ fn decode_image(bytes: &[u8]) -> Result<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::Area;
-    use crossbeam_channel::bounded;
+    use crate::builtin_diff::{Cancellation, Column, Side};
+    use crate::git::{Area, Version};
+    use crate::logging::ReadLog;
+    use anyhow::{Context, Result, ensure};
     use std::fs;
-    use std::sync::Mutex;
-    use std::time::Duration;
+    use std::path::PathBuf;
 
     fn image_bytes(width: u32, format: ImageFormat) -> Result<Vec<u8>> {
         let mut bytes = Cursor::new(Vec::new());
@@ -209,65 +113,35 @@ mod tests {
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
     }
 
-    fn compare(root: &Path, pair: &Compare, canceled: bool) -> ImageDiff {
+    struct Images {
+        left: Side<egui::ColorImage>,
+        right: Side<egui::ColorImage>,
+    }
+
+    fn compare(root: &Path, pair: &Compare, canceled: bool) -> Images {
         assert!(supports_pair(pair));
         let log = ReadLog::queue("diff", root, 1);
-        let images = Mutex::new(ImageDiff::pending());
-        load(
-            root,
-            pair,
-            &log,
-            &AtomicBool::new(canceled),
-            |column, image| {
-                images.lock().unwrap().apply(column, image);
-            },
-        );
-        let images = images.into_inner().unwrap();
-        assert!(!images.is_loading());
-        images
-    }
-
-    fn dimensions(side: &ImageSide) -> Option<[usize; 2]> {
-        match side {
-            ImageSide::Pixels(pixels) => Some(pixels.size),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn image_diff_can_deliver_either_column_while_its_peer_is_busy() -> Result<()> {
-        let sandbox = tempfile::tempdir()?;
-        let root = sandbox.path();
-        fs::write(root.join("left.png"), image_bytes(2, ImageFormat::Png)?)?;
-        fs::write(root.join("right.png"), image_bytes(3, ImageFormat::Png)?)?;
-        let pair = Compare {
-            left: Version::Worktree,
-            right: Version::Worktree,
-            base: Version::Empty,
-            left_path: "left.png".into(),
-            right_path: "right.png".into(),
-            left_gitlink: false,
-            right_gitlink: false,
+        let (sender, cancel) = Cancellation::new();
+        let _sender = (!canceled).then_some(sender);
+        let read = |column| {
+            let snapshot = Snapshot::new(root, pair, column, &log, &cancel);
+            if matches!(snapshot.version, Version::Empty) {
+                Side::Absent
+            } else {
+                match load(snapshot) {
+                    Ok(image) => Side::Ready(image),
+                    Err(issue) => Side::Failed(issue),
+                }
+            }
         };
-        let log = ReadLog::queue("diff", root, 1);
-        for delayed in [ImageColumn::Left, ImageColumn::Right] {
-            let (emitted, peer) = bounded(1);
-            load(
-                root,
-                &pair,
-                &log,
-                &AtomicBool::new(false),
-                |column, image| {
-                    assert!(matches!(image, ImageSide::Pixels(_)));
-                    if column == delayed {
-                        peer.recv_timeout(Duration::from_secs(5)).unwrap();
-                    } else {
-                        emitted.send(()).unwrap();
-                    }
-                },
-            );
+        Images {
+            left: read(Column::Left),
+            right: read(Column::Right),
         }
-        Ok(())
+    }
+
+    fn dimensions(side: &Side<egui::ColorImage>) -> Option<[usize; 2]> {
+        side.ready().map(|pixels| pixels.size)
     }
 
     #[test]
@@ -280,7 +154,7 @@ mod tests {
             ImageFormat::WebP,
         ] {
             assert_eq!(
-                decode_image(&image_bytes(3, format)?)?.size,
+                decode_image(&image_bytes(3, format)?).unwrap().size,
                 [3, 2],
                 "{format:?}"
             );
@@ -288,14 +162,14 @@ mod tests {
         let mut png = Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(2, 2).write_to(&mut png, ImageFormat::Png)?;
         assert_eq!(
-            decode_image(png.get_ref())?.pixels[0],
+            decode_image(png.get_ref()).unwrap().pixels[0],
             egui::Color32::TRANSPARENT
         );
         assert!(decode_image(&image_bytes(2, ImageFormat::Png)?[..8]).is_err());
         let mut bmp = image_bytes(2, ImageFormat::Bmp)?;
         bmp[18..22].copy_from_slice(&5000_u32.to_le_bytes());
         bmp[22..26].copy_from_slice(&5000_u32.to_le_bytes());
-        assert_eq!(decode_image(&bmp).unwrap_err().to_string(), IMAGE_LIMIT);
+        assert_eq!(decode_image(&bmp).unwrap_err(), Issue::PreviewLimit);
         Ok(())
     }
 
@@ -354,7 +228,7 @@ mod tests {
             false,
         );
         assert_eq!(dimensions(&images.left), Some([3, 2]));
-        assert!(matches!(images.right, ImageSide::Absent));
+        assert!(matches!(images.right, Side::Absent));
         Ok(())
     }
 
@@ -411,9 +285,10 @@ mod tests {
         };
         let images = compare(&linked, &pair, false);
         assert_eq!(dimensions(&images.left), Some([2, 2]));
-        assert!(
-            matches!(images.right, ImageSide::Unavailable(reason) if reason.contains("Git LFS 对象"))
-        );
+        assert!(matches!(
+            images.right,
+            Side::Failed(Issue::LfsMissing | Issue::LfsDownload)
+        ));
         assert_eq!(fs::read_to_string(linked.join(path))?, pointer(&missing));
         assert!(
             !root
@@ -488,9 +363,7 @@ mod tests {
         let pair = git::compare(change, None, state.head.as_deref());
         assert!(!old_object.exists() && !new_object.exists());
         let canceled = compare(root, &pair, true);
-        assert!(
-            matches!(canceled.right, ImageSide::Unavailable(reason) if reason.contains("已取消"))
-        );
+        assert!(matches!(canceled.right, Side::Failed(Issue::Read)));
         assert!(!old_object.exists() && !new_object.exists());
 
         let views = compare(root, &pair, false);

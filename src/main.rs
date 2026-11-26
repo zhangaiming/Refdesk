@@ -4,6 +4,7 @@
 )]
 
 mod app;
+mod builtin_diff;
 mod diff;
 mod git;
 mod graph;
@@ -19,7 +20,9 @@ mod ui_branches;
 mod ui_dialogs;
 mod ui_diff;
 mod ui_history;
+mod ui_image;
 mod ui_inspector;
+mod ui_text;
 mod ui_workbook;
 #[cfg(windows)]
 mod window_chrome;

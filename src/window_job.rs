@@ -31,3 +31,23 @@ pub(crate) fn assign(
         Ok(job)
     }
 }
+
+pub(crate) fn cancel_with<T>(
+    job: OwnedHandle,
+    canceled: &crossbeam_channel::Receiver<()>,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (finished, done) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            crossbeam_channel::select! {
+                recv(canceled) -> _ => (),
+                recv(done) -> _ => (),
+            }
+            drop(job);
+        });
+        let result = work();
+        drop(finished);
+        result
+    })
+}

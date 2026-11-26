@@ -810,7 +810,7 @@ impl Desk {
                 .state()
                 .is_some_and(|state| state.history_busy || state.status_busy)
                 || self.details_busy
-                || self.diff_busy
+                || self.diff.as_ref().is_some_and(|diff| diff.busy())
                 || !self.operations.is_empty();
             let color = if self.status_is_error {
                 colors.removed.foreground

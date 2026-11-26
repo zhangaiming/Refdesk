@@ -5,7 +5,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +27,17 @@ impl HistoryScope {
 
 pub const PAGE: usize = 32;
 pub(crate) const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct SnapshotLimit;
+
+impl std::fmt::Display for SnapshotLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("文件超过 64 MiB")
+    }
+}
+
+impl std::error::Error for SnapshotLimit {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Commit {
@@ -887,6 +897,18 @@ pub fn safe_relative(path: &str) -> Result<&Path> {
 }
 
 pub fn snapshot(root: &Path, version: &Version, path: &str, missing_ok: bool) -> Result<Vec<u8>> {
+    snapshot_with(root, version, path, missing_ok, &|root, args| {
+        output(root, args, true)
+    })
+}
+
+fn snapshot_with(
+    root: &Path,
+    version: &Version,
+    path: &str,
+    missing_ok: bool,
+    read: &impl Fn(&Path, &[&str]) -> Result<Output>,
+) -> Result<Vec<u8>> {
     let relative = safe_relative(path)?;
     match version {
         Version::Empty => Ok(Vec::new()),
@@ -909,12 +931,12 @@ pub fn snapshot(root: &Path, version: &Version, path: &str, missing_ok: bool) ->
                 file.canonicalize()?.starts_with(root.canonicalize()?),
                 "文件位于工作树之外"
             );
-            ensure!(metadata.len() <= MAX_SNAPSHOT, "文件超过 64 MiB");
+            ensure!(metadata.len() <= MAX_SNAPSHOT, SnapshotLimit);
             let mut bytes = Vec::new();
             std::fs::File::open(file)?
                 .take(MAX_SNAPSHOT + 1)
                 .read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 <= MAX_SNAPSHOT, "文件超过 64 MiB");
+            ensure!(bytes.len() as u64 <= MAX_SNAPSHOT, SnapshotLimit);
             Ok(bytes)
         }
         Version::Index | Version::Head(_) | Version::Commit(_) => {
@@ -925,13 +947,13 @@ pub fn snapshot(root: &Path, version: &Version, path: &str, missing_ok: bool) ->
                 }
                 _ => format!(":{path}"),
             };
-            let size = output(root, &["cat-file", "-s", &spec], true)?;
+            let size = read(root, &["cat-file", "-s", &spec])?;
             if missing_ok && !size.status.success() {
                 return Ok(Vec::new());
             }
             let size: u64 = trim(&checked(size)?).parse().context("无法读取文件大小")?;
-            ensure!(size <= MAX_SNAPSHOT, "文件超过 64 MiB");
-            run(root, &["cat-file", "blob", &spec]).context("无法读取文件版本")
+            ensure!(size <= MAX_SNAPSHOT, SnapshotLimit);
+            checked(read(root, &["cat-file", "blob", &spec])?).context("无法读取文件版本")
         }
     }
 }
@@ -942,9 +964,58 @@ pub fn diff_snapshot(
     path: &str,
     gitlink: bool,
 ) -> Result<Vec<u8>> {
+    diff_snapshot_with(worktree, version, path, gitlink, &|root, args| {
+        output(root, args, true)
+    })
+}
+
+pub(crate) fn diff_snapshot_cancellable(
+    root: &Path,
+    version: &Version,
+    path: &str,
+    gitlink: bool,
+    cancel: &crate::builtin_diff::Cancellation,
+) -> Result<Vec<u8>> {
+    ensure!(!cancel.requested(), "读取已取消");
+    diff_snapshot_with(root, version, path, gitlink, &|root, args| {
+        ensure!(!cancel.requested(), "读取已取消");
+        #[cfg(windows)]
+        {
+            let mut child = command(Some(root), true)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            match crate::window_job::assign(&child, Default::default()) {
+                Ok(job) => crate::window_job::cancel_with(job, cancel.signal(), || {
+                    Ok(child.wait_with_output()?)
+                }),
+                Err(error) => {
+                    if child.try_wait()?.is_some() {
+                        return Ok(child.wait_with_output()?);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(error.into())
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        output(root, args, true)
+    })
+}
+
+fn diff_snapshot_with(
+    worktree: &Path,
+    version: &Version,
+    path: &str,
+    gitlink: bool,
+    read: &impl Fn(&Path, &[&str]) -> Result<Output>,
+) -> Result<Vec<u8>> {
     if !gitlink {
-        return snapshot(worktree, version, path, false);
+        return snapshot_with(worktree, version, path, false, read);
     }
+    let run = |root: &Path, args: &[&str]| checked(read(root, args)?);
     let relative = safe_relative(path)?;
     let id = match version {
         Version::Index => trim(&run(
@@ -960,9 +1031,10 @@ pub fn diff_snapshot(
         }
         Version::Worktree => {
             let module = worktree.join(relative);
+            ensure!(module.join(".git").exists(), "子模块未检出");
+            let top = run(&module, &["rev-parse", "--show-toplevel"])?;
             ensure!(
-                module.join(".git").exists()
-                    && root(&module)?.canonicalize()? == module.canonicalize()?,
+                PathBuf::from(trim(&top)).canonicalize()? == module.canonicalize()?,
                 "子模块未检出"
             );
             trim(&run(&module, &["rev-parse", "--verify", "HEAD"])?)
@@ -1009,7 +1081,7 @@ impl<'a> LfsPointer<'a> {
     }
 
     pub fn read(&self, dir: &Path) -> Result<Option<Vec<u8>>> {
-        ensure!(self.size <= MAX_SNAPSHOT, "Git LFS 图片文件超过 64 MiB");
+        ensure!(self.size <= MAX_SNAPSHOT, SnapshotLimit);
         let oid = self.oid;
         let path = dir.join(&oid[..2]).join(&oid[2..4]).join(oid);
         let metadata = match std::fs::metadata(&path) {
@@ -1052,12 +1124,12 @@ pub(crate) fn download_lfs_object(
     root: &Path,
     path: &str,
     pointer: &[u8],
-    canceled: &AtomicBool,
+    canceled: impl Fn() -> bool,
 ) -> Result<()> {
     const TIMEOUT: Duration = Duration::from_secs(15);
     const CANCELED: &str = "Git LFS 下载已取消";
     const FAILED: &str = "无法下载 Git LFS 对象";
-    ensure!(!canceled.load(Ordering::Relaxed), CANCELED);
+    ensure!(!canceled(), CANCELED);
     // Git LFS smudge also attempts to install hooks. Keep those inside the temporary directory.
     let hooks = tempfile::tempdir().context(FAILED)?;
     let mut hooks_config = OsString::from("core.hooksPath=");
@@ -1085,7 +1157,7 @@ pub(crate) fn download_lfs_object(
             .write_all(pointer)
             .context(FAILED)?;
         loop {
-            ensure!(!canceled.load(Ordering::Relaxed), CANCELED);
+            ensure!(!canceled(), CANCELED);
             if let Some(status) = child.try_wait().context(FAILED)? {
                 ensure!(status.success(), FAILED);
                 return Ok(());

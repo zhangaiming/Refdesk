@@ -19,7 +19,7 @@ cargo test --release --locked
 
 本地开发时，可用 `cargo test --release --locked <测试名片段>` 定向复验，或加 `-- --list` 列出用例。Windows Release 工作流在推送和 PR 时运行完整检查，也可在 GitHub Actions 中手动启动。 [Windows CI](../.github/workflows/windows-ci.yml)
 
-工作簿进程用例可单独运行 `cargo test --release --locked --test workbook_worker`。它读取 [XLSX 夹具](../tests/fixtures/workbook)，其中 `Balance!N358` 从 12 改为 18，`Balance!R401` 的公式从 `=N358*2` 改为 `=N358*3`，新版新增 `Notes!B4`。两版保留 `Balance!M357` 作为未修改的上下文。运行这项测试只需正常的 Windows Rust 构建环境。
+工作簿进程用例可单独运行 `cargo test --release --locked --test workbook_worker`。它分别读取 [XLSX 夹具](../tests/fixtures/workbook) 的两版，核对稀疏坐标、值、公式和无效数据的错误。比较层测试 `parsed_snapshots_gain_workbook_changes_without_reparsing` 用同一夹具核对 `Balance!N358` 从 12 改为 18、`Balance!R401` 的公式从 `=N358*2` 改为 `=N358*3`，以及新版新增 `Notes!B4`。两版保留 `Balance!M357` 作为上下文。
 
 ## 验收与记录
 

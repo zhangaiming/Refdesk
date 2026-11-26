@@ -7,8 +7,8 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::git::{self, Compare, Version};
-use crate::image_diff::ImageDiff;
+use crate::builtin_diff::{Issue, Snapshot};
+use crate::git::Compare;
 use crate::logging::{self, ReadLog};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -84,21 +84,35 @@ pub struct WorkbookDiff {
     pub total: usize,
 }
 
-pub enum Content {
-    LoadingText,
-    LoadingWorkbook,
-    Text {
-        lines: Vec<Line>,
-        added: usize,
-        removed: usize,
-    },
-    Sheet(WorkbookDiff),
-    Image(ImageDiff),
-    Binary {
-        left: usize,
-        right: usize,
-    },
-    Notice(String),
+pub(crate) struct TextDocument {
+    text: String,
+    pub lines: Vec<String>,
+}
+
+impl TextDocument {
+    pub fn parse(bytes: &[u8]) -> std::result::Result<Self, Issue> {
+        let text = decode(bytes).ok_or(Issue::Binary(bytes.len()))?;
+        if bytes.len() > 2 * 1024 * 1024 || text.lines().count() > 30_000 {
+            return Err(Issue::PreviewLimit);
+        }
+        let text = text.replace("\r\n", "\n");
+        let lines = text.split_terminator('\n').map(display_line).collect();
+        Ok(Self { text, lines })
+    }
+}
+
+pub(crate) struct TextChanges {
+    pub lines: Vec<Line>,
+    pub added: usize,
+    pub removed: usize,
+}
+
+pub(crate) fn load_text(snapshot: Snapshot<'_>) -> std::result::Result<TextDocument, Issue> {
+    TextDocument::parse(&snapshot.read()?)
+}
+
+fn display_line(text: &str) -> String {
+    text.trim_end_matches('\n').replace('\t', "    ")
 }
 
 pub fn is_workbook(path: &str) -> bool {
@@ -117,86 +131,19 @@ pub(crate) fn is_workbook_pair(pair: &Compare) -> bool {
     !pair.left_gitlink && !pair.right_gitlink && is_workbook(&pair.right_path)
 }
 
-pub(crate) fn read_snapshot(
-    root: &Path,
-    version: &Version,
-    path: &str,
-    gitlink: bool,
+pub(crate) fn compare_text(
+    [left, right]: [Option<&TextDocument>; 2],
     log: &ReadLog,
-) -> Result<Vec<u8>> {
+) -> TextChanges {
     let (worktree, request) = (log.worktree, log.request);
-    git::diff_snapshot(root, version, path, gitlink).inspect_err(|error| {
-        let (error_kind, exit_code) = git::error_kind(error);
-        tracing::warn!(
-            worktree,
-            request,
-            error_kind,
-            exit_code,
-            "diff_snapshot_failed"
-        );
-    })
-}
-
-pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> Result<Content> {
-    let (worktree, request) = (log.worktree, log.request);
-    let old = read_snapshot(root, &pair.left, &pair.left_path, pair.left_gitlink, log)?;
-    let new = read_snapshot(root, &pair.right, &pair.right_path, pair.right_gitlink, log)?;
-    let (left_bytes, right_bytes) = (old.len(), new.len());
-    let lfs = |bytes: &[u8]| bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n");
-    if !force_text && is_workbook_pair(pair) && !lfs(&old) && !lfs(&new) {
-        #[cfg(windows)]
-        let workbook = crate::workbook_worker::compare(&old, &new, log)?;
-        #[cfg(not(windows))]
-        let workbook = compare_workbooks(&old, &new).inspect_err(|_| {
-            tracing::warn!(worktree, request, "workbook_compare_failed");
-        })?;
-        return Ok(Content::Sheet(workbook));
-    }
-    let (Some(old_text), Some(new_text)) = (decode(&old), decode(&new)) else {
-        tracing::debug!(
-            worktree,
-            request,
-            kind = "binary",
-            left_bytes,
-            right_bytes,
-            "diff_input"
-        );
-        return Ok(Content::Binary {
-            left: old.len(),
-            right: new.len(),
-        });
-    };
-    tracing::debug!(
-        worktree,
-        request,
-        kind = "text",
-        left_bytes,
-        right_bytes,
-        "diff_input"
-    );
-    if old.len().max(new.len()) > 2 * 1024 * 1024
-        || old_text.lines().count().max(new_text.lines().count()) > 30_000
-    {
-        tracing::warn!(
-            worktree,
-            request,
-            kind = "text",
-            left_bytes,
-            right_bytes,
-            "diff_input_limit"
-        );
-        return Ok(Content::Notice(
-            "文件超过内置文本比较的上限，可以交给外部 diff 工具。".into(),
-        ));
-    }
-    let old_text = old_text.replace("\r\n", "\n");
-    let new_text = new_text.replace("\r\n", "\n");
+    let old_text = left.map_or("", |document| document.text.as_str());
+    let new_text = right.map_or("", |document| document.text.as_str());
     let budget = Duration::from_millis(750);
     let started = Instant::now();
     let result = TextDiff::configure()
         .algorithm(Algorithm::Patience)
         .timeout(budget)
-        .diff_lines(&old_text, &new_text);
+        .diff_lines(old_text, new_text);
     let elapsed = started.elapsed();
     if elapsed >= budget {
         // similar returns a diff even when it reaches its internal deadline.
@@ -212,7 +159,6 @@ pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> 
     let mut removed = 0;
     let old = result.old_slices();
     let new = result.new_slices();
-    let line = |text: &str| text.trim_end_matches('\n').replace('\t', "    ");
     for operation in result.ops() {
         let before = operation.old_range();
         let after = operation.new_range();
@@ -229,11 +175,11 @@ pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> 
         for offset in 0..before.len().max(after.len()) {
             let left = (offset < before.len()).then(|| {
                 let index = before.start + offset;
-                (index + 1, line(old[index]))
+                (index + 1, display_line(old[index]))
             });
             let right = (offset < after.len()).then(|| {
                 let index = after.start + offset;
-                (index + 1, line(new[index]))
+                (index + 1, display_line(new[index]))
             });
             let kind = match (&left, &right) {
                 (None, Some(_)) => Kind::Add,
@@ -247,11 +193,11 @@ pub fn compare(root: &Path, pair: &Compare, force_text: bool, log: &ReadLog) -> 
             });
         }
     }
-    Ok(Content::Text {
+    TextChanges {
         lines,
         added,
         removed,
-    })
+    }
 }
 
 pub fn encoding(bytes: &[u8]) -> &'static str {
@@ -296,7 +242,7 @@ fn decode(bytes: &[u8]) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 struct Cell {
     value: String,
     typed: String,
@@ -304,24 +250,91 @@ struct Cell {
 }
 
 impl Cell {
-    fn into_display(self) -> String {
+    fn display(&self) -> std::borrow::Cow<'_, str> {
         if self.formula.is_empty() {
-            return self.value;
+            return std::borrow::Cow::Borrowed(&self.value);
         }
         if self.value.is_empty() {
-            return format!("={}", self.formula);
+            return format!("={}", self.formula).into();
         }
-        format!("={}  →  {}", self.formula, self.value)
+        format!("={}  →  {}", self.formula, self.value).into()
     }
 }
 
 const MAX_USED_CELLS: usize = 300_000;
-type Worksheet = BTreeMap<(u32, u32), Cell>;
-type Workbook = Vec<(String, Worksheet)>;
+type WorksheetCells = BTreeMap<CellPosition, Cell>;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Worksheet {
+    pub name: String,
+    pub rows: u32,
+    pub columns: u32,
+    cells: Vec<(CellPosition, Cell)>,
+}
+
+impl Worksheet {
+    fn new(name: String, cells: WorksheetCells) -> Self {
+        let rows = cells
+            .last_key_value()
+            .map_or(0, |(&(row, _), _)| row.saturating_add(1));
+        let columns = cells
+            .keys()
+            .map(|&(_, col)| col.saturating_add(1))
+            .max()
+            .unwrap_or_default();
+        Self {
+            name,
+            rows,
+            columns,
+            cells: cells.into_iter().collect(),
+        }
+    }
+
+    pub fn cell(&self, position: CellPosition) -> Option<std::borrow::Cow<'_, str>> {
+        self.cells
+            .binary_search_by_key(&position, |(position, _)| *position)
+            .ok()
+            .map(|index| self.cells[index].1.display())
+    }
+
+    pub fn first_cell(&self) -> Option<CellPosition> {
+        self.cells.first().map(|(position, _)| *position)
+    }
+}
+
+pub(crate) type Workbook = Vec<Worksheet>;
+
+pub(crate) enum WorkbookSide {
+    Book(Workbook),
+    Pointer(TextDocument),
+}
+
+pub(crate) fn load_workbook(snapshot: Snapshot<'_>) -> std::result::Result<WorkbookSide, Issue> {
+    let bytes = snapshot.read()?;
+    if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1") {
+        return TextDocument::parse(&bytes).map(WorkbookSide::Pointer);
+    }
+    #[cfg(windows)]
+    let parsed = crate::workbook_worker::parse(&bytes, snapshot.log, snapshot.cancel);
+    #[cfg(not(windows))]
+    let parsed = parse_workbook(&bytes);
+    parsed.map(WorkbookSide::Book)
+}
+
+#[derive(Debug)]
+struct WorkbookLimit;
+
+impl std::fmt::Display for WorkbookLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("工作簿超过 300,000 个已用单元格")
+    }
+}
+
+impl std::error::Error for WorkbookLimit {}
 
 #[derive(Default)]
 struct SheetCells {
-    cells: Worksheet,
+    cells: WorksheetCells,
     used: usize,
 }
 
@@ -331,10 +344,7 @@ impl SheetCells {
         match self.cells.entry(position) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                ensure!(
-                    self.used < MAX_USED_CELLS,
-                    "工作簿超过 300,000 个已用单元格，请使用外部工具"
-                );
+                ensure!(self.used < MAX_USED_CELLS, WorkbookLimit);
                 self.used += 1;
                 Ok(entry.insert(Cell::default()))
             }
@@ -395,6 +405,16 @@ impl SheetCells {
     }
 }
 
+pub(crate) fn parse_workbook(bytes: &[u8]) -> std::result::Result<Workbook, Issue> {
+    read_workbook(bytes).map_err(|error| {
+        if error.is::<WorkbookLimit>() {
+            Issue::PreviewLimit
+        } else {
+            Issue::Decode
+        }
+    })
+}
+
 fn read_workbook(bytes: &[u8]) -> Result<Workbook> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -430,48 +450,63 @@ fn read_workbook(bytes: &[u8]) -> Result<Workbook> {
         })()
         .with_context(|| format!("无法读取工作表 {name}"))?;
         cells_seen = sheet.used;
-        sheets.push((name, sheet.cells));
+        sheets.push(Worksheet::new(name, sheet.cells));
     }
     Ok(sheets)
 }
 
-pub(crate) fn compare_workbooks(left: &[u8], right: &[u8]) -> Result<WorkbookDiff> {
-    let left = read_workbook(left)?;
-    let right = read_workbook(right)?;
-    let left_order: Vec<_> = left.iter().map(|(name, _)| name.clone()).collect();
-    let mut left: BTreeMap<_, _> = left.into_iter().collect();
-    let mut sheets: Vec<_> = right
-        .into_iter()
-        .map(|(name, after)| {
-            let before = left.remove(&name);
-            compare_worksheet(name, before, Some(after))
-        })
+pub(crate) fn compare_workbooks(
+    [left, right]: [Option<&[Worksheet]>; 2],
+    cancel: impl Fn() -> bool,
+) -> Option<WorkbookDiff> {
+    let left = left.unwrap_or_default();
+    let right = right.unwrap_or_default();
+    let mut remaining: BTreeMap<_, _> = left
+        .iter()
+        .map(|sheet| (sheet.name.as_str(), sheet))
         .collect();
-    sheets.extend(left_order.into_iter().filter_map(|name| {
-        let before = left.remove(&name)?;
-        Some(compare_worksheet(name, Some(before), None))
-    }));
+    let mut sheets = Vec::new();
+    for after in right {
+        let before = remaining.remove(after.name.as_str());
+        sheets.push(compare_worksheet(
+            &after.name,
+            before,
+            Some(after),
+            &cancel,
+        )?);
+    }
+    for before in left {
+        if remaining.contains_key(before.name.as_str()) {
+            sheets.push(compare_worksheet(
+                &before.name,
+                Some(before),
+                None,
+                &cancel,
+            )?);
+        }
+    }
     let total = sheets
         .iter()
         .map(|sheet| sheet.change_count() + usize::from(sheet.kind != Kind::Equal))
         .sum();
-    Ok(WorkbookDiff { sheets, total })
+    Some(WorkbookDiff { sheets, total })
 }
 
 fn compare_worksheet(
-    name: String,
-    before: Option<Worksheet>,
-    after: Option<Worksheet>,
-) -> WorksheetDiff {
+    name: &str,
+    before: Option<&Worksheet>,
+    after: Option<&Worksheet>,
+    cancel: impl Fn() -> bool,
+) -> Option<WorksheetDiff> {
     let kind = match (&before, &after) {
         (None, _) => Kind::Add,
         (_, None) => Kind::Remove,
         _ => Kind::Equal,
     };
-    let mut left = before.unwrap_or_default().into_iter().peekable();
-    let mut right = after.unwrap_or_default().into_iter().peekable();
+    let mut left = before.into_iter().flat_map(|sheet| &sheet.cells).peekable();
+    let mut right = after.into_iter().flat_map(|sheet| &sheet.cells).peekable();
     let mut diff = WorksheetDiff {
-        name,
+        name: name.to_owned(),
         rows: 0,
         columns: 0,
         kind,
@@ -485,14 +520,19 @@ fn compare_worksheet(
         .chain(right.peek().map(|(position, _)| *position))
         .min()
     {
-        let at_position = |entry: &(CellPosition, Cell)| entry.0 == position;
+        if cancel() {
+            return None;
+        }
+        let at_position = |entry: &&(CellPosition, Cell)| entry.0 == position;
         let old = left.next_if(at_position).map(|(_, cell)| cell);
         let new = right.next_if(at_position).map(|(_, cell)| cell);
         let values = match (old, new) {
-            (Some(old), Some(new)) if old == new => CellValues::Same(new.into_display()),
-            (Some(old), Some(new)) => CellValues::Changed(old.into_display(), new.into_display()),
-            (None, Some(new)) => CellValues::Added(new.into_display()),
-            (Some(old), None) => CellValues::Removed(old.into_display()),
+            (Some(old), Some(new)) if old == new => CellValues::Same(new.display().into_owned()),
+            (Some(old), Some(new)) => {
+                CellValues::Changed(old.display().into_owned(), new.display().into_owned())
+            }
+            (None, Some(new)) => CellValues::Added(new.display().into_owned()),
+            (Some(old), None) => CellValues::Removed(old.display().into_owned()),
             (None, None) => unreachable!("position came from an input"),
         };
         diff.rows = diff.rows.max(position.0.saturating_add(1));
@@ -502,7 +542,7 @@ fn compare_worksheet(
         }
         diff.cells.push((position, values));
     }
-    diff
+    Some(diff)
 }
 
 pub fn column_name(col: u32) -> String {
@@ -542,25 +582,31 @@ mod tests {
             value: text.into(),
             ..Cell::default()
         };
-        let before = Worksheet::from([
-            ((0, 0), value("name")),
-            ((356, 12), value("context")),
-            ((357, 13), value("old")),
-            ((359, 13), value("removed")),
-        ]);
-        let after = Worksheet::from([
-            ((0, 0), value("name")),
-            ((356, 12), value("context")),
-            ((357, 13), value("new")),
-            (
-                (1500, 27),
-                Cell {
-                    formula: "N358".into(),
-                    ..Cell::default()
-                },
-            ),
-        ]);
-        let sheet = compare_worksheet("function".into(), Some(before), Some(after));
+        let before = Worksheet::new(
+            "function".into(),
+            WorksheetCells::from([
+                ((0, 0), value("name")),
+                ((356, 12), value("context")),
+                ((357, 13), value("old")),
+                ((359, 13), value("removed")),
+            ]),
+        );
+        let after = Worksheet::new(
+            "function".into(),
+            WorksheetCells::from([
+                ((0, 0), value("name")),
+                ((356, 12), value("context")),
+                ((357, 13), value("new")),
+                (
+                    (1500, 27),
+                    Cell {
+                        formula: "N358".into(),
+                        ..Cell::default()
+                    },
+                ),
+            ]),
+        );
+        let sheet = compare_worksheet("function", Some(&before), Some(&after), || false).unwrap();
         assert_eq!((sheet.rows, sheet.columns), (1501, 28));
         assert_eq!(
             sheet.cell((356, 12)).unwrap().sides(),
@@ -595,9 +641,35 @@ mod tests {
         sheet.value(position, &Data::Int(2)).unwrap();
         sheet.at(position).unwrap().formula = "1+1".into();
         assert_eq!(
-            sheet.cells.remove(&position).unwrap().into_display(),
+            sheet
+                .cells
+                .remove(&position)
+                .unwrap()
+                .display()
+                .into_owned(),
             "=1+1  →  2"
         );
         assert!(sheet.value((0, 0), &Data::Int(3)).is_err());
+    }
+
+    #[test]
+    fn parsed_snapshots_gain_workbook_changes_without_reparsing() {
+        let old = parse_workbook(include_bytes!("../tests/fixtures/workbook/before.xlsx")).unwrap();
+        let new = parse_workbook(include_bytes!("../tests/fixtures/workbook/after.xlsx")).unwrap();
+        assert_eq!(old[0].cell((357, 13)).as_deref(), Some("12"));
+        assert_eq!(new[0].cell((357, 13)).as_deref(), Some("18"));
+        assert_eq!(new[0].cell((356, 12)).as_deref(), Some("Context"));
+        let compared = compare_workbooks([Some(&old), Some(&new)], || false).unwrap();
+        let [balance, notes] = compared.sheets.as_slice() else {
+            panic!("expected Balance and Notes");
+        };
+        assert_eq!(balance.change(0), Some((357, 13)));
+        assert_eq!(balance.change(1), Some((400, 17)));
+        assert_eq!(
+            balance.cell((400, 17)).unwrap().sides(),
+            (Some("=N358*2  →  24"), Some("=N358*3  →  54"))
+        );
+        assert_eq!(notes.kind, Kind::Add);
+        assert_eq!(notes.change(0), Some((3, 1)));
     }
 }

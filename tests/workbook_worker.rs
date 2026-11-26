@@ -7,20 +7,44 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-fn workbook_worker_preserves_sparse_cells_and_formulas() -> Result<()> {
+fn workbook_worker_delivers_each_snapshot_with_sparse_cells_and_formulas() -> Result<()> {
+    let before = parse(include_bytes!("fixtures/workbook/before.xlsx"))?;
+    let after = parse(include_bytes!("fixtures/workbook/after.xlsx"))?;
+    let [old_balance] = before.as_array().unwrap().as_slice() else {
+        bail!("expected Balance, got {before}");
+    };
+    let [new_balance, notes] = after.as_array().unwrap().as_slice() else {
+        bail!("expected Balance and Notes, got {after}");
+    };
+    for balance in [old_balance, new_balance] {
+        assert_eq!(balance["name"], "Balance");
+        assert_eq!(balance["rows"], 401);
+        assert_eq!(balance["columns"], 18);
+        assert_eq!(balance["cells"][0][0], json!([356, 12]));
+        assert_eq!(balance["cells"][0][1]["value"], "Context");
+        assert_eq!(balance["cells"][1][0], json!([357, 13]));
+        assert_eq!(balance["cells"][2][0], json!([400, 17]));
+    }
+    assert_eq!(old_balance["cells"][1][1]["value"], "12");
+    assert_eq!(new_balance["cells"][1][1]["value"], "18");
+    assert_eq!(old_balance["cells"][2][1]["formula"], "N358*2");
+    assert_eq!(new_balance["cells"][2][1]["formula"], "N358*3");
+    assert_eq!(notes["name"], "Notes");
+    assert_eq!(notes["cells"][0][0], json!([3, 1]));
+    assert_eq!(notes["cells"][0][1]["value"], "Reviewed");
+    assert_eq!(parse(b"not a workbook")?.as_str(), Some("Decode"));
+    Ok(())
+}
+
+fn parse(workbook: &[u8]) -> Result<Value> {
     let sandbox = tempfile::tempdir()?;
     let mut input = tempfile::tempfile()?;
-    for workbook in [
-        include_bytes!("fixtures/workbook/before.xlsx").as_slice(),
-        include_bytes!("fixtures/workbook/after.xlsx").as_slice(),
-    ] {
-        input.write_all(&(workbook.len() as u64).to_le_bytes())?;
-        input.write_all(workbook)?;
-    }
+    input.write_all(&(workbook.len() as u64).to_le_bytes())?;
+    input.write_all(workbook)?;
     input.rewind()?;
 
     let child = Command::new(env!("CARGO_BIN_EXE_refdesk"))
-        .arg("--workbook-diff-worker")
+        .arg("--workbook-read-worker")
         .current_dir(sandbox.path())
         .env("REFDESK_CONFIG", sandbox.path().join("settings.json"))
         .env("REFDESK_LOG_DIR", sandbox.path())
@@ -37,33 +61,11 @@ fn workbook_worker_preserves_sparse_cells_and_formulas() -> Result<()> {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    let reply: Result<Value, String> =
+    let reply: std::result::Result<Value, Value> =
         serde_json::from_slice(&output.stdout).context("decode the workbook worker reply")?;
-    let workbook = reply.map_err(anyhow::Error::msg)?;
-    let sheets = workbook["sheets"]
-        .as_array()
-        .context("workbook worker reply has no sheet list")?;
-    let [balance, notes] = sheets.as_slice() else {
-        bail!("expected Balance and Notes, got {sheets:?}");
-    };
-
-    assert_eq!(balance["name"], "Balance");
-    assert_eq!(balance["rows"], 401);
-    assert_eq!(balance["columns"], 18);
-    // M357 is unchanged. N358 and R401 keep their absolute zero-based coordinates.
-    assert_eq!(
-        balance["cells"],
-        json!([
-            [[356, 12], {"Same": "Context"}],
-            [[357, 13], {"Changed": ["12", "18"]}],
-            [[400, 17], {"Changed": ["=N358*2  →  24", "=N358*3  →  54"]}],
-        ])
-    );
-    assert_eq!(balance["changes"], json!([1, 2]));
-    assert_eq!(notes["name"], "Notes");
-    assert_eq!(notes["kind"], "Add");
-    assert_eq!(notes["cells"], json!([[[3, 1], {"Added": "Reviewed"}]]));
-    Ok(())
+    Ok(match reply {
+        Ok(value) | Err(value) => value,
+    })
 }
 
 fn wait_for_worker(mut child: Child) -> Result<Output> {

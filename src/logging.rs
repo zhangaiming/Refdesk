@@ -110,6 +110,7 @@ pub(crate) fn millis(duration: Duration) -> u64 {
     duration.as_millis() as u64
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ReadLog {
     kind: &'static str,
     pub worktree: u64,
