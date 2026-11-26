@@ -20,6 +20,12 @@ Refdesk 将登记仓库 `repositories` 和上次活动仓库 `active` 保存在�
 
 统一路径后，将项目会话整份复制到用户目录，保留了旧文件。通过启动器和直接运行同一个 EXE 依次验证，两个入口都恢复了 7 个已登记仓库和上次活动仓库，提交图和工作树状态均已就绪。
 
+## 提交图时间列
+
+- `bBj` 注册 `Date` 列，`bBr` 取作者信息中的时间交给 `hy`，再由 `RK` 实现 `acj` 格式化。默认取作者时间，低阶选项 `log.graph.author.showCommitDate` 可改用提交者时间。见本地 `sg-live-time-graph-option.txt`、`sg-live-time-graph-columns.txt` 和 `sg-live-time-hy.txt`。
+- 本机 `preferences.yml` 配置为 `datePattern: yyyy-MM-dd`、`timePattern: HH:mm`、`showTimeForLastDays: true`，使用系统时区。`acj` 以本地午夜为基准，今天只显示时分，昨天和前 2 到 6 天分别显示 `Yesterday` 或英文星期加时分。更早及未来日期回到完整年月日和时分。`showTimeForLastDays` 关闭时统一使用完整格式。见本地 `sg-live-time-ace.txt` 和 `sg-live-time-acj.txt`。
+- `hy` 按实际行文本估算列宽，时间右对齐，复制时取完整格式。Refdesk 的「时间」列使用中文星期和「昨天」，以本地日历日计算范围，悬停显示完整时间。
+
 ## 其他行为
 
 - Log 窗口布局以实际窗口为准。仓库和分支在左、历史图居中、提交和文件在右、差异在下。Refdesk 自行实现这些面板和提交图算法。

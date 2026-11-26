@@ -1,14 +1,18 @@
 use crate::app::{Desk, Selection};
 use crate::git::{Commit, History, HistoryScope, PAGE, Reference, TrackingState};
 use crate::graph::{GraphRow, Span};
-use crate::history::{SearchDirection, matches_search};
+use crate::history::{Row, SearchDirection, matches_search};
 use crate::theme;
 use crate::ui::{
     CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, fit_line_job,
     galley_baseline, heading, paint_baseline, small_button,
 };
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
+use std::time::Duration;
+
+const FULL_COMMIT_TIME: &str = "%Y-%m-%d %H:%M";
 
 const SUBJECT_SIZE: f32 = 14.0;
 const GRAPH_INSET: f32 = 9.0;
@@ -138,6 +142,8 @@ impl Desk {
         let width = ui.available_width() - ui.spacing().scroll.allocated_width();
         let graph_width = graph_width(width, lanes);
         table_header(ui, width, graph_width);
+        let today = Local::now().date_naive();
+        ctx.request_repaint_after(Duration::from_secs(60));
         let baseline_offset = centered_baseline(ui.painter(), FontId::proportional(SUBJECT_SIZE));
         let rows = summary.loaded;
         let mut click = None;
@@ -277,9 +283,9 @@ impl Desk {
                         rect,
                         graph_width,
                         history,
-                        commit,
+                        cached,
+                        today,
                         !query.is_empty() && !matched && !selected,
-                        Some(colors.lane(graph.color)),
                     );
                     if response.clicked() {
                         click = Some(Click::Commit(
@@ -306,10 +312,11 @@ impl Desk {
                     });
                     response.on_hover_ui(|ui| {
                         ui.label(&commit.subject);
-                        ui.label(format!(
-                            "{} · {} · {}",
-                            commit.author, commit.date, commit.short
-                        ));
+                        let time = local_author_time(commit).map_or_else(
+                            || commit.date.clone(),
+                            |time| time.format(FULL_COMMIT_TIME).to_string(),
+                        );
+                        ui.label(format!("{} · {} · {}", commit.author, time, commit.short));
                         if commit.parents.len() > 1 {
                             let parents = commit
                                 .parents
@@ -402,7 +409,7 @@ fn graph_width(width: f32, lanes: usize) -> f32 {
 struct HistoryColumns {
     subject: Rect,
     author: Option<Rect>,
-    date: Option<Rect>,
+    time: Option<Rect>,
     sha: Option<Rect>,
 }
 
@@ -417,14 +424,14 @@ impl HistoryColumns {
             bounds
         };
         let sha = (rect.width() >= 660.0).then(|| column(72.0));
-        let date = (rect.width() >= 465.0).then(|| column(42.0));
+        let time = (rect.width() >= 465.0).then(|| column(124.0));
         let author = (rect.width() >= 550.0).then(|| column(102.0));
         let left = rect.left() + graph_width + 4.0;
         let subject = Rect::from_x_y_ranges(left..=right.max(left), rect.y_range());
         Self {
             subject,
             author,
-            date,
+            time,
             sha,
         }
     }
@@ -443,7 +450,7 @@ fn table_header(ui: &mut egui::Ui, width: f32, graph_width: f32) {
         (Some(graph), "图", Align::Min, colors.muted),
         (Some(columns.subject), "提交消息", Align::Min, colors.text),
         (columns.author, "作者", Align::Min, colors.muted),
-        (columns.date, "日期", Align::Max, colors.muted),
+        (columns.time, "时间", Align::Max, colors.muted),
         (columns.sha, "SHA", Align::Max, colors.muted),
     ] {
         if let Some(column) = column {
@@ -674,15 +681,35 @@ fn graph_references_at<'a>(history: &'a History, target: &str) -> Vec<&'a Refere
     refs
 }
 
+fn local_author_time(commit: &Commit) -> Option<NaiveDateTime> {
+    let time = Local.timestamp_opt(commit.author_timestamp?, 0).single()?;
+    time.naive_utc().checked_add_offset(*time.offset())
+}
+
+fn format_commit_time(time: NaiveDateTime, today: NaiveDate) -> (Option<&'static str>, String) {
+    let days_ago = (today - time.date()).num_days();
+    let prefix = match days_ago {
+        0 => None,
+        1 => Some("昨天"),
+        2..=6 => {
+            let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+            Some(weekdays[time.weekday().num_days_from_monday() as usize])
+        }
+        _ => return (None, time.format(FULL_COMMIT_TIME).to_string()),
+    };
+    (prefix, time.format("%H:%M").to_string())
+}
+
 fn draw_commit(
     ui: &egui::Ui,
     rect: Rect,
     graph_width: f32,
     history: &History,
-    commit: &Commit,
+    row: &Row,
+    today: NaiveDate,
     dim: bool,
-    lane_color: Option<Color32>,
 ) {
+    let commit = &row.commit;
     let colors = theme::palette(ui.ctx());
     let columns = HistoryColumns::new(rect, graph_width);
     let painter = ui
@@ -730,7 +757,7 @@ fn draw_commit(
         let color = match style {
             RefBadgeStyle::Head => colors.accent,
             RefBadgeStyle::Local => colors.text,
-            RefBadgeStyle::Remote => lane_color.unwrap_or(colors.muted),
+            RefBadgeStyle::Remote => colors.lane(row.graph.color),
             RefBadgeStyle::Tag => colors.lane(2),
         };
         let icon_width = if matches!(style, RefBadgeStyle::Remote) {
@@ -840,9 +867,18 @@ fn draw_commit(
         );
         paint_baseline(ui.painter(), author.left(), baseline, name, colors.muted);
     }
-    for (column, value) in [
-        (columns.date, commit.date.get(5..).unwrap_or(&commit.date)),
-        (columns.sha, commit.short.as_str()),
+    let time = columns
+        .time
+        .and_then(|_| local_author_time(commit))
+        .map(|time| format_commit_time(time, today));
+    let (prefix, time) = time
+        .as_ref()
+        .map_or((None, commit.date.as_str()), |(prefix, value)| {
+            (*prefix, value.as_str())
+        });
+    for (column, prefix, value) in [
+        (columns.time, prefix, time),
+        (columns.sha, None, commit.short.as_str()),
     ] {
         if let Some(column) = column {
             let painter = ui
@@ -850,13 +886,17 @@ fn draw_commit(
                 .with_clip_rect(column.intersect(ui.clip_rect()));
             let value =
                 painter.layout_no_wrap(value.into(), FontId::monospace(DETAIL_SIZE), colors.subtle);
-            paint_baseline(
-                &painter,
-                column.right() - value.size().x,
-                baseline,
-                value,
-                colors.subtle,
-            );
+            let x = column.right() - value.size().x;
+            paint_baseline(&painter, x, baseline, value, colors.subtle);
+            if let Some(prefix) = prefix {
+                let prefix = painter.layout_no_wrap(
+                    prefix.into(),
+                    FontId::proportional(DETAIL_SIZE),
+                    colors.subtle,
+                );
+                let prefix_x = x - 5.0 - prefix.size().x;
+                paint_baseline(&painter, prefix_x, baseline, prefix, colors.subtle);
+            }
         }
     }
     ui.painter().hline(
@@ -870,6 +910,27 @@ fn draw_commit(
 mod tests {
     use super::*;
     use crate::git::Upstream;
+
+    #[test]
+    fn commit_time_uses_local_calendar_days_across_new_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for (year, month, day, expected_prefix, expected_time) in [
+            (2026, 1, 1, None, "00:05"),
+            (2025, 12, 31, Some("昨天"), "00:05"),
+            (2025, 12, 30, Some("周二"), "00:05"),
+            (2025, 12, 26, Some("周五"), "00:05"),
+            (2025, 12, 25, None, "2025-12-25 00:05"),
+            (2026, 1, 2, None, "2026-01-02 00:05"),
+        ] {
+            let time = NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(0, 5, 0)
+                .unwrap();
+            let (prefix, value) = format_commit_time(time, today);
+            assert_eq!(prefix, expected_prefix);
+            assert_eq!(value, expected_time);
+        }
+    }
 
     #[test]
     fn graph_combines_coincident_upstream_labels_and_keeps_disjoint_tips() {

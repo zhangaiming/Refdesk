@@ -149,6 +149,7 @@ mod tests {
             short: id.into(),
             author: String::new(),
             date: String::new(),
+            author_timestamp: None,
             subject: String::new(),
         }
     }

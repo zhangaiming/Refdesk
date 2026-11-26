@@ -8,6 +8,7 @@ description = "A native Git workbench with a commit graph and spreadsheet diffs"
 [dependencies]
 anyhow = "1"
 calamine = "0.31"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossbeam-channel = "0.5"
 dirs = "6"
 eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }

@@ -34,6 +34,7 @@ pub struct Commit {
     pub short: String,
     pub author: String,
     pub date: String,
+    pub author_timestamp: Option<i64>,
     pub subject: String,
 }
 
@@ -540,7 +541,7 @@ impl HistoryStart {
                 "--date-order",
                 "--date=short",
                 "-z",
-                "--format=%H%x00%P%x00%h%x00%an%x00%ad%x00%s",
+                "--format=%H%x00%P%x00%h%x00%an%x00%ad%x00%at%x00%s",
                 &skip,
                 "--stdin",
                 "--",
@@ -577,7 +578,7 @@ pub struct LogReader {
 impl LogReader {
     pub fn next_commit(&mut self) -> Result<Option<Commit>> {
         let mut bytes = Vec::new();
-        for field in 0..6 {
+        for field in 0..7 {
             if self.stdout.read_until(0, &mut bytes)? == 0 || bytes.last() != Some(&0) {
                 if !self.child.wait()?.success() {
                     self.stderr.rewind()?;
@@ -605,6 +606,7 @@ impl LogReader {
             short: fields.next().expect("short id"),
             author: fields.next().expect("author"),
             date: fields.next().expect("date"),
+            author_timestamp: fields.next().expect("author timestamp").parse().ok(),
             subject: fields.next().expect("subject"),
         }))
     }
@@ -1470,7 +1472,12 @@ mod tests {
         Operation::Unstage(vec![notes.clone()]).execute(&root)?;
         assert_eq!(status(&root)?.files[0].code, '?');
         Operation::Stage(vec![notes.clone()]).execute(&root)?;
-        Operation::Commit("initial commit".into()).execute(&root)?;
+        git(&[
+            "commit",
+            "--date=2000-01-01T00:30:00+08:00",
+            "-m",
+            "initial commit",
+        ])?;
         git(&["tag", "-a", "v1", "-m", "first release"])?;
 
         Operation::Branch("feature/forecast".into()).execute(&root)?;
@@ -1512,6 +1519,8 @@ mod tests {
         assert_eq!(history.info.head.as_ref(), Some(&merge.id));
         assert_eq!(merge.parents.len(), 2);
         let base = history.commits.last().expect("root commit");
+        assert_eq!(base.author_timestamp, Some(946_657_800));
+        assert_eq!(base.date, "2000-01-01");
         assert!(
             history
                 .info
