@@ -1080,7 +1080,7 @@ impl Desk {
         self.content = None;
         self.diff_error = None;
         self.diff_busy = true;
-        self.diff_reset = request;
+        self.diff_reset += 1;
         let force_text = self.force_text;
         let path = root.clone();
         let log = ReadLog::queue("diff", &path, request);
