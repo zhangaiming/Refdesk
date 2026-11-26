@@ -24,7 +24,7 @@ impl HistoryScope {
     }
 }
 
-pub const PAGE: usize = 300;
+pub const PAGE: usize = 32;
 pub(crate) const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

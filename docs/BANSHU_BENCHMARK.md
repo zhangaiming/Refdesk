@@ -53,3 +53,11 @@ Refdesk 可以用 REFDESK_TIMINGS 记录 activate、graph-ready、status-ready�
 SmartGit 日志同时记录 client 对象库的 Commit Net 遍历 19,752 个节点，8 项组还记录 common 对象库的遍历。相同首批显示规模下，两者仍采用各自的引用、索引与历史缓存策略。测试记录状态就绪后的内存，启动峰值以及同规模下的启动或切换耗时是独立测项。
 
 计数和指标定义见 [SmartGit Git Log](https://docs.smartgit.dev/latest/manual/gui/log)、[Windows Private Bytes](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64) 和 [Working Set](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.workingset64)。
+
+## 32 条分页与分支刷新
+
+2026-11-26，用正式 Windows Release 和隔离会话实测 banshu，关闭后台预读。从只看 HEAD 开始，依次勾选 main、release/261125、release/261113、release/261016、feature/brave-trial、feature/guild-boss、feature/mist-forest。七次勾选到新图可绘制的耗时依次为 347、360、400、347、347、400、346 毫秒。每次首批 32 条，滚动一次分页后底部显示「已加载 64 条提交」。
+
+连续测试在同一复选框快速切换 2–4 次。重叠请求的间隔主要约 150 毫秒，五组最后一次勾选到新图可绘制耗时 490–727 毫秒。中间请求被覆盖，绘制记录中没有空白帧或过期提交图。单次勾选最大绘制间隔为 16 毫秒，连续测试中有两次分别达到 119 和 146 毫秒。
+
+REFDESK_TIMINGS 保留原有启动计时列。history-filter 另记请求号和已选引用数。history-filter-ready 与 history-filter-superseded 另记请求号、耗时、提交数、绘制次数、最大绘制间隔、缺页帧数及绘制的过期结果数。计时终点是应用生成可绘制数据。

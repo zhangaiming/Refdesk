@@ -350,10 +350,12 @@ mod tests {
     #[test]
     fn history_pages_continue_past_3000_and_restore_evicted_graph_rows() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        make_history(repo.path())?;
+        make_history(repo.path()).context("create paging fixture")?;
         let cache = HistoryCache::open(repo.path(), &HistoryScope::Head, true)?;
         let canceled = AtomicBool::new(false);
-        let first = cache.load_through(1, &canceled)?;
+        let first = cache
+            .load_through(1, &canceled)
+            .context("load first page")?;
         assert_eq!(first.loaded, PAGE);
         assert_eq!(first.head_row, Some(0));
         assert!(first.has_more);
@@ -375,7 +377,9 @@ mod tests {
         assert!(cache.load_through(2, &canceled).is_err());
         assert_eq!(cache.progress.lock().unwrap().summary.loaded, PAGE);
         std::fs::remove_dir(cache.dir.path().join("1"))?;
-        let second = cache.load_through(2, &canceled)?;
+        let second = cache
+            .load_through(2, &canceled)
+            .context("retry second page")?;
         pages = cache.window(0..3, second, pages)?;
         assert!(
             pages[&1][0]
@@ -396,7 +400,9 @@ mod tests {
         let mut summary = second;
         while summary.has_more {
             let page = summary.page_count();
-            summary = cache.load_through(page + 1, &canceled)?;
+            summary = cache
+                .load_through(page + 1, &canceled)
+                .with_context(|| format!("load page {}", page + 1))?;
             pages = cache.window(page.saturating_sub(1)..page + 2, summary, pages)?;
             assert!(pages.len() <= 3);
         }

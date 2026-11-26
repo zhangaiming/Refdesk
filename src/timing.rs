@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) struct Timings {
     file: File,
@@ -9,6 +9,18 @@ pub(crate) struct Timings {
     activation: Instant,
     graph: bool,
     status: bool,
+    scope: Option<ScopeTiming>,
+    drawn_history: Option<u64>,
+}
+
+struct ScopeTiming {
+    request: u64,
+    started: Instant,
+    last_frame: Instant,
+    max_gap: Duration,
+    frames: u32,
+    missing_frames: u32,
+    intermediate_graphs: u32,
 }
 
 impl Timings {
@@ -25,6 +37,8 @@ impl Timings {
             activation: started,
             graph: false,
             status: false,
+            scope: None,
+            drawn_history: None,
         })
     }
 
@@ -32,6 +46,8 @@ impl Timings {
         self.activation = Instant::now();
         self.graph = false;
         self.status = false;
+        self.scope = None;
+        self.drawn_history = None;
         self.write("activate", path);
     }
 
@@ -46,14 +62,85 @@ impl Timings {
         }
     }
 
+    pub fn change_history_scope(&mut self, path: &Path, request: u64, checked_refs: Option<usize>) {
+        if let Some(pending) = self.scope.take() {
+            self.finish_scope("history-filter-superseded", path, pending, 0);
+        }
+        let Some(checked_refs) = checked_refs else {
+            return;
+        };
+        let started = Instant::now();
+        self.scope = Some(ScopeTiming {
+            request,
+            started,
+            last_frame: started,
+            max_gap: Duration::ZERO,
+            frames: 0,
+            missing_frames: 0,
+            intermediate_graphs: 0,
+        });
+        self.write_fields(
+            "history-filter",
+            path,
+            &format!("\t{request}\t{checked_refs}"),
+        );
+    }
+
+    pub fn history_frame(
+        &mut self,
+        path: &Path,
+        generation: Option<u64>,
+        rows: usize,
+        missing: bool,
+    ) {
+        let previous = std::mem::replace(&mut self.drawn_history, generation);
+        let Some(pending) = &mut self.scope else {
+            return;
+        };
+        let now = Instant::now();
+        pending.max_gap = pending.max_gap.max(now.duration_since(pending.last_frame));
+        pending.last_frame = now;
+        pending.frames += 1;
+        pending.missing_frames += u32::from(generation.is_none() || missing);
+        if generation == Some(pending.request) && !missing {
+            let pending = self.scope.take().expect("pending history filter");
+            self.finish_scope("history-filter-ready", path, pending, rows);
+        } else if generation.is_some()
+            && generation != previous
+            && generation != Some(pending.request)
+        {
+            pending.intermediate_graphs += 1;
+        }
+    }
+
+    fn finish_scope(&mut self, event: &str, path: &Path, timing: ScopeTiming, rows: usize) {
+        self.write_fields(
+            event,
+            path,
+            &format!(
+                "\t{}\t{}\t{rows}\t{}\t{}\t{}\t{}",
+                timing.request,
+                timing.started.elapsed().as_millis(),
+                timing.frames,
+                timing.max_gap.as_millis(),
+                timing.missing_frames,
+                timing.intermediate_graphs
+            ),
+        );
+    }
+
     fn write(&mut self, event: &str, path: &Path) {
+        self.write_fields(event, path, "");
+    }
+
+    fn write_fields(&mut self, event: &str, path: &Path, fields: &str) {
         let unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let _ = writeln!(
             self.file,
-            "{event}\t{unix_ms}\t{}\t{}\t{}",
+            "{event}\t{unix_ms}\t{}\t{}\t{}{fields}",
             self.started.elapsed().as_millis(),
             self.activation.elapsed().as_millis(),
             path.display(),

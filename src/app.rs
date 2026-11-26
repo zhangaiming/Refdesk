@@ -536,7 +536,7 @@ impl Desk {
     }
 
     pub fn request_history(&mut self, ctx: &egui::Context, path: &Path) {
-        self.queue_history(ctx, path, false);
+        self.queue_history(ctx, path, false, None);
     }
 
     fn deactivate_history(&mut self, path: &Path) {
@@ -553,13 +553,22 @@ impl Desk {
         }
     }
 
-    fn queue_history(&mut self, ctx: &egui::Context, path: &Path, check_superproject: bool) {
+    fn queue_history(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        check_superproject: bool,
+        checked_refs: Option<usize>,
+    ) {
         let active = self.active.as_deref() == Some(path);
         if active {
             self.cancel_history_search();
             self.search_row = None;
         }
         let request = self.next();
+        if active && let Some(timings) = &mut self.timings {
+            timings.change_history_scope(path, request, checked_refs);
+        }
         let state = self
             .repos
             .entry(path.to_owned())
@@ -656,11 +665,16 @@ impl Desk {
             return;
         }
         state.filter = filter.clone();
+        let checked_refs = match &filter {
+            HistoryScope::Head => 1,
+            HistoryScope::All => 0,
+            HistoryScope::Selected(refs) => refs.len(),
+        };
         self.settings.branch_selection.insert(path.clone(), filter);
         state.history_viewport = 0..2;
         self.graph_reset += 1;
         self.search_row = None;
-        self.request_history(ctx, &path);
+        self.queue_history(ctx, &path, false, Some(checked_refs));
         self.save();
     }
 
@@ -1222,6 +1236,12 @@ impl Desk {
         }
     }
 
+    pub fn report_history_frame(&mut self, generation: Option<u64>, rows: usize, missing: bool) {
+        if let (Some(timings), Some(path)) = (&mut self.timings, &self.active) {
+            timings.history_frame(path, generation, rows, missing);
+        }
+    }
+
     pub fn prefetch(&mut self, ctx: &egui::Context) {
         if !self.settings.prefetch_history
             || !self
@@ -1247,7 +1267,7 @@ impl Desk {
                 .repositories
                 .iter()
                 .any(|parent| is_descendant(&path, parent));
-            self.queue_history(ctx, &path, nested);
+            self.queue_history(ctx, &path, nested, None);
         }
     }
 

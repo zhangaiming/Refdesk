@@ -142,6 +142,7 @@ impl Desk {
         let baseline_offset = centered_baseline(ui.painter(), FontId::proportional(SUBJECT_SIZE));
         let rows = summary.loaded;
         let mut click = None;
+        let mut missing_rows = false;
         let scroll = ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut scroll = egui::ScrollArea::vertical()
@@ -220,6 +221,7 @@ impl Desk {
                     }
                     let Some((cached, history)) = cached.zip(history) else {
                         if !missing_label && rect.intersects(ui.clip_rect()) {
+                            missing_rows = true;
                             let label = if state.history_error.is_some() && !state.history_busy {
                                 "历史页不可用"
                             } else {
@@ -352,7 +354,7 @@ impl Desk {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if query.is_empty() {
-                    format!("{rows} 条提交")
+                    format!("已加载 {rows} 条提交")
                 } else {
                     match self.history_search_result() {
                         Some(Ok(count)) => format!("{count} / {rows} 条匹配"),
@@ -377,6 +379,11 @@ impl Desk {
                 }
             });
         });
+        self.report_history_frame(
+            history.map(|history| history.generation),
+            rows,
+            missing_rows,
+        );
         self.scroll_to = None;
         self.request_history_window(ctx, pages, remaining <= HISTORY_PREFETCH_DISTANCE);
         match click {
