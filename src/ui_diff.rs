@@ -1,6 +1,6 @@
 use crate::app::Desk;
 use crate::diff::{Content, Kind, is_workbook};
-use crate::ui::{ACCENT, BORDER, FAINT, GREEN, INK, MUTE, RED, SHADE, paint, small_button};
+use crate::ui::{BORDER, FAINT, GREEN, INK, MUTE, RED, SHADE, paint, small_button};
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
 impl Desk {
@@ -13,7 +13,10 @@ impl Desk {
         let mut invoke = false;
         let mut toggle = false;
         let mut save = false;
-        let workbook = path.as_deref().is_some_and(is_workbook);
+        let workbook = self
+            .file
+            .as_ref()
+            .is_some_and(|file| !file.is_gitlink() && is_workbook(&file.path));
         ui.horizontal(|ui| {
             ui.label(RichText::new("差异").size(17.0).strong().color(INK));
             if let Some(path) = &path {
@@ -34,7 +37,7 @@ impl Desk {
                         .on_hover_text(&tool.command)
                         .clicked();
                 }
-                if workbook && let Some(Content::Sheet { .. }) = self.content {
+                if workbook && let Some(Content::Sheet(_)) = self.content {
                     toggle = small_button(ui, "比较原始文件").clicked();
                 } else if workbook && self.force_text {
                     toggle = small_button(ui, "单元格对比").clicked();
@@ -55,6 +58,7 @@ impl Desk {
         }
         if toggle {
             self.force_text = !self.force_text;
+            self.sheet_view = crate::ui_workbook::SheetView::default();
             self.request_diff(ctx);
         }
 
@@ -148,106 +152,14 @@ impl Desk {
                             });
                     });
                 }
-                Content::Sheet { cells, total } => {
-                    let sheets = cells
-                        .iter()
-                        .map(|change| change.sheet.as_str())
-                        .collect::<std::collections::BTreeSet<_>>();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} 处变化", total))
-                                .color(ACCENT)
-                                .small(),
-                        );
-                        if *total > cells.len() {
-                            ui.label(
-                                RichText::new(format!("显示前 {} 处", cells.len()))
-                                    .color(MUTE)
-                                    .small(),
-                            );
-                        }
-                        ui.label(RichText::new("值 / 公式").color(MUTE).small());
-                        ui.separator();
-                        egui::ComboBox::from_id_salt("sheet-filter")
-                            .width(145.0)
-                            .selected_text(if self.sheet_filter.is_empty() {
-                                "全部工作表"
-                            } else {
-                                &self.sheet_filter
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.sheet_filter,
-                                    String::new(),
-                                    "全部工作表",
-                                );
-                                for name in sheets {
-                                    ui.selectable_value(&mut self.sheet_filter, name.into(), name);
-                                }
-                            });
-                    });
-                    diff_header(
+                Content::Sheet(workbook) => {
+                    full_line = self.sheet_view.show(
                         ui,
-                        &format!("旧值 · {}", pair.left.title()),
-                        &format!("新值 · {}", pair.right.title()),
+                        workbook,
+                        self.diff_reset,
+                        pair.left.title(),
+                        pair.right.title(),
                     );
-                    let filtered = cells
-                        .iter()
-                        .filter(|change| {
-                            self.sheet_filter.is_empty() || change.sheet == self.sheet_filter
-                        })
-                        .collect::<Vec<_>>();
-                    if filtered.is_empty() {
-                        ui.label(RichText::new("没有单元格内容变更").small().color(MUTE));
-                    }
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        egui::ScrollArea::vertical()
-                            .id_salt(("sheet-diff", self.diff_reset))
-                            .auto_shrink([false, false])
-                            .show_rows(ui, 23.0, filtered.len(), |ui, visible| {
-                                for index in visible {
-                                    let item = filtered[index];
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        Vec2::new(ui.available_width(), 23.0),
-                                        Sense::click(),
-                                    );
-                                    let (left, right) = halves(rect);
-                                    let gutter_width = left.width().min(320.0) * 0.57;
-                                    let location = Rect::from_min_max(
-                                        left.min,
-                                        pos2(left.left() + gutter_width, left.bottom()),
-                                    );
-                                    ui.painter().rect_filled(location, 0.0, SHADE);
-                                    paint(
-                                        ui,
-                                        location,
-                                        location.left() + 8.0,
-                                        &format!("{} · {}", item.sheet, item.address),
-                                        FontId::proportional(12.0),
-                                        MUTE,
-                                    );
-                                    let data = Rect::from_min_max(
-                                        pos2(location.right(), left.top()),
-                                        left.max,
-                                    );
-                                    cell(ui, data, &item.left, item.kind != Kind::Add, RED);
-                                    cell(ui, right, &item.right, item.kind != Kind::Remove, GREEN);
-                                    ui.painter().vline(
-                                        right.left(),
-                                        rect.y_range(),
-                                        Stroke::new(1.0_f32, BORDER),
-                                    );
-                                    if response.clicked() {
-                                        full_line = Some(format!(
-                                            "{} · {}\n旧：{}\n新：{}",
-                                            item.sheet, item.address, item.left, item.right
-                                        ));
-                                    }
-                                    response.on_hover_text("单击查看完整单元格内容");
-                                }
-                            });
-                    });
                 }
                 Content::Binary { left, right } => {
                     ui.label(
@@ -276,7 +188,7 @@ fn halves(rect: Rect) -> (Rect, Rect) {
     )
 }
 
-fn diff_header(ui: &mut egui::Ui, left: &str, right: &str) {
+pub(crate) fn diff_header(ui: &mut egui::Ui, left: &str, right: &str) {
     ui.add_space(3.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 25.0), Sense::hover());
     ui.painter().rect_filled(rect, 3.0, SHADE);
@@ -327,21 +239,6 @@ fn code(ui: &egui::Ui, rect: Rect, value: Option<&(usize, String)>, color: Optio
         rect.left() + 54.0,
         text,
         FontId::monospace(12.0),
-        INK,
-    );
-}
-
-fn cell(ui: &egui::Ui, rect: Rect, text: &str, changed: bool, color: Color32) {
-    if changed {
-        ui.painter()
-            .rect_filled(rect, 0.0, color.gamma_multiply(0.13));
-    }
-    paint(
-        ui,
-        rect,
-        rect.left() + 10.0,
-        text,
-        FontId::proportional(13.0),
         INK,
     );
 }

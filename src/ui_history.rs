@@ -1,5 +1,5 @@
 use crate::app::{Desk, Selection};
-use crate::git::{Commit, History, HistoryScope, Reference};
+use crate::git::{Commit, History, HistoryPage, HistoryScope, Reference};
 use crate::graph::{GraphRow, Span};
 use crate::ui::{
     ACCENT, BASE, CONTROL_HEIGHT, DETAIL_SIZE, DIVIDER, FAINT, HOVER, INK, MUTE, ROW, SELECTION,
@@ -33,7 +33,7 @@ impl Desk {
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
         let history = self.state().and_then(|state| state.history.as_ref());
         let count = history.map_or(0, |history| history.commits.len());
-        let working = self.state().map(|state| state.changes.len());
+        let working = self.state().map(|state| state.changes().len());
         let scope = self
             .state()
             .map(|state| &state.filter)
@@ -165,11 +165,10 @@ impl Desk {
         let graph_width = graph_width(width, state.graph.lanes);
         table_header(ui, width, graph_width);
         let baseline_offset = centered_baseline(ui.painter(), FontId::proportional(SUBJECT_SIZE));
-        let has_more = state
+        let page = state
             .history
             .as_ref()
-            .is_some_and(|history| history.has_more);
-        let limited = state.limit >= 3000;
+            .map_or(HistoryPage::Complete, History::page);
         let rows = state
             .history
             .as_ref()
@@ -215,7 +214,7 @@ impl Desk {
                             INK,
                         );
                         paint_baseline(ui.painter(), columns.subject.left(), baseline, label, INK);
-                        let summary = if state.status_busy && !state.has_status {
+                        let summary = if state.status_busy && state.status.is_none() {
                             "读取状态…".into()
                         } else if let Some(0) = working {
                             "工作树干净".into()
@@ -360,10 +359,14 @@ impl Desk {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if has_more && !limited {
-                    more = small_button(ui, "加载更多").clicked();
-                } else if limited {
-                    ui.label(RichText::new("已显示最近 3,000 条").small().color(MUTE));
+                match page {
+                    HistoryPage::Truncated => {
+                        ui.label(RichText::new("已达显示上限").small().color(MUTE));
+                    }
+                    HistoryPage::More if !busy => {
+                        more = small_button(ui, "加载更多").clicked();
+                    }
+                    _ => {}
                 }
                 if let Selection::Commit { left: Some(_), .. } = self.selection {
                     ui.label(RichText::new("两提交比较").small().color(ACCENT));

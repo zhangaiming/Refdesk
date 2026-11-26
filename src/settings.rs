@@ -275,8 +275,8 @@ pub struct Launch {
 pub fn prepare_external(root: &Path, pair: &git::Compare, tool: &Tool) -> Result<Launch> {
     ensure!(tool.mode != ToolMode::BuiltIn, "此规则选择内置工具");
     let dir = tempfile::Builder::new().prefix("refdesk-diff-").tempdir()?;
-    let old = git::snapshot(root, &pair.left, &pair.left_path, false)?;
-    let new = git::snapshot(root, &pair.right, &pair.right_path, false)?;
+    let old = git::diff_snapshot(root, &pair.left, &pair.left_path, pair.left_gitlink)?;
+    let new = git::diff_snapshot(root, &pair.right, &pair.right_path, pair.right_gitlink)?;
     let tokens = tokenize(&tool.arguments)?;
     let needs_base = tokens.iter().any(|arg| arg.contains("${base"));
     let left_file = snapshot_path(dir.path(), "left", &pair.left_path);
@@ -319,7 +319,7 @@ pub fn prepare_external(root: &Path, pair: &git::Compare, tool: &Tool) -> Result
         vars.insert("smartGitDir", dir.to_string_lossy().into_owned());
     }
     if needs_base {
-        let old = git::snapshot(root, &pair.base, &pair.left_path, true)?;
+        let old = git::base_snapshot(root, pair)?;
         let path = snapshot_path(dir.path(), "base", &pair.left_path);
         fs::write(&path, &old)?;
         vars.insert("baseFile", path.to_string_lossy().into_owned());

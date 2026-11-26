@@ -1,9 +1,11 @@
 use crate::diff::{self, Content};
 use crate::git::{
-    self, Change, Commit, Compare, Details, History, HistoryScope, Operation, Submodule,
+    self, Change, Commit, Compare, Details, History, HistoryPage, HistoryScope, Operation, Status,
+    Submodule,
 };
 use crate::graph::Graph;
 use crate::settings::{self, Settings, Tool};
+use crate::tasks::{ReadKind, Scheduler};
 use crate::timing::{FrameCapture, Timings};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -13,14 +15,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-type Task = Box<dyn FnOnce() + Send>;
 type Outcome<T> = std::result::Result<T, String>;
 type HistoryPayload = Option<(History, Graph)>;
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(25);
+
+enum Work<'a> {
+    Read,
+    Latest(ReadKind, &'a Path),
+    Write,
+}
 
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
     History(PathBuf, u64, Outcome<HistoryPayload>),
-    Status(PathBuf, u64, Outcome<Vec<Change>>, Outcome<Vec<Submodule>>),
+    Status(PathBuf, u64, Outcome<Status>, Outcome<Vec<Submodule>>),
     Details(u64, Outcome<Details>),
     Diff(u64, Outcome<Content>),
     Operation(PathBuf, Option<String>, Outcome<String>),
@@ -31,9 +39,8 @@ enum Event {
 pub(crate) struct Repository {
     pub history: Option<History>,
     pub graph: Graph,
-    pub changes: Vec<Change>,
+    pub status: Option<Status>,
     submodules: Option<Vec<Submodule>>,
-    pub has_status: bool,
     pub history_busy: bool,
     pub status_busy: bool,
     pub status_error: Option<String>,
@@ -45,6 +52,21 @@ pub(crate) struct Repository {
     draft: String,
     status_request: u64,
     status_checked: Option<Instant>,
+    refresh_on_focus: bool,
+}
+
+impl Repository {
+    pub fn changes(&self) -> &[Change] {
+        self.status.as_ref().map_or(&[], |status| &status.files)
+    }
+
+    fn focus_refresh_delay(&self, now: Instant) -> Option<Duration> {
+        (self.refresh_on_focus && !self.status_busy).then(|| {
+            self.status_checked.map_or(Duration::ZERO, |checked| {
+                STATUS_REFRESH_INTERVAL.saturating_sub(now.saturating_duration_since(checked))
+            })
+        })
+    }
 }
 
 pub(crate) struct RepositoryRow {
@@ -100,7 +122,7 @@ pub(crate) struct Desk {
     pub status_message: String,
     pub status_is_error: bool,
     pub operations: HashSet<PathBuf>,
-    pub sheet_filter: String,
+    pub sheet_view: crate::ui_workbook::SheetView,
     pub force_text: bool,
     pub show_full_line: Option<String>,
     pub diff_reset: u64,
@@ -113,7 +135,7 @@ pub(crate) struct Desk {
     external_dirs: Vec<TempDir>,
     timings: Option<Timings>,
     frame_capture: Option<FrameCapture>,
-    tasks: Sender<Task>,
+    tasks: Scheduler,
     events: Sender<Event>,
     inbox: Receiver<Event>,
 }
@@ -130,25 +152,21 @@ impl Desk {
         started: Instant,
     ) -> Self {
         let ctx = &creation.egui_ctx;
-        let (tasks, work) = unbounded::<Task>();
         let (events, inbox) = unbounded();
-        for index in 0..4 {
-            let work = work.clone();
-            std::thread::Builder::new()
-                .name(format!("refdesk-git-{index}"))
-                .spawn(move || {
-                    while let Ok(job) = work.recv() {
-                        job();
-                    }
-                })
-                .expect("worker thread");
-        }
-
-        let (mut settings, warning, writes_enabled) = match Settings::load() {
+        let (mut settings, mut warning, writes_enabled) = match Settings::load() {
             Ok(settings) => (settings, None, true),
             Err(error) => (Settings::default(), Some(error.to_string()), false),
         };
+        normalize_repositories(&mut settings);
         for path in paths {
+            let path = match git::root(&path) {
+                Ok(root) => root,
+                Err(error) => {
+                    warning
+                        .get_or_insert_with(|| format!("无法打开 {}：{error:#}", path.display()));
+                    continue;
+                }
+            };
             if !settings
                 .repositories
                 .iter()
@@ -214,7 +232,7 @@ impl Desk {
             status_is_error,
             writes_enabled,
             operations: HashSet::new(),
-            sheet_filter: String::new(),
+            sheet_view: crate::ui_workbook::SheetView::default(),
             force_text: false,
             show_full_line: None,
             diff_reset: 0,
@@ -226,7 +244,7 @@ impl Desk {
             external_dirs: Vec::new(),
             timings: Timings::open(started),
             frame_capture: FrameCapture::from_environment(),
-            tasks,
+            tasks: Scheduler::new(),
             events,
             inbox,
         };
@@ -241,13 +259,23 @@ impl Desk {
         self.requests
     }
 
-    fn submit(&self, ctx: &egui::Context, task: impl FnOnce() -> Event + Send + 'static) {
+    fn submit(
+        &self,
+        ctx: &egui::Context,
+        work: Work<'_>,
+        task: impl FnOnce() -> Event + Send + 'static,
+    ) {
         let events = self.events.clone();
         let ctx = ctx.clone();
-        let _ = self.tasks.send(Box::new(move || {
+        let task = Box::new(move || {
             let _ = events.send(task());
             ctx.request_repaint();
-        }));
+        });
+        match work {
+            Work::Read => self.tasks.read(task),
+            Work::Latest(kind, path) => self.tasks.latest(kind, path, task),
+            Work::Write => self.tasks.write(task),
+        }
     }
 
     pub fn tell(&mut self, message: impl Into<String>, error: bool) {
@@ -357,7 +385,7 @@ impl Desk {
     }
 
     pub fn choose_repository(&self, ctx: &egui::Context) {
-        self.submit(ctx, || {
+        self.submit(ctx, Work::Read, || {
             Event::Added(
                 readable((|| {
                     let Some(path) = rfd::FileDialog::new()
@@ -377,7 +405,7 @@ impl Desk {
         let Some(root) = self.active.clone() else {
             return;
         };
-        self.submit(ctx, move || {
+        self.submit(ctx, Work::Read, move || {
             Event::Added(readable(git::worktrees(&root)), false)
         });
     }
@@ -395,6 +423,11 @@ impl Desk {
         if self.active.as_ref() == Some(&path) {
             return;
         }
+        if let Some(previous) = &self.active {
+            self.tasks.cancel(previous, Some(ReadKind::Details));
+            self.tasks.cancel(previous, Some(ReadKind::Diff));
+        }
+        self.tasks.set_active(Some(path.clone()));
         if let Some(previous) = self
             .active
             .as_ref()
@@ -444,11 +477,17 @@ impl Desk {
             return;
         }
         self.settings.repositories.retain(|entry| entry != path);
+        self.tasks.cancel(path, None);
         self.repos.remove(path);
         self.settings.branch_selection.remove(path);
         if self.active.as_ref().is_some_and(|active| {
             active == path || !self.repository_rows().iter().any(|row| &row.path == active)
         }) {
+            self.tasks.set_active(None);
+            if let Some(active) = &self.active {
+                self.tasks.cancel(active, Some(ReadKind::Details));
+                self.tasks.cancel(active, Some(ReadKind::Diff));
+            }
             self.active = None;
             self.restore_active = None;
             self.settings.active = None;
@@ -491,7 +530,7 @@ impl Desk {
         let root = path.to_owned();
         let filter = state.filter.clone();
         let limit = state.limit;
-        self.submit(ctx, move || {
+        self.submit(ctx, Work::Latest(ReadKind::History, path), move || {
             let result = readable((|| {
                 if check_superproject && git::has_superproject(&root)? {
                     return Ok(None);
@@ -504,7 +543,7 @@ impl Desk {
         });
     }
 
-    pub fn request_status(&mut self, ctx: &egui::Context, path: &Path, force: bool) {
+    fn request_status(&mut self, ctx: &egui::Context, path: &Path, force: bool) {
         let request = self.next();
         let state = self.repos.entry(path.to_owned()).or_default();
         if state.status_busy && !force {
@@ -513,15 +552,16 @@ impl Desk {
         if !force
             && state
                 .status_checked
-                .is_some_and(|checked| checked.elapsed() < Duration::from_secs(25))
+                .is_some_and(|checked| checked.elapsed() < STATUS_REFRESH_INTERVAL)
         {
             return;
         }
         state.status_request = request;
         state.status_busy = true;
         state.status_error = None;
+        state.refresh_on_focus = false;
         let root = path.to_owned();
-        self.submit(ctx, move || {
+        self.submit(ctx, Work::Latest(ReadKind::Status, path), move || {
             let result = readable(git::status(&root));
             let submodules = readable(git::submodules(&root));
             Event::Status(root, request, result, submodules)
@@ -557,14 +597,22 @@ impl Desk {
             return;
         };
         let state = self.repos.entry(path.clone()).or_default();
-        if state.history_busy {
+        if state.history_busy
+            || state
+                .history
+                .as_ref()
+                .is_none_or(|history| history.page() != HistoryPage::More)
+        {
             return;
         }
-        state.limit = (state.limit + git::PAGE).min(3000);
+        state.limit = (state.limit + git::PAGE).min(git::MAX_HISTORY);
         self.request_history(ctx, &path);
     }
 
     pub fn choose_worktree(&mut self) {
+        if let Some(active) = &self.active {
+            self.tasks.cancel(active, Some(ReadKind::Details));
+        }
         self.selection = Selection::Worktree;
         self.details_request = self.next();
         self.details_busy = false;
@@ -606,7 +654,8 @@ impl Desk {
         self.details_error = None;
         self.details_busy = true;
         self.clear_diff();
-        self.submit(ctx, move || {
+        let path = root.clone();
+        self.submit(ctx, Work::Latest(ReadKind::Details, &path), move || {
             Event::Details(
                 request,
                 readable(git::details(&root, &right, left.as_ref())),
@@ -616,14 +665,14 @@ impl Desk {
 
     pub fn choose_file(&mut self, ctx: &egui::Context, file: Change) {
         self.force_text = false;
-        let has_head = self
+        let head = self
             .state()
-            .and_then(|state| state.history.as_ref())
-            .is_some_and(|history| history.head.is_some());
-        let pair = git::compare(&file, self.details.as_ref(), has_head);
+            .and_then(|state| state.status.as_ref())
+            .and_then(|status| status.head.as_deref());
+        let pair = git::compare(&file, self.details.as_ref(), head);
         self.file = Some(file);
         self.comparison = Some(pair);
-        self.sheet_filter.clear();
+        self.sheet_view = crate::ui_workbook::SheetView::default();
         self.request_diff(ctx);
     }
 
@@ -638,12 +687,16 @@ impl Desk {
         self.diff_busy = true;
         self.diff_reset = request;
         let force_text = self.force_text;
-        self.submit(ctx, move || {
+        let path = root.clone();
+        self.submit(ctx, Work::Latest(ReadKind::Diff, &path), move || {
             Event::Diff(request, readable(diff::compare(&root, &pair, force_text)))
         });
     }
 
     pub fn clear_diff(&mut self) {
+        if let Some(active) = &self.active {
+            self.tasks.cancel(active, Some(ReadKind::Diff));
+        }
         self.diff_request = self.next();
         self.file = None;
         self.comparison = None;
@@ -661,7 +714,7 @@ impl Desk {
             _ => None,
         };
         self.tell("正在运行 Git…", false);
-        self.submit(ctx, move || {
+        self.submit(ctx, Work::Write, move || {
             let result = readable(operation.execute(&root));
             Event::Operation(root, committed_message, result)
         });
@@ -672,7 +725,7 @@ impl Desk {
             return;
         };
         self.tell(format!("正在准备 {} 的两个版本…", tool.name), false);
-        self.submit(ctx, move || {
+        self.submit(ctx, Work::Read, move || {
             Event::External(readable((|| {
                 let launch = settings::prepare_external(&root, &pair, &tool)?;
                 for invocation in &launch.commands {
@@ -762,10 +815,7 @@ impl Desk {
                     state.status_busy = false;
                     state.status_checked = Some(Instant::now());
                     match result {
-                        Ok(files) => {
-                            state.changes = files;
-                            state.has_status = true;
-                        }
+                        Ok(status) => state.status = Some(status),
                         Err(error) => state.status_error = Some(error),
                     }
                     let updated = match submodules {
@@ -903,7 +953,7 @@ impl Desk {
     pub fn report_frame(&mut self, ctx: &egui::Context) {
         let capture_ready = self
             .state()
-            .is_some_and(|repo| repo.history.is_some() && repo.has_status);
+            .is_some_and(|repo| repo.history.is_some() && repo.status.is_some());
         if capture_ready && let Some(capture) = &mut self.frame_capture {
             if capture.save(ctx) {
                 self.frame_capture = None;
@@ -918,7 +968,7 @@ impl Desk {
             timings.presented(
                 path,
                 repo.history.is_some(),
-                repo.has_status && !repo.status_busy,
+                repo.status.is_some() && !repo.status_busy,
             );
         }
     }
@@ -965,14 +1015,66 @@ impl Desk {
 
     pub fn background_status(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
-        if focused
-            && !self.focused
-            && let Some(path) = self.active.clone()
-        {
-            self.request_status(ctx, &path, false);
-        }
+        let refocused = focused && !self.focused;
         self.focused = focused;
+        if !focused {
+            return;
+        }
+        let Some(path) = self.active.clone() else {
+            return;
+        };
+        if let Some(state) = self.repos.get_mut(&path) {
+            state.refresh_on_focus |= refocused;
+            if let Some(delay) = state.focus_refresh_delay(Instant::now()) {
+                if delay.is_zero() {
+                    self.request_status(ctx, &path, true);
+                } else {
+                    ctx.request_repaint_after(delay);
+                }
+            }
+        }
     }
+}
+
+fn normalize_repositories(settings: &mut Settings) {
+    for entry in std::mem::take(&mut settings.repositories) {
+        let absolute = std::path::absolute(&entry).unwrap_or_else(|_| entry.clone());
+        let was_active = settings
+            .active
+            .as_ref()
+            .is_some_and(|path| same_path(path, &entry) || same_path(path, &absolute));
+        let root = if absolute.is_dir()
+            && !absolute.join(".git").exists()
+            && let Ok(root) = git::root(&absolute)
+            && !git::submodules(&root).is_ok_and(|modules| {
+                modules
+                    .iter()
+                    .any(|module| same_path(&module.path, &absolute))
+            }) {
+            root
+        } else {
+            absolute
+        };
+        let registered = settings
+            .repositories
+            .iter()
+            .find(|path| same_path(path, &root))
+            .cloned()
+            .unwrap_or_else(|| {
+                settings.repositories.push(root.clone());
+                root
+            });
+        if was_active {
+            settings.active = Some(registered.clone());
+        }
+        if let Some(scope) = settings.branch_selection.remove(&entry) {
+            settings.branch_selection.entry(registered).or_insert(scope);
+        }
+    }
+    settings.active = settings
+        .active
+        .take()
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
 }
 
 fn is_descendant(path: &Path, parent: &Path) -> bool {
@@ -988,5 +1090,34 @@ fn same_path(left: &Path, right: &Path) -> bool {
             .eq_ignore_ascii_case(&right.to_string_lossy().replace('\\', "/"))
     } else {
         left == right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refocus_refresh_waits_until_the_throttle_expires() {
+        let now = Instant::now();
+        let mut repository = Repository {
+            status_checked: Some(now),
+            refresh_on_focus: true,
+            ..Repository::default()
+        };
+        assert_eq!(
+            repository.focus_refresh_delay(now),
+            Some(STATUS_REFRESH_INTERVAL)
+        );
+        let deadline = now + STATUS_REFRESH_INTERVAL;
+        assert_eq!(
+            repository.focus_refresh_delay(deadline),
+            Some(Duration::ZERO)
+        );
+        repository.status_busy = true;
+        assert_eq!(repository.focus_refresh_delay(deadline), None);
+        repository.status_busy = false;
+        repository.refresh_on_focus = false;
+        assert_eq!(repository.focus_refresh_delay(deadline), None);
     }
 }

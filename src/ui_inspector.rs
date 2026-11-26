@@ -20,7 +20,7 @@ impl Desk {
             .is_some_and(|root| self.operations.contains(root));
         let staged = self.state().map_or(0, |state| {
             state
-                .changes
+                .changes()
                 .iter()
                 .filter(|file| file.area == Area::Staged)
                 .count()
@@ -133,7 +133,7 @@ impl Desk {
         let worktree = matches!(self.selection, Selection::Worktree);
         let state = self.state();
         let count = if worktree {
-            state.map_or(0, |state| state.changes.len())
+            state.map_or(0, |state| state.changes().len())
         } else {
             self.details
                 .as_ref()
@@ -167,9 +167,7 @@ impl Desk {
             );
         }
         let files = if worktree {
-            state
-                .map(|state| state.changes.as_slice())
-                .unwrap_or_default()
+            state.map(|state| state.changes()).unwrap_or_default()
         } else {
             self.details
                 .as_ref()
@@ -246,11 +244,16 @@ impl Desk {
                             .file_name()
                             .and_then(|name| name.to_str())
                             .unwrap_or(&file.path);
+                        let label = if file.is_gitlink() {
+                            format!("{short} · Gitlink")
+                        } else {
+                            short.to_owned()
+                        };
                         paint(
                             ui,
                             rect,
                             rect.left() + 24.0,
-                            short,
+                            &label,
                             FontId::proportional(13.0),
                             INK,
                         );
@@ -304,16 +307,10 @@ impl Desk {
                 self.external(ctx, tool);
             }
         }
-        if let (Some(file), Some(root)) = (staging, self.active.clone()) {
-            self.operate(
-                ctx,
-                root,
-                if file.area == Area::Staged {
-                    Operation::Unstage(file.path)
-                } else {
-                    Operation::Stage(file.path)
-                },
-            );
+        if let (Some(file), Some(root)) = (staging, self.active.clone())
+            && let Some(operation) = file.index_operation()
+        {
+            self.operate(ctx, root, operation);
         }
     }
 }

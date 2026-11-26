@@ -8,6 +8,7 @@ mod diff;
 mod git;
 mod graph;
 mod settings;
+mod tasks;
 mod timing;
 mod ui;
 mod ui_branches;
@@ -15,8 +16,11 @@ mod ui_dialogs;
 mod ui_diff;
 mod ui_history;
 mod ui_inspector;
+mod ui_workbook;
 #[cfg(windows)]
 mod window_chrome;
+#[cfg(windows)]
+mod workbook_worker;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -25,7 +29,14 @@ fn main() -> eframe::Result<()> {
     let started = std::time::Instant::now();
     let mut paths = Vec::new();
     let mut import = false;
-    let mut arguments = std::env::args_os().skip(1);
+    let mut arguments = std::env::args_os().skip(1).peekable();
+    #[cfg(windows)]
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == workbook_worker::ARGUMENT)
+    {
+        std::process::exit(i32::from(workbook_worker::run().is_err()));
+    }
     while let Some(argument) = arguments.next() {
         if argument == "--repo" {
             if let Some(path) = arguments.next() {

@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, ensure};
-use calamine::{Reader, open_workbook_auto_from_rs};
+use calamine::{Data, DataRef, Reader, Sheets, open_workbook_auto_from_rs};
+use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffTag, TextDiff};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::git::{self, Compare};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Kind {
     Equal,
     Add,
@@ -23,13 +24,62 @@ pub struct Line {
     pub kind: Kind,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct CellChange {
-    pub sheet: String,
-    pub address: String,
-    pub left: String,
-    pub right: String,
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum CellValues {
+    Same(String),
+    Added(String),
+    Removed(String),
+    Changed(String, String),
+}
+
+impl CellValues {
+    pub fn sides(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::Same(value) => (Some(value), Some(value)),
+            Self::Added(value) => (None, Some(value)),
+            Self::Removed(value) => (Some(value), None),
+            Self::Changed(old, new) => (Some(old), Some(new)),
+        }
+    }
+
+    pub fn is_changed(&self) -> bool {
+        !matches!(self, Self::Same(_))
+    }
+}
+
+pub type CellPosition = (u32, u32);
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WorksheetDiff {
+    pub name: String,
+    pub rows: u32,
+    pub columns: u32,
     pub kind: Kind,
+    cells: Vec<(CellPosition, CellValues)>,
+    changes: Vec<usize>,
+}
+
+impl WorksheetDiff {
+    pub fn cell(&self, position: CellPosition) -> Option<&CellValues> {
+        self.cells
+            .binary_search_by_key(&position, |(position, _)| *position)
+            .ok()
+            .map(|index| &self.cells[index].1)
+    }
+
+    pub fn change(&self, index: usize) -> Option<CellPosition> {
+        self.changes.get(index).map(|&index| self.cells[index].0)
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.changes.len()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WorkbookDiff {
+    pub sheets: Vec<WorksheetDiff>,
+    pub total: usize,
 }
 
 #[derive(Debug)]
@@ -39,10 +89,7 @@ pub enum Content {
         added: usize,
         removed: usize,
     },
-    Sheet {
-        cells: Vec<CellChange>,
-        total: usize,
-    },
+    Sheet(WorkbookDiff),
     Binary {
         left: usize,
         right: usize,
@@ -63,12 +110,21 @@ pub fn is_workbook(path: &str) -> bool {
 }
 
 pub fn compare(root: &Path, pair: &Compare, force_text: bool) -> Result<Content> {
-    let old = git::snapshot(root, &pair.left, &pair.left_path, false)?;
-    let new = git::snapshot(root, &pair.right, &pair.right_path, false)?;
+    let old = git::diff_snapshot(root, &pair.left, &pair.left_path, pair.left_gitlink)?;
+    let new = git::diff_snapshot(root, &pair.right, &pair.right_path, pair.right_gitlink)?;
     let lfs = |bytes: &[u8]| bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n");
-    if !force_text && is_workbook(&pair.right_path) && !lfs(&old) && !lfs(&new) {
-        let (cells, total) = compare_workbooks(&old, &new)?;
-        return Ok(Content::Sheet { cells, total });
+    if !force_text
+        && !pair.left_gitlink
+        && !pair.right_gitlink
+        && is_workbook(&pair.right_path)
+        && !lfs(&old)
+        && !lfs(&new)
+    {
+        #[cfg(windows)]
+        let workbook = crate::workbook_worker::compare(&old, &new)?;
+        #[cfg(not(windows))]
+        let workbook = compare_workbooks(&old, &new)?;
+        return Ok(Content::Sheet(workbook));
     }
     let (Some(old_text), Some(new_text)) = (decode(&old), decode(&new)) else {
         return Ok(Content::Binary {
@@ -186,9 +242,9 @@ struct Cell {
 }
 
 impl Cell {
-    fn display(&self) -> String {
+    fn into_display(self) -> String {
         if self.formula.is_empty() {
-            return self.value.clone();
+            return self.value;
         }
         if self.value.is_empty() {
             return format!("={}", self.formula);
@@ -197,132 +253,209 @@ impl Cell {
     }
 }
 
-type Workbook = BTreeMap<String, BTreeMap<(u32, u32), Cell>>;
+const MAX_USED_CELLS: usize = 300_000;
+type Worksheet = BTreeMap<(u32, u32), Cell>;
+type Workbook = Vec<(String, Worksheet)>;
 
-fn read_workbook(bytes: &[u8]) -> Result<Workbook> {
-    if bytes.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let mut workbook =
-        open_workbook_auto_from_rs(Cursor::new(bytes)).context("无法读取电子表格")?;
-    let mut sheets = BTreeMap::new();
-    let mut cells_seen = 0;
-    for name in workbook.sheet_names() {
-        let values = workbook
-            .worksheet_range(&name)
-            .with_context(|| format!("无法读取工作表 {name}"))?;
-        let origin = values.start().unwrap_or((0, 0));
-        let mut cells = BTreeMap::new();
-        for (row, col, value) in values.used_cells() {
-            cells.insert(
-                (origin.0 + row as u32, origin.1 + col as u32),
-                Cell {
-                    value: value.to_string(),
-                    typed: format!("{value:?}"),
-                    formula: String::new(),
-                },
-            );
+#[derive(Default)]
+struct SheetCells {
+    cells: Worksheet,
+    used: usize,
+}
+
+impl SheetCells {
+    fn at(&mut self, position: (u32, u32)) -> Result<&mut Cell> {
+        use std::collections::btree_map::Entry;
+        match self.cells.entry(position) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                ensure!(
+                    self.used < MAX_USED_CELLS,
+                    "工作簿超过 300,000 个已用单元格，请使用外部工具"
+                );
+                self.used += 1;
+                Ok(entry.insert(Cell::default()))
+            }
         }
-        if let Ok(formulas) = workbook.worksheet_formula(&name) {
+    }
+
+    fn value(&mut self, position: (u32, u32), value: &Data) -> Result<()> {
+        let cell = self.at(position)?;
+        cell.value = value.to_string();
+        cell.typed = format!("{value:?}");
+        Ok(())
+    }
+
+    fn sparse_values<'a>(
+        &mut self,
+        mut next: impl FnMut() -> Result<Option<calamine::Cell<DataRef<'a>>>>,
+    ) -> Result<()> {
+        while let Some(cell) = next()? {
+            if !matches!(cell.get_value(), DataRef::Empty) {
+                self.value(cell.get_position(), &Data::from(cell.get_value().clone()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sparse_formulas(
+        &mut self,
+        mut next: impl FnMut() -> Result<Option<calamine::Cell<String>>>,
+    ) -> Result<()> {
+        while let Some(cell) = next()? {
+            if !cell.get_value().is_empty() {
+                self.at(cell.get_position())?
+                    .formula
+                    .clone_from(cell.get_value());
+            }
+        }
+        Ok(())
+    }
+
+    fn dense(&mut self, workbook: &mut Sheets<Cursor<&[u8]>>, name: &str) -> Result<()> {
+        let values = workbook.worksheet_range(name)?;
+        let origin = values.start().unwrap_or((0, 0));
+        for (row, col, value) in values.used_cells() {
+            self.value((origin.0 + row as u32, origin.1 + col as u32), value)?;
+        }
+        if let Ok(formulas) = workbook.worksheet_formula(name) {
             let origin = formulas.start().unwrap_or((0, 0));
             for (row, col, formula) in formulas
                 .used_cells()
-                .filter(|(_, _, formula)| !formula.is_empty())
+                .filter(|(_, _, text)| !text.is_empty())
             {
-                cells
-                    .entry((origin.0 + row as u32, origin.1 + col as u32))
-                    .or_insert_with(Cell::default)
+                self.at((origin.0 + row as u32, origin.1 + col as u32))?
                     .formula
                     .clone_from(formula);
             }
         }
-        cells_seen += cells.len();
-        ensure!(
-            cells_seen <= 300_000,
-            "工作簿超过 300,000 个已用单元格，请使用外部工具"
-        );
-        sheets.insert(name, cells);
+        Ok(())
+    }
+}
+
+fn read_workbook(bytes: &[u8]) -> Result<Workbook> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut workbook =
+        open_workbook_auto_from_rs(Cursor::new(bytes)).context("无法读取电子表格")?;
+    let mut sheets = Vec::new();
+    let mut cells_seen = 0;
+    for name in workbook.sheet_names() {
+        let mut sheet = SheetCells {
+            used: cells_seen,
+            ..SheetCells::default()
+        };
+        (|| -> Result<()> {
+            match &mut workbook {
+                Sheets::Xlsx(workbook) => {
+                    let mut reader = workbook.worksheet_cells_reader(&name)?;
+                    sheet.sparse_values(|| Ok(reader.next_cell()?))?;
+                    drop(reader);
+                    let mut reader = workbook.worksheet_cells_reader(&name)?;
+                    sheet.sparse_formulas(|| Ok(reader.next_formula()?))?;
+                }
+                Sheets::Xlsb(workbook) => {
+                    let mut reader = workbook.worksheet_cells_reader(&name)?;
+                    sheet.sparse_values(|| Ok(reader.next_cell()?))?;
+                    drop(reader);
+                    let mut reader = workbook.worksheet_cells_reader(&name)?;
+                    sheet.sparse_formulas(|| Ok(reader.next_formula()?))?;
+                }
+                _ => sheet.dense(&mut workbook, &name)?,
+            }
+            Ok(())
+        })()
+        .with_context(|| format!("无法读取工作表 {name}"))?;
+        cells_seen = sheet.used;
+        sheets.push((name, sheet.cells));
     }
     Ok(sheets)
 }
 
-pub fn compare_workbooks(left: &[u8], right: &[u8]) -> Result<(Vec<CellChange>, usize)> {
+pub(crate) fn compare_workbooks(left: &[u8], right: &[u8]) -> Result<WorkbookDiff> {
     let left = read_workbook(left)?;
     let right = read_workbook(right)?;
-    let mut changes = Vec::new();
-    let mut total = 0;
-    let names = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
-    let empty = BTreeMap::new();
-    for name in names {
-        let before = left.get(name);
-        let after = right.get(name);
-        if before.is_none() || after.is_none() {
-            total += 1;
-            if changes.len() < 5000 {
-                changes.push(CellChange {
-                    sheet: name.clone(),
-                    address: "工作表".into(),
-                    left: if before.is_some() {
-                        name.clone()
-                    } else {
-                        String::new()
-                    },
-                    right: if after.is_some() {
-                        name.clone()
-                    } else {
-                        String::new()
-                    },
-                    kind: if before.is_some() {
-                        Kind::Remove
-                    } else {
-                        Kind::Add
-                    },
-                });
-            }
-        }
-        let before = before.unwrap_or(&empty);
-        let after = after.unwrap_or(&empty);
-        let keys = before.keys().chain(after.keys()).collect::<BTreeSet<_>>();
-        for &(row, col) in keys {
-            let old = before.get(&(row, col));
-            let new = after.get(&(row, col));
-            if old == new {
-                continue;
-            }
-            total += 1;
-            if changes.len() < 5000 {
-                changes.push(CellChange {
-                    sheet: name.clone(),
-                    address: address(row, col),
-                    left: old.map(Cell::display).unwrap_or_default(),
-                    right: new.map(Cell::display).unwrap_or_default(),
-                    kind: if old.is_none() {
-                        Kind::Add
-                    } else if new.is_none() {
-                        Kind::Remove
-                    } else {
-                        Kind::Replace
-                    },
-                });
-            }
-        }
-    }
-    Ok((changes, total))
+    let left_order: Vec<_> = left.iter().map(|(name, _)| name.clone()).collect();
+    let mut left: BTreeMap<_, _> = left.into_iter().collect();
+    let mut sheets: Vec<_> = right
+        .into_iter()
+        .map(|(name, after)| {
+            let before = left.remove(&name);
+            compare_worksheet(name, before, Some(after))
+        })
+        .collect();
+    sheets.extend(left_order.into_iter().filter_map(|name| {
+        let before = left.remove(&name)?;
+        Some(compare_worksheet(name, Some(before), None))
+    }));
+    let total = sheets
+        .iter()
+        .map(|sheet| sheet.change_count() + usize::from(sheet.kind != Kind::Equal))
+        .sum();
+    Ok(WorkbookDiff { sheets, total })
 }
 
-fn address(row: u32, col: u32) -> String {
-    let mut col = col + 1;
+fn compare_worksheet(
+    name: String,
+    before: Option<Worksheet>,
+    after: Option<Worksheet>,
+) -> WorksheetDiff {
+    let kind = match (&before, &after) {
+        (None, _) => Kind::Add,
+        (_, None) => Kind::Remove,
+        _ => Kind::Equal,
+    };
+    let mut left = before.unwrap_or_default().into_iter().peekable();
+    let mut right = after.unwrap_or_default().into_iter().peekable();
+    let mut diff = WorksheetDiff {
+        name,
+        rows: 0,
+        columns: 0,
+        kind,
+        cells: Vec::new(),
+        changes: Vec::new(),
+    };
+    while let Some(position) = left
+        .peek()
+        .map(|(position, _)| *position)
+        .into_iter()
+        .chain(right.peek().map(|(position, _)| *position))
+        .min()
+    {
+        let at_position = |entry: &(CellPosition, Cell)| entry.0 == position;
+        let old = left.next_if(at_position).map(|(_, cell)| cell);
+        let new = right.next_if(at_position).map(|(_, cell)| cell);
+        let values = match (old, new) {
+            (Some(old), Some(new)) if old == new => CellValues::Same(new.into_display()),
+            (Some(old), Some(new)) => CellValues::Changed(old.into_display(), new.into_display()),
+            (None, Some(new)) => CellValues::Added(new.into_display()),
+            (Some(old), None) => CellValues::Removed(old.into_display()),
+            (None, None) => unreachable!("position came from an input"),
+        };
+        diff.rows = diff.rows.max(position.0.saturating_add(1));
+        diff.columns = diff.columns.max(position.1.saturating_add(1));
+        if values.is_changed() {
+            diff.changes.push(diff.cells.len());
+        }
+        diff.cells.push((position, values));
+    }
+    diff
+}
+
+pub fn column_name(col: u32) -> String {
+    let mut col = u64::from(col) + 1;
     let mut letters = Vec::new();
     while col > 0 {
         col -= 1;
         letters.push((b'A' + (col % 26) as u8) as char);
         col /= 26;
     }
-    format!(
-        "{}{}",
-        letters.into_iter().rev().collect::<String>(),
-        row + 1
-    )
+    letters.into_iter().rev().collect()
+}
+
+pub fn address(row: u32, col: u32) -> String {
+    format!("{}{row}", column_name(col), row = u64::from(row) + 1)
 }
 
 #[cfg(test)]
@@ -339,5 +472,70 @@ mod tests {
     fn utf16_text_and_binary_are_distinguished() {
         assert_eq!(decode(&[0xff, 0xfe, b'A', 0]).as_deref(), Some("A"));
         assert_eq!(decode(&[1, 0, 3]), None);
+    }
+
+    #[test]
+    fn worksheet_keeps_context_and_absolute_change_positions() {
+        let value = |text: &str| Cell {
+            value: text.into(),
+            ..Cell::default()
+        };
+        let before = Worksheet::from([
+            ((0, 0), value("name")),
+            ((356, 12), value("context")),
+            ((357, 13), value("old")),
+            ((359, 13), value("removed")),
+        ]);
+        let after = Worksheet::from([
+            ((0, 0), value("name")),
+            ((356, 12), value("context")),
+            ((357, 13), value("new")),
+            (
+                (1500, 27),
+                Cell {
+                    formula: "N358".into(),
+                    ..Cell::default()
+                },
+            ),
+        ]);
+        let sheet = compare_worksheet("function".into(), Some(before), Some(after));
+        assert_eq!((sheet.rows, sheet.columns), (1501, 28));
+        assert_eq!(
+            sheet.cell((356, 12)).unwrap().sides(),
+            (Some("context"), Some("context"))
+        );
+        assert!(sheet.cell((358, 13)).is_none());
+        assert_eq!(sheet.change_count(), 3);
+        assert_eq!(sheet.change(0), Some((357, 13)));
+        assert_eq!(
+            sheet.cell((357, 13)).unwrap().sides(),
+            (Some("old"), Some("new"))
+        );
+        assert_eq!(sheet.change(1), Some((359, 13)));
+        assert_eq!(
+            sheet.cell((359, 13)).unwrap().sides(),
+            (Some("removed"), None)
+        );
+        assert_eq!(sheet.change(2), Some((1500, 27)));
+        assert_eq!(
+            sheet.cell((1500, 27)).unwrap().sides(),
+            (None, Some("=N358"))
+        );
+    }
+
+    #[test]
+    fn shared_value_and_formula_use_one_cell_of_the_workbook_budget() {
+        let mut sheet = SheetCells {
+            used: MAX_USED_CELLS - 1,
+            ..SheetCells::default()
+        };
+        let position = (1023, 27);
+        sheet.value(position, &Data::Int(2)).unwrap();
+        sheet.at(position).unwrap().formula = "1+1".into();
+        assert_eq!(
+            sheet.cells.remove(&position).unwrap().into_display(),
+            "=1+1  →  2"
+        );
+        assert!(sheet.value((0, 0), &Data::Int(3)).is_err());
     }
 }

@@ -25,7 +25,8 @@ impl HistoryScope {
 }
 
 pub const PAGE: usize = 300;
-const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
+pub const MAX_HISTORY: usize = 3000;
+pub(crate) const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Commit {
@@ -148,6 +149,25 @@ pub struct History {
     pub elapsed_ms: u128,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistoryPage {
+    Complete,
+    More,
+    Truncated,
+}
+
+impl History {
+    pub fn page(&self) -> HistoryPage {
+        if !self.has_more {
+            HistoryPage::Complete
+        } else if self.commits.len() >= MAX_HISTORY {
+            HistoryPage::Truncated
+        } else {
+            HistoryPage::More
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Area {
     Staged,
@@ -161,6 +181,34 @@ pub struct Change {
     pub old_path: Option<String>,
     pub code: char,
     pub area: Area,
+    pub left_gitlink: bool,
+    pub right_gitlink: bool,
+}
+
+impl Change {
+    pub fn index_operation(&self) -> Option<Operation> {
+        let mut paths = vec![self.path.clone()];
+        if self.code == 'R'
+            && let Some(old_path) = &self.old_path
+        {
+            paths.push(old_path.clone());
+        }
+        match self.area {
+            Area::Staged => Some(Operation::Unstage(paths)),
+            Area::Unstaged => Some(Operation::Stage(paths)),
+            Area::Commit => None,
+        }
+    }
+
+    pub fn is_gitlink(&self) -> bool {
+        self.left_gitlink || self.right_gitlink
+    }
+}
+
+#[derive(Debug)]
+pub struct Status {
+    pub head: Option<String>,
+    pub files: Vec<Change>,
 }
 
 #[derive(Debug)]
@@ -174,6 +222,7 @@ pub enum Version {
     Empty,
     Index,
     Worktree,
+    Head(String),
     Commit(String),
 }
 
@@ -183,7 +232,7 @@ impl Version {
             Self::Empty => "∅",
             Self::Index => "暂存区",
             Self::Worktree => "工作树",
-            Self::Commit(id) if id == "HEAD" => "HEAD",
+            Self::Head(_) => "HEAD",
             Self::Commit(id) => id.get(..8).unwrap_or(id),
         }
     }
@@ -196,6 +245,8 @@ pub struct Compare {
     pub base: Version,
     pub left_path: String,
     pub right_path: String,
+    pub left_gitlink: bool,
+    pub right_gitlink: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -490,80 +541,95 @@ fn parse_commits(bytes: &[u8]) -> Vec<Commit> {
         .collect()
 }
 
-pub fn status(root: &Path) -> Result<Vec<Change>> {
+pub fn status(root: &Path) -> Result<Status> {
     let bytes = run(
         root,
         &[
             "status",
-            "--porcelain=v1",
+            "--porcelain=v2",
+            "--branch",
             "-z",
             "--untracked-files=all",
             "--ignore-submodules=dirty",
         ],
     )?;
-    let mut fields = bytes.split(|ch| *ch == 0);
+    let mut fields = bytes.split(|&byte| byte == 0);
+    let mut head = None;
     let mut files = Vec::new();
-    while let Some(field) = fields.next() {
-        if field.len() < 4 {
-            continue;
-        }
-        let path = string(&field[3..]);
-        let x = field[0] as char;
-        let y = field[1] as char;
-        let old = if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
-            fields.next().map(string)
-        } else {
-            None
-        };
-        if matches!(
-            (x, y),
-            ('D', 'D')
-                | ('A', 'U')
-                | ('U', 'D')
-                | ('U', 'A')
-                | ('D', 'U')
-                | ('A', 'A')
-                | ('U', 'U')
-        ) {
+    while let Some(record) = fields.next() {
+        if let Some(value) = record.strip_prefix(b"# branch.oid ") {
+            let value = string(value);
+            ensure!(value == "(initial)" || oid(&value), "无法识别工作树的 HEAD");
+            head = Some((value != "(initial)").then_some(value));
+        } else if let Some(path) = record.strip_prefix(b"? ") {
             files.push(Change {
-                path,
+                path: string(path),
+                old_path: None,
+                code: '?',
+                area: Area::Unstaged,
+                left_gitlink: false,
+                right_gitlink: false,
+            });
+        } else if record.starts_with(b"u ") {
+            let parts: Vec<_> = record.splitn(11, |&byte| byte == b' ').collect();
+            ensure!(parts.len() == 11, "无法读取冲突文件状态");
+            files.push(Change {
+                path: string(parts[10]),
                 old_path: None,
                 code: 'U',
                 area: Area::Unstaged,
+                left_gitlink: false,
+                right_gitlink: parts[6] == b"160000",
             });
-            continue;
-        }
-        if !matches!(x, ' ' | '?' | '!') {
-            files.push(Change {
-                path: path.clone(),
-                old_path: old.clone().filter(|_| matches!(x, 'R' | 'C')),
-                code: x,
-                area: Area::Staged,
-            });
-        }
-        if !matches!(y, ' ' | '!') {
-            files.push(Change {
-                path,
-                old_path: old.filter(|_| matches!(y, 'R' | 'C')),
-                code: y,
-                area: Area::Unstaged,
-            });
+        } else if record.starts_with(b"1 ") || record.starts_with(b"2 ") {
+            let renamed = record[0] == b'2';
+            let field_count = if renamed { 10 } else { 9 };
+            let parts: Vec<_> = record.splitn(field_count, |&byte| byte == b' ').collect();
+            ensure!(
+                parts.len() == field_count && parts[1].len() == 2,
+                "无法读取文件状态"
+            );
+            let path = string(parts[field_count - 1]);
+            let old = if renamed {
+                Some(string(fields.next().context("重命名记录缺少原路径")?))
+            } else {
+                None
+            };
+            for (index, area) in [Area::Staged, Area::Unstaged].into_iter().enumerate() {
+                let code = parts[1][index] as char;
+                if code != '.' {
+                    files.push(Change {
+                        path: path.clone(),
+                        old_path: old.clone().filter(|_| matches!(code, 'R' | 'C')),
+                        code,
+                        area,
+                        left_gitlink: parts[3 + index] == b"160000",
+                        right_gitlink: parts[4 + index] == b"160000",
+                    });
+                }
+            }
         }
     }
-    Ok(files)
+    Ok(Status {
+        head: head.context("工作树状态缺少 HEAD")?,
+        files,
+    })
 }
 
-fn named_changes(bytes: &[u8]) -> Vec<Change> {
+fn raw_changes(bytes: &[u8]) -> Result<Vec<Change>> {
     let mut fields = bytes.split(|ch| *ch == 0);
     let mut files = Vec::new();
-    while let Some(field) = fields.next() {
-        let Some(&code) = field.first() else { break };
-        let Some(first) = fields.next() else { break };
-        let code = code as char;
-        let first = string(first);
+    while let Some(header) = fields.next().filter(|header| !header.is_empty()) {
+        let header = header.strip_prefix(b":").context("无效的文件差异记录")?;
+        let parts: Vec<_> = header.split(|&byte| byte == b' ').collect();
+        ensure!(parts.len() == 5, "无效的文件差异记录");
+        let code = *parts[4].first().context("文件差异缺少状态")? as char;
+        let first = string(fields.next().context("文件差异缺少路径")?);
         let (old_path, path) = if matches!(code, 'R' | 'C') {
-            let Some(next) = fields.next() else { break };
-            (Some(first), string(next))
+            (
+                Some(first),
+                string(fields.next().context("重命名记录缺少目标路径")?),
+            )
         } else {
             (None, first)
         };
@@ -572,9 +638,11 @@ fn named_changes(bytes: &[u8]) -> Vec<Change> {
             old_path,
             code,
             area: Area::Commit,
+            left_gitlink: parts[0] == b"160000",
+            right_gitlink: parts[1] == b"160000",
         });
     }
-    files
+    Ok(files)
 }
 
 pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<Details> {
@@ -589,7 +657,8 @@ pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<
                 root,
                 &[
                     "diff",
-                    "--name-status",
+                    "--raw",
+                    "--ignore-submodules=none",
                     "--find-renames",
                     "-z",
                     from_id,
@@ -607,7 +676,8 @@ pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<
                     "diff-tree",
                     "--root",
                     "--no-commit-id",
-                    "--name-status",
+                    "--raw",
+                    "--ignore-submodules=none",
                     "--find-renames",
                     "-r",
                     "-z",
@@ -638,14 +708,14 @@ pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<
         message,
         author: item.author.clone(),
         date: item.date.clone(),
-        files: named_changes(&files),
+        files: raw_changes(&files)?,
         from,
         to,
         base,
     })
 }
 
-pub fn compare(file: &Change, details: Option<&Details>, has_head: bool) -> Compare {
+pub fn compare(file: &Change, details: Option<&Details>, head: Option<&str>) -> Compare {
     let (mut left, mut right, base) = match file.area {
         Area::Commit => {
             let details = details.expect("commit changes require commit details");
@@ -656,11 +726,7 @@ pub fn compare(file: &Change, details: Option<&Details>, has_head: bool) -> Comp
             )
         }
         Area::Staged => {
-            let from = if has_head {
-                Version::Commit("HEAD".into())
-            } else {
-                Version::Empty
-            };
+            let from = head.map_or(Version::Empty, |id| Version::Head(id.to_owned()));
             (from.clone(), Version::Index, from)
         }
         Area::Unstaged => (Version::Index, Version::Worktree, Version::Index),
@@ -677,6 +743,8 @@ pub fn compare(file: &Change, details: Option<&Details>, has_head: bool) -> Comp
         base,
         left_path: file.old_path.clone().unwrap_or_else(|| file.path.clone()),
         right_path: file.path.clone(),
+        left_gitlink: file.left_gitlink,
+        right_gitlink: file.right_gitlink,
     }
 }
 
@@ -723,10 +791,10 @@ pub fn snapshot(root: &Path, version: &Version, path: &str, missing_ok: bool) ->
             ensure!(bytes.len() as u64 <= MAX_SNAPSHOT, "文件超过 64 MiB");
             Ok(bytes)
         }
-        Version::Index | Version::Commit(_) => {
+        Version::Index | Version::Head(_) | Version::Commit(_) => {
             let spec = match version {
-                Version::Commit(id) => {
-                    ensure!(id == "HEAD" || oid(id), "无效的提交标识");
+                Version::Head(id) | Version::Commit(id) => {
+                    ensure!(oid(id), "无效的提交标识");
                     format!("{id}:{path}")
                 }
                 _ => format!(":{path}"),
@@ -742,10 +810,64 @@ pub fn snapshot(root: &Path, version: &Version, path: &str, missing_ok: bool) ->
     }
 }
 
+pub fn diff_snapshot(
+    worktree: &Path,
+    version: &Version,
+    path: &str,
+    gitlink: bool,
+) -> Result<Vec<u8>> {
+    if !gitlink {
+        return snapshot(worktree, version, path, false);
+    }
+    let relative = safe_relative(path)?;
+    let id = match version {
+        Version::Index => trim(&run(
+            worktree,
+            &["rev-parse", "--verify", &format!(":{path}")],
+        )?),
+        Version::Head(id) | Version::Commit(id) => {
+            ensure!(oid(id), "无效的提交标识");
+            trim(&run(
+                worktree,
+                &["rev-parse", "--verify", &format!("{id}:{path}")],
+            )?)
+        }
+        Version::Worktree => {
+            let module = worktree.join(relative);
+            ensure!(
+                module.join(".git").exists()
+                    && root(&module)?.canonicalize()? == module.canonicalize()?,
+                "子模块未检出"
+            );
+            trim(&run(&module, &["rev-parse", "--verify", "HEAD"])?)
+        }
+        Version::Empty => return Ok(Vec::new()),
+    };
+    ensure!(oid(&id), "无效的子模块提交标识");
+    Ok(format!("Subproject commit {id}\n").into_bytes())
+}
+
+pub fn base_snapshot(root: &Path, pair: &Compare) -> Result<Vec<u8>> {
+    let version = &pair.base;
+    let path = &pair.left_path;
+    let gitlink = match version {
+        Version::Head(id) | Version::Commit(id) if pair.left_gitlink || pair.right_gitlink => {
+            run(root, &["ls-tree", "-z", id, "--", path])?.starts_with(b"160000 ")
+        }
+        Version::Index => pair.left_gitlink,
+        _ => false,
+    };
+    if gitlink {
+        diff_snapshot(root, version, path, true)
+    } else {
+        snapshot(root, version, path, true)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Operation {
-    Stage(String),
-    Unstage(String),
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
     Commit(String),
     Switch(String),
     Branch(String),
@@ -755,22 +877,30 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub fn execute(&self, root: &Path) -> Result<String> {
+    pub fn execute(&self, worktree: &Path) -> Result<String> {
+        ensure!(
+            root(worktree)?.canonicalize()? == worktree.canonicalize()?,
+            "Git 操作需要工作树根目录"
+        );
+        let root = worktree;
         let args = match self {
-            Self::Stage(path) => {
-                safe_relative(path)?;
-                vec!["add", "--", path]
-            }
-            Self::Unstage(path) => {
-                safe_relative(path)?;
-                if output(root, &["rev-parse", "--verify", "--quiet", "HEAD"], true)?
+            Self::Stage(paths) | Self::Unstage(paths) => {
+                ensure!(!paths.is_empty(), "没有选中的文件");
+                for path in paths {
+                    safe_relative(path)?;
+                }
+                let mut args = if matches!(self, Self::Stage(_)) {
+                    vec!["add", "--"]
+                } else if output(root, &["rev-parse", "--verify", "--quiet", "HEAD"], true)?
                     .status
                     .success()
                 {
-                    vec!["restore", "--staged", "--", path]
+                    vec!["restore", "--staged", "--"]
                 } else {
-                    vec!["rm", "--cached", "--ignore-unmatch", "--", path]
-                }
+                    vec!["rm", "-f", "--cached", "--ignore-unmatch", "--"]
+                };
+                args.extend(paths.iter().map(String::as_str));
+                args
             }
             Self::Commit(message) => {
                 ensure!(!message.trim().is_empty(), "请输入提交说明");
@@ -820,7 +950,10 @@ mod tests {
     use super::*;
     #[test]
     fn parses_nul_rename_paths_without_splitting_spaces() {
-        let files = named_changes(b"R100\0before name.xlsx\0after name.xlsx\0M\0other.txt\0");
+        let files = raw_changes(
+            b":100644 100644 0123 0123 R100\0before name.xlsx\0after name.xlsx\0:100644 100644 0123 4567 M\0other.txt\0",
+        )
+        .unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].old_path.as_deref(), Some("before name.xlsx"));
         assert_eq!(files[0].path, "after name.xlsx");
@@ -830,6 +963,105 @@ mod tests {
     fn rejects_paths_outside_the_worktree() {
         assert!(safe_relative("../outside").is_err());
         assert!(safe_relative("Assets/config.xlsx").is_ok());
+    }
+
+    #[test]
+    fn index_operations_use_the_worktree_root_and_both_rename_paths() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let worktree = sandbox.path().join("中文 worktree");
+        let nested = worktree.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        let git = |args: &[&str]| checked(output(&worktree, args, false)?);
+        git(&["init", "--initial-branch=main"])?;
+        git(&["config", "user.name", "Refdesk test"])?;
+        git(&["config", "user.email", "test@example.invalid"])?;
+        git(&["config", "commit.gpgSign", "false"])?;
+        git(&["config", "core.hooksPath", "disabled-hooks"])?;
+        git(&["config", "core.autocrlf", "false"])?;
+        git(&["config", "status.renames", "true"])?;
+
+        let name = "同名 文件.txt";
+        let stage = Operation::Stage(vec![name.into()]);
+        std::fs::write(worktree.join(name), "original\n")?;
+        stage.execute(&worktree)?;
+        std::fs::write(worktree.join(name), "edited after staging\n")?;
+        let initial = status(&worktree)?;
+        assert!(initial.head.is_none());
+        initial.files[0]
+            .index_operation()
+            .unwrap()
+            .execute(&worktree)?;
+        assert_eq!(status(&worktree)?.files[0].code, '?');
+        assert_eq!(
+            std::fs::read(worktree.join(name))?,
+            b"edited after staging\n"
+        );
+
+        std::fs::write(nested.join(name), "different original\n")?;
+        git(&["add", "--", "."])?;
+        Operation::Commit("baseline".into()).execute(&worktree)?;
+        std::fs::write(worktree.join(name), "root edit\n")?;
+        std::fs::write(nested.join(name), "nested edit\n")?;
+        assert!(stage.execute(&nested).is_err());
+        assert!(run(&worktree, &["diff", "--cached", "--name-only"])?.is_empty());
+        assert_eq!(root(&nested)?.canonicalize()?, worktree.canonicalize()?);
+        stage.execute(&root(&nested)?)?;
+        let state = status(&worktree)?;
+        let staged = state
+            .files
+            .iter()
+            .find(|file| file.area == Area::Staged)
+            .unwrap();
+        assert_eq!(staged.path, name);
+        let pair = compare(staged, None, state.head.as_deref());
+        assert_eq!(
+            snapshot(&worktree, &pair.left, name, false)?,
+            b"edited after staging\n"
+        );
+        assert_eq!(
+            snapshot(&worktree, &pair.right, name, false)?,
+            b"root edit\n"
+        );
+        Operation::Commit("changed head".into()).execute(&worktree)?;
+        assert_eq!(
+            snapshot(&worktree, &pair.left, name, false)?,
+            b"edited after staging\n"
+        );
+
+        let renamed = "新 文件.txt";
+        git(&["mv", "--", name, renamed])?;
+        let state = status(&worktree)?;
+        let change = state.files.iter().find(|file| file.code == 'R').unwrap();
+        assert_eq!(change.old_path.as_deref(), Some(name));
+        assert_eq!(change.path, renamed);
+        change.index_operation().unwrap().execute(&worktree)?;
+        assert!(run(&worktree, &["diff", "--cached", "--name-only"])?.is_empty());
+        assert_eq!(std::fs::read(worktree.join(renamed))?, b"root edit\n");
+        assert!(!worktree.join(name).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn history_page_only_reports_truncation_if_more_records_exist() {
+        let commit = Commit {
+            id: String::new(),
+            parents: Vec::new(),
+            short: String::new(),
+            author: String::new(),
+            date: String::new(),
+            subject: String::new(),
+        };
+        let mut history = History {
+            commits: vec![commit.clone(); MAX_HISTORY - 1],
+            ..History::default()
+        };
+        assert_eq!(history.page(), HistoryPage::Complete);
+        history.has_more = true;
+        assert_eq!(history.page(), HistoryPage::More);
+        history.commits.push(commit);
+        assert_eq!(history.page(), HistoryPage::Truncated);
+        history.has_more = false;
+        assert_eq!(history.page(), HistoryPage::Complete);
     }
 
     #[test]
@@ -895,8 +1127,73 @@ mod tests {
             ],
         );
 
+        let state = status(&parent)?;
+        let added = state.files.iter().find(|file| file.path == local).unwrap();
+        let pair = compare(added, None, state.head.as_deref());
+        assert!(matches!(pair.left, Version::Empty));
+        assert_eq!(
+            diff_snapshot(&parent, &pair.right, local, pair.right_gitlink)?,
+            format!("Subproject commit {oid}\n").as_bytes()
+        );
         git(&parent, &["commit", "-m", "parent"])?;
+        let parent_history = history(&parent, &HistoryScope::Head, PAGE)?;
+        let commit_details = details(&parent, &parent_history.commits[0], None)?;
+        let added = commit_details
+            .files
+            .iter()
+            .find(|file| file.path == local)
+            .unwrap();
+        let pair = compare(added, Some(&commit_details), None);
+        assert_eq!(
+            diff_snapshot(&parent, &pair.right, local, pair.right_gitlink)?,
+            format!("Subproject commit {oid}\n").as_bytes()
+        );
+
+        let child = parent.join(local);
+        git(
+            &child,
+            &[
+                "-c",
+                "user.name=Refdesk test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=disabled-hooks",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "new child tip",
+            ],
+        )?;
+        let tip = trim(&run(&child, &["rev-parse", "HEAD"])?);
+        let state = status(&parent)?;
+        let moved = state.files.iter().find(|file| file.path == local).unwrap();
+        assert_eq!(moved.area, Area::Unstaged);
+        let pair = compare(moved, None, state.head.as_deref());
+        assert_eq!(
+            diff_snapshot(&parent, &pair.left, local, pair.left_gitlink)?,
+            format!("Subproject commit {oid}\n").as_bytes()
+        );
+        assert_eq!(
+            diff_snapshot(&parent, &pair.right, local, pair.right_gitlink)?,
+            format!("Subproject commit {tip}\n").as_bytes()
+        );
+
         git(&parent, &["update-index", "--force-remove", "--", local])?;
+        let state = status(&parent)?;
+        let removed = state
+            .files
+            .iter()
+            .find(|file| file.path == local && file.area == Area::Staged)
+            .unwrap();
+        let pair = compare(removed, None, state.head.as_deref());
+        assert_eq!(
+            diff_snapshot(&parent, &pair.left, local, pair.left_gitlink)?,
+            format!("Subproject commit {oid}\n").as_bytes()
+        );
+        assert!(matches!(pair.right, Version::Empty));
         assert_eq!(submodules(&parent)?.len(), 2);
         git(&parent, &["commit", "-m", "remove link"])?;
         let modules = submodules(&parent)?;
@@ -1005,24 +1302,24 @@ mod tests {
         git(&["config", "core.hooksPath", "disabled-hooks"])?;
         std::fs::write(root.join("notes with spaces.txt"), "original\n")?;
         let notes = "notes with spaces.txt".to_owned();
-        Operation::Stage(notes.clone()).execute(&root)?;
-        Operation::Unstage(notes.clone()).execute(&root)?;
-        assert_eq!(status(&root)?[0].code, '?');
-        Operation::Stage(notes.clone()).execute(&root)?;
+        Operation::Stage(vec![notes.clone()]).execute(&root)?;
+        Operation::Unstage(vec![notes.clone()]).execute(&root)?;
+        assert_eq!(status(&root)?.files[0].code, '?');
+        Operation::Stage(vec![notes.clone()]).execute(&root)?;
         Operation::Commit("initial commit".into()).execute(&root)?;
         git(&["tag", "-a", "v1", "-m", "first release"])?;
 
         Operation::Branch("feature/forecast".into()).execute(&root)?;
         std::fs::write(root.join("forecast.txt"), "scattered clouds\n")?;
-        Operation::Stage("forecast.txt".into()).execute(&root)?;
+        Operation::Stage(vec!["forecast.txt".into()]).execute(&root)?;
         Operation::Commit("add forecast".into()).execute(&root)?;
         Operation::Switch("main".into()).execute(&root)?;
         std::fs::write(root.join(&notes), "revised\n")?;
-        Operation::Stage(notes.clone()).execute(&root)?;
-        assert_eq!(status(&root)?[0].area, Area::Staged);
-        Operation::Unstage(notes.clone()).execute(&root)?;
-        assert_eq!(status(&root)?[0].area, Area::Unstaged);
-        Operation::Stage(notes.clone()).execute(&root)?;
+        Operation::Stage(vec![notes.clone()]).execute(&root)?;
+        assert_eq!(status(&root)?.files[0].area, Area::Staged);
+        Operation::Unstage(vec![notes.clone()]).execute(&root)?;
+        assert_eq!(status(&root)?.files[0].area, Area::Unstaged);
+        Operation::Stage(vec![notes.clone()]).execute(&root)?;
         Operation::Commit("revise notes".into()).execute(&root)?;
         git(&[
             "merge",
@@ -1063,11 +1360,11 @@ mod tests {
             .iter()
             .find(|change| change.path == notes)
             .expect("changed notes");
-        let pair = compare(change, Some(&compared), true);
+        let pair = compare(change, Some(&compared), None);
         assert_eq!(snapshot(&root, &pair.left, &notes, false)?, b"original\n");
         assert_eq!(snapshot(&root, &pair.right, &notes, false)?, b"revised\n");
         std::fs::write(linked.join("review-only.txt"), "review\n")?;
-        Operation::Stage("review-only.txt".into()).execute(&linked)?;
+        Operation::Stage(vec!["review-only.txt".into()]).execute(&linked)?;
         Operation::Commit("independent review".into()).execute(&linked)?;
         let review = HistoryScope::Selected(BTreeSet::from(["refs/heads/review".into()]));
         let joint = HistoryScope::Selected(BTreeSet::from([
