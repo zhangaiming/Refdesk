@@ -821,7 +821,7 @@ impl Desk {
                         self.repos
                             .get(path)
                             .and_then(|repo| repo.history.as_ref())
-                            .map(|history| history.branch.as_str())
+                            .map(|history| history.cache.info.branch.as_str())
                             .unwrap_or(if row.submodule.is_some() {
                                 "子模块"
                             } else {

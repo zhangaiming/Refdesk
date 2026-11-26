@@ -1,9 +1,8 @@
 use crate::diff::{self, Content};
 use crate::git::{
-    self, Change, Commit, Compare, Details, History, HistoryPage, HistoryScope, Operation, Status,
-    Submodule,
+    self, Change, Commit, Compare, Details, HistoryScope, Operation, Status, Submodule,
 };
-use crate::graph::Graph;
+use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
 use crate::settings::{self, Settings, Tool};
 use crate::tasks::{ReadKind, Scheduler};
 use crate::timing::{FrameCapture, Timings};
@@ -11,12 +10,14 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 type Outcome<T> = std::result::Result<T, String>;
-type HistoryPayload = Option<(History, Graph)>;
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(25);
 
 enum Work<'a> {
@@ -27,9 +28,10 @@ enum Work<'a> {
 
 enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
-    History(PathBuf, u64, Outcome<HistoryPayload>),
+    History(PathBuf, u64, Outcome<Option<HistoryView>>),
+    HistorySearch(u64, Outcome<SearchResult>),
     Status(PathBuf, u64, Outcome<Status>, Outcome<Vec<Submodule>>),
-    Details(u64, Outcome<Details>),
+    Details(u64, Selection, Outcome<Details>),
     Diff(u64, Outcome<Content>),
     Operation(PathBuf, Option<String>, Outcome<String>),
     External(Outcome<TempDir>),
@@ -37,8 +39,7 @@ enum Event {
 
 #[derive(Default)]
 pub(crate) struct Repository {
-    pub history: Option<History>,
-    pub graph: Graph,
+    pub history: Option<HistoryView>,
     pub status: Option<Status>,
     submodules: Option<Vec<Submodule>>,
     pub history_busy: bool,
@@ -46,7 +47,10 @@ pub(crate) struct Repository {
     pub status_error: Option<String>,
     pub history_error: Option<String>,
     pub filter: HistoryScope,
-    pub limit: usize,
+    history_viewport: Range<usize>,
+    history_pending_window: Option<Range<usize>>,
+    history_failed_window: Option<Range<usize>>,
+    history_cancel: Option<Arc<AtomicBool>>,
     history_request: u64,
     history_on_demand: bool,
     draft: String,
@@ -81,7 +85,17 @@ pub(crate) enum Selection {
     Commit {
         right: Box<Commit>,
         left: Option<Box<Commit>>,
+        right_position: Option<(u64, usize)>,
     },
+}
+
+struct HistorySearch {
+    request: u64,
+    generation: u64,
+    loaded: usize,
+    query: String,
+    canceled: Arc<AtomicBool>,
+    result: Option<Outcome<usize>>,
 }
 
 pub(crate) enum Dialog {
@@ -116,6 +130,7 @@ pub(crate) struct Desk {
     pub search: String,
     pub branch_query: String,
     pub search_row: Option<usize>,
+    history_search: Option<HistorySearch>,
     pub scroll_to: Option<usize>,
     pub dialog: Option<Dialog>,
     pub tools_open: bool,
@@ -227,6 +242,7 @@ impl Desk {
             search: String::new(),
             branch_query: String::new(),
             search_row: None,
+            history_search: None,
             scroll_to: None,
             dialog: None,
             tools_open: false,
@@ -426,9 +442,10 @@ impl Desk {
         if self.active.as_ref() == Some(&path) {
             return;
         }
-        if let Some(previous) = &self.active {
-            self.tasks.cancel(previous, Some(ReadKind::Details));
-            self.tasks.cancel(previous, Some(ReadKind::Diff));
+        if let Some(previous) = self.active.clone() {
+            self.deactivate_history(&previous);
+            self.tasks.cancel(&previous, Some(ReadKind::Details));
+            self.tasks.cancel(&previous, Some(ReadKind::Diff));
         }
         self.tasks.set_active(Some(path.clone()));
         if let Some(previous) = self
@@ -462,13 +479,18 @@ impl Desk {
         self.clear_diff();
         self.search.clear();
         self.branch_query.clear();
+        self.cancel_history_search();
         self.search_row = None;
         self.scroll_to = None;
         self.graph_reset += 1;
         self.editor =
             std::mem::take(&mut self.repos.get_mut(&path).expect("active repository").draft);
 
-        if self.repos[&path].history.is_none() && !self.repos[&path].history_busy {
+        let state = self.repos.get_mut(&path).expect("active repository");
+        state.history_viewport = 0..2;
+        if let Some(history) = &state.history {
+            history.cache.set_active(true);
+        } else if !state.history_busy {
             self.request_history(ctx, &path);
         }
         self.request_status(ctx, &path, false);
@@ -481,16 +503,23 @@ impl Desk {
         }
         self.settings.repositories.retain(|entry| entry != path);
         self.tasks.cancel(path, None);
-        self.repos.remove(path);
+        self.deactivate_history(path);
+        if let Some(state) = self.repos.remove(path)
+            && let Some(cancel) = state.history_cancel
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
         self.settings.branch_selection.remove(path);
         if self.active.as_ref().is_some_and(|active| {
             active == path || !self.repository_rows().iter().any(|row| &row.path == active)
         }) {
             self.tasks.set_active(None);
-            if let Some(active) = &self.active {
-                self.tasks.cancel(active, Some(ReadKind::Details));
-                self.tasks.cancel(active, Some(ReadKind::Diff));
+            if let Some(active) = self.active.clone() {
+                self.deactivate_history(&active);
+                self.tasks.cancel(&active, Some(ReadKind::Details));
+                self.tasks.cancel(&active, Some(ReadKind::Diff));
             }
+            self.cancel_history_search();
             self.active = None;
             self.restore_active = None;
             self.settings.active = None;
@@ -510,7 +539,26 @@ impl Desk {
         self.queue_history(ctx, path, false);
     }
 
+    fn deactivate_history(&mut self, path: &Path) {
+        self.tasks.cancel(path, Some(ReadKind::HistorySearch));
+        if let Some(history) = self
+            .repos
+            .get_mut(path)
+            .and_then(|state| state.history.as_mut())
+        {
+            history.pages.clear();
+            let cache = Arc::clone(&history.cache);
+            cache.set_active(false);
+            self.tasks.read(Box::new(move || cache.pause_if_inactive()));
+        }
+    }
+
     fn queue_history(&mut self, ctx: &egui::Context, path: &Path, check_superproject: bool) {
+        let active = self.active.as_deref() == Some(path);
+        if active {
+            self.cancel_history_search();
+            self.search_row = None;
+        }
         let request = self.next();
         let state = self
             .repos
@@ -524,23 +572,44 @@ impl Desk {
                     .unwrap_or_default(),
                 ..Repository::default()
             });
-        if state.limit == 0 {
-            state.limit = git::PAGE;
+        if state.history_viewport.is_empty() {
+            state.history_viewport = 0..2;
         }
+        let canceled = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = state.history_cancel.replace(Arc::clone(&canceled)) {
+            previous.store(true, Ordering::Relaxed);
+        }
+        if let Some(history) = &state.history {
+            let cache = Arc::clone(&history.cache);
+            cache.set_active(false);
+            self.tasks.read(Box::new(move || cache.pause_if_inactive()));
+        }
+        state.history_pending_window = None;
+        state.history_failed_window = None;
         state.history_request = request;
         state.history_busy = true;
         state.history_error = None;
         let root = path.to_owned();
         let filter = state.filter.clone();
-        let limit = state.limit;
+        let range = state.history_viewport.clone();
         self.submit(ctx, Work::Latest(ReadKind::History, path), move || {
             let result = readable((|| {
                 if check_superproject && git::has_superproject(&root)? {
                     return Ok(None);
                 }
-                let history = git::history(&root, &filter, limit)?;
-                let graph = Graph::build(&history.commits);
-                Ok(Some((history, graph)))
+                let cache = HistoryCache::open(&root, &filter, active)?;
+                let summary = cache.load_through(range.end.saturating_sub(1).max(1), &canceled)?;
+                let pages = if active {
+                    cache.window(range, summary, Default::default())?
+                } else {
+                    Default::default()
+                };
+                Ok(Some(HistoryView {
+                    cache,
+                    summary,
+                    pages,
+                    generation: request,
+                }))
             })());
             Event::History(root, request, result)
         });
@@ -588,28 +657,134 @@ impl Desk {
         }
         state.filter = filter.clone();
         self.settings.branch_selection.insert(path.clone(), filter);
-        state.limit = git::PAGE;
+        state.history_viewport = 0..2;
         self.graph_reset += 1;
         self.search_row = None;
         self.request_history(ctx, &path);
         self.save();
     }
 
-    pub fn more(&mut self, ctx: &egui::Context) {
+    pub fn request_history_window(
+        &mut self,
+        ctx: &egui::Context,
+        range: Range<usize>,
+        near_end: bool,
+    ) {
         let Some(path) = self.active.clone() else {
             return;
         };
-        let state = self.repos.entry(path.clone()).or_default();
+        let request = self.requests + 1;
+        let state = self.repos.get_mut(&path).expect("active repository");
+        state.history_viewport = range.clone();
+        let Some(history) = &mut state.history else {
+            return;
+        };
+        history.pages.retain(|page, _| range.contains(page));
+        let summary = history.summary;
+        let extend = near_end && summary.has_more && state.history_error.is_none();
+        let missing = (range.start..range.end.min(summary.page_count()))
+            .any(|page| !history.pages.contains_key(&page));
         if state.history_busy
-            || state
-                .history
-                .as_ref()
-                .is_none_or(|history| history.page() != HistoryPage::More)
+            || state.history_failed_window.as_ref() == Some(&range)
+            || !(extend || missing)
         {
             return;
         }
-        state.limit = (state.limit + git::PAGE).min(git::MAX_HISTORY);
-        self.request_history(ctx, &path);
+        self.requests = request;
+        state.history_request = request;
+        state.history_busy = true;
+        state.history_pending_window = Some(range.clone());
+        let canceled = Arc::new(AtomicBool::new(false));
+        state.history_cancel = Some(Arc::clone(&canceled));
+        let cache = Arc::clone(&history.cache);
+        let pages = history.pages.clone();
+        let generation = history.generation;
+        let root = path.clone();
+        self.submit(ctx, Work::Latest(ReadKind::History, &path), move || {
+            let result = readable((|| {
+                let summary = if extend {
+                    cache.load_through(summary.page_count() + 1, &canceled)?
+                } else {
+                    summary
+                };
+                let pages = cache.window(range, summary, pages)?;
+                Ok(Some(HistoryView {
+                    cache,
+                    summary,
+                    pages,
+                    generation,
+                }))
+            })());
+            Event::History(root, request, result)
+        });
+        ctx.request_repaint();
+    }
+
+    fn cancel_history_search(&mut self) {
+        if let Some(search) = self.history_search.take() {
+            search.canceled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn request_history_search(
+        &mut self,
+        ctx: &egui::Context,
+        query: &str,
+        direction: Option<SearchDirection>,
+    ) {
+        if query.is_empty() {
+            self.cancel_history_search();
+            return;
+        }
+        let Some(path) = self.active.clone() else {
+            return;
+        };
+        let state = &self.repos[&path];
+        let Some(history) = &state.history else {
+            return;
+        };
+        if state.history_busy && state.history_pending_window.is_none() {
+            return;
+        }
+        let generation = history.generation;
+        let loaded = history.summary.loaded;
+        if direction.is_none()
+            && self.history_search.as_ref().is_some_and(|search| {
+                search.query == query
+                    && search.generation == generation
+                    && (search.loaded == loaded || search.result.is_none())
+            })
+        {
+            return;
+        }
+        let cache = Arc::clone(&history.cache);
+        self.cancel_history_search();
+        let request = self.next();
+        let canceled = Arc::new(AtomicBool::new(false));
+        self.history_search = Some(HistorySearch {
+            request,
+            generation,
+            loaded,
+            query: query.into(),
+            canceled: Arc::clone(&canceled),
+            result: None,
+        });
+        let anchor = self.search_row;
+        let query = query.to_owned();
+        self.submit(
+            ctx,
+            Work::Latest(ReadKind::HistorySearch, &path),
+            move || {
+                Event::HistorySearch(
+                    request,
+                    readable(cache.search(&query, loaded, anchor, direction, &canceled)),
+                )
+            },
+        );
+    }
+
+    pub fn history_search_result(&self) -> Option<&Outcome<usize>> {
+        self.history_search.as_ref()?.result.as_ref()
     }
 
     pub fn choose_worktree(&mut self) {
@@ -624,32 +799,33 @@ impl Desk {
         self.clear_diff();
     }
 
-    pub fn choose_commit(&mut self, ctx: &egui::Context, item: Commit, extend: bool) {
+    pub fn choose_commit(&mut self, ctx: &egui::Context, row: usize, item: Commit, extend: bool) {
         let Some(root) = self.active.clone() else {
             return;
         };
-        let (left, right) = if extend {
-            match &self.selection {
-                Selection::Commit { right: current, .. } if current.id != item.id => {
-                    let position = |id: &str| {
-                        self.repos[&root].history.as_ref().and_then(|history| {
-                            history.commits.iter().position(|commit| commit.id == id)
-                        })
-                    };
-                    if position(&item.id) < position(&current.id) {
-                        (Some(current.as_ref().clone()), item)
-                    } else {
-                        (Some(item), current.as_ref().clone())
-                    }
-                }
-                _ => (None, item),
-            }
-        } else {
-            (None, item)
+        let Some(history) = &self.repos[&root].history else {
+            return;
         };
+        let generation = history.generation;
+        let loaded = history.summary.loaded;
+        let cache = Arc::clone(&history.cache);
+        let current = if extend
+            && let Selection::Commit {
+                right,
+                right_position,
+                ..
+            } = &self.selection
+            && right.id != item.id
+        {
+            Some((right.clone(), *right_position))
+        } else {
+            None
+        };
+        let item = Box::new(item);
         self.selection = Selection::Commit {
-            right: Box::new(right.clone()),
-            left: left.clone().map(Box::new),
+            right: item.clone(),
+            left: current.as_ref().map(|(commit, _)| commit.clone()),
+            right_position: Some((generation, row)),
         };
         self.details_request = self.next();
         let request = self.details_request;
@@ -659,9 +835,42 @@ impl Desk {
         self.clear_diff();
         let path = root.clone();
         self.submit(ctx, Work::Latest(ReadKind::Details, &path), move || {
+            let (left, right, right_position) = if let Some((commit, position)) = current {
+                let current_row = match position {
+                    Some((snapshot, index)) if snapshot == generation => Some(index),
+                    _ => match cache.position(loaded, &commit.id) {
+                        Ok(index) => index,
+                        Err(error) => {
+                            let selection = Selection::Commit {
+                                right: item,
+                                left: Some(commit),
+                                right_position: Some((generation, row)),
+                            };
+                            return Event::Details(request, selection, Err(format!("{error:#}")));
+                        }
+                    },
+                };
+                if current_row.is_some_and(|index| row < index) {
+                    (Some(commit), item, Some((generation, row)))
+                } else {
+                    (
+                        Some(item),
+                        commit,
+                        current_row.map(|index| (generation, index)),
+                    )
+                }
+            } else {
+                (None, item, Some((generation, row)))
+            };
+            let result = readable(git::details(&root, &right, left.as_deref()));
             Event::Details(
                 request,
-                readable(git::details(&root, &right, left.as_ref())),
+                Selection::Commit {
+                    right,
+                    left,
+                    right_position,
+                },
+                result,
             )
         });
     }
@@ -794,9 +1003,21 @@ impl Desk {
                         continue;
                     }
                     state.history_busy = false;
+                    state.history_cancel = None;
+                    let pending = state.history_pending_window.take();
                     match result {
-                        Ok(Some((history, graph))) => {
-                            state.graph = graph;
+                        Ok(Some(mut history)) => {
+                            let active = self.active.as_ref() == Some(&path);
+                            history.cache.set_active(active);
+                            if active {
+                                history
+                                    .pages
+                                    .retain(|page, _| state.history_viewport.contains(page));
+                            } else {
+                                history.pages.clear();
+                                let cache = Arc::clone(&history.cache);
+                                self.tasks.read(Box::new(move || cache.pause_if_inactive()));
+                            }
                             state.history = Some(history);
                         }
                         Ok(None) => {
@@ -805,7 +1026,23 @@ impl Desk {
                                 self.request_history(ctx, &path);
                             }
                         }
-                        Err(error) => state.history_error = Some(error),
+                        Err(error) => {
+                            state.history_error = Some(error);
+                            state.history_failed_window = pending;
+                        }
+                    }
+                }
+                Event::HistorySearch(request, result) => {
+                    if let Some(search) = &mut self.history_search
+                        && search.request == request
+                    {
+                        search.result = Some(result.map(|result| {
+                            if let Some(row) = result.target {
+                                self.search_row = Some(row);
+                                self.scroll_to = Some(row);
+                            }
+                            result.count
+                        }));
                     }
                 }
                 Event::Status(path, request, result, submodules) => {
@@ -858,7 +1095,8 @@ impl Desk {
                         self.activate(ctx, path);
                     }
                 }
-                Event::Details(request, result) if request == self.details_request => {
+                Event::Details(request, selection, result) if request == self.details_request => {
+                    self.selection = selection;
                     self.details_busy = false;
                     match result {
                         Ok(details) => self.details = Some(details),
@@ -940,23 +1178,29 @@ impl Desk {
             .and_then(|repo| repo.history.as_ref())
             .and_then(|history| {
                 history
-                    .commits
-                    .iter()
-                    .position(|commit| commit.id.starts_with(&target))
+                    .cached_rows()
+                    .find_map(|(index, row)| row.commit.id.starts_with(&target).then_some(index))
             });
         if let Some(row) = row {
             self.scroll_to = Some(row.saturating_sub(4));
-        } else if !self.state().is_some_and(|repo| repo.history.is_some())
-            && let Some(capture) = &mut self.frame_capture
+        } else if !self.state().is_some_and(|repo| {
+            repo.history
+                .as_ref()
+                .is_some_and(HistoryView::ready_to_draw)
+        }) && let Some(capture) = &mut self.frame_capture
         {
             capture.commit = Some(target);
         }
     }
 
     pub fn report_frame(&mut self, ctx: &egui::Context) {
-        let capture_ready = self
-            .state()
-            .is_some_and(|repo| repo.history.is_some() && repo.status.is_some());
+        let capture_ready = self.state().is_some_and(|repo| {
+            repo.status.is_some()
+                && repo
+                    .history
+                    .as_ref()
+                    .is_some_and(HistoryView::ready_to_draw)
+        });
         if capture_ready && let Some(capture) = &mut self.frame_capture {
             if capture.save(ctx) {
                 self.frame_capture = None;
@@ -970,7 +1214,9 @@ impl Desk {
         {
             timings.presented(
                 path,
-                repo.history.is_some(),
+                repo.history
+                    .as_ref()
+                    .is_some_and(HistoryView::ready_to_draw),
                 repo.status.is_some() && !repo.status_busy,
             );
         }
@@ -978,7 +1224,10 @@ impl Desk {
 
     pub fn prefetch(&mut self, ctx: &egui::Context) {
         if !self.settings.prefetch_history
-            || !self.state().is_some_and(|state| state.history.is_some())
+            || !self
+                .state()
+                .and_then(|state| state.history.as_ref())
+                .is_some_and(HistoryView::ready_to_draw)
             || self.repos.values().any(|repo| repo.history_busy)
         {
             return;

@@ -2,9 +2,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryScope {
@@ -25,10 +25,9 @@ impl HistoryScope {
 }
 
 pub const PAGE: usize = 300;
-pub const MAX_HISTORY: usize = 3000;
 pub(crate) const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Commit {
     pub id: String,
     pub parents: Vec<String>,
@@ -143,29 +142,7 @@ fn short_ref(name: &str) -> &str {
 pub struct History {
     pub branch: String,
     pub head: Option<String>,
-    pub commits: Vec<Commit>,
     pub refs: Vec<Reference>,
-    pub has_more: bool,
-    pub elapsed_ms: u128,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum HistoryPage {
-    Complete,
-    More,
-    Truncated,
-}
-
-impl History {
-    pub fn page(&self) -> HistoryPage {
-        if !self.has_more {
-            HistoryPage::Complete
-        } else if self.commits.len() >= MAX_HISTORY {
-            HistoryPage::Truncated
-        } else {
-            HistoryPage::More
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,8 +368,7 @@ fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|ch| ch.is_ascii_hexdigit())
 }
 
-pub fn history(root: &Path, scope: &HistoryScope, limit: usize) -> Result<History> {
-    let timer = std::time::Instant::now();
+pub fn history_snapshot(root: &Path, scope: &HistoryScope) -> Result<(History, HistoryStart)> {
     let head_result = output(root, &["rev-parse", "--verify", "--quiet", "HEAD"], true)?;
     let head = head_result
         .status
@@ -420,77 +396,129 @@ pub fn history(root: &Path, scope: &HistoryScope, limit: usize) -> Result<Histor
         .split(|ch| *ch == b'\n')
         .filter_map(parse_reference)
         .collect::<Vec<_>>();
-    let count = format!("--max-count={}", limit + 1);
-    let mut args = vec![
-        "log",
-        "--date-order",
-        "--date=short",
-        "-z",
-        &count,
-        "--format=%H%x00%P%x00%h%x00%an%x00%ad%x00%s",
-    ];
-    let mut commits = if let HistoryScope::Selected(filter) = scope {
-        let mut targets: BTreeSet<&str> = refs
+    let targets = match scope {
+        HistoryScope::Head => head.iter().cloned().collect(),
+        HistoryScope::All => refs
             .iter()
-            .filter(|reference| filter.contains(&reference.name))
-            .map(|reference| reference.target.as_str())
-            .collect();
-        if filter.contains("HEAD")
-            && let Some(head) = &head
-        {
-            targets.insert(head);
+            .map(|reference| reference.target.clone())
+            .chain(head.iter().cloned())
+            .collect(),
+        HistoryScope::Selected(filter) => {
+            let mut targets: BTreeSet<_> = refs
+                .iter()
+                .filter(|reference| filter.contains(&reference.name))
+                .map(|reference| reference.target.clone())
+                .collect();
+            if filter.contains("HEAD")
+                && let Some(head) = &head
+            {
+                targets.insert(head.clone());
+            }
+            targets.into_iter().collect()
         }
-        if targets.is_empty() {
-            Vec::new()
-        } else {
-            args.push("--stdin");
-            let mut child = command(Some(root), true)
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("无法读取所选分支的 Git 历史")?;
-            let mut input = child.stdin.take().expect("piped stdin");
-            let written = input.write_all(
-                targets
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .as_bytes(),
-            );
-            drop(input);
-            let bytes = checked(child.wait_with_output()?)?;
-            written?;
-            parse_commits(&bytes)
-        }
-    } else if *scope == HistoryScope::Head {
-        if head.is_some() {
-            args.extend(["HEAD", "--"]);
-            parse_commits(&run(root, &args)?)
-        } else {
-            Vec::new()
-        }
-    } else if head.is_none() && refs.is_empty() {
-        Vec::new()
-    } else {
-        args.extend(["--branches", "--remotes", "--tags"]);
-        if head.is_some() {
-            args.push("HEAD");
-        }
-        args.push("--");
-        parse_commits(&run(root, &args)?)
     };
-    let has_more = commits.len() > limit;
-    commits.truncate(limit);
-    Ok(History {
-        branch,
-        head,
-        commits,
-        refs,
-        has_more,
-        elapsed_ms: timer.elapsed().as_millis(),
-    })
+    Ok((
+        History { branch, head, refs },
+        HistoryStart {
+            root: root.to_owned(),
+            targets,
+        },
+    ))
+}
+
+pub struct HistoryStart {
+    root: PathBuf,
+    targets: Vec<String>,
+}
+
+impl HistoryStart {
+    pub fn open(&self, skip: usize) -> Result<Option<LogReader>> {
+        if self.targets.is_empty() {
+            return Ok(None);
+        }
+        let stderr = tempfile::tempfile()?;
+        let skip = format!("--skip={skip}");
+        let mut child = command(Some(&self.root), true)
+            .args([
+                "log",
+                "--date-order",
+                "--date=short",
+                "-z",
+                "--format=%H%x00%P%x00%h%x00%an%x00%ad%x00%s",
+                &skip,
+                "--stdin",
+                "--",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr.try_clone()?)
+            .spawn()
+            .context("无法启动 Git 历史读取")?;
+        let input = child.stdin.take().expect("piped stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let reader = LogReader {
+            child,
+            stdout,
+            stderr,
+        };
+        {
+            let mut input = std::io::BufWriter::new(input);
+            for target in &self.targets {
+                writeln!(input, "{target}")?;
+            }
+            input.flush()?;
+        }
+        Ok(Some(reader))
+    }
+}
+
+pub struct LogReader {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    stderr: std::fs::File,
+}
+
+impl LogReader {
+    pub fn next_commit(&mut self) -> Result<Option<Commit>> {
+        let mut bytes = Vec::new();
+        for field in 0..6 {
+            if self.stdout.read_until(0, &mut bytes)? == 0 || bytes.last() != Some(&0) {
+                if !self.child.wait()?.success() {
+                    self.stderr.rewind()?;
+                    let mut message = Vec::new();
+                    (&mut self.stderr)
+                        .take(16 * 1024)
+                        .read_to_end(&mut message)?;
+                    bail!("无法读取 Git 历史：{}", string(&message).trim());
+                }
+                ensure!(field == 0 && bytes.is_empty(), "Git 历史记录不完整");
+                return Ok(None);
+            }
+        }
+        let mut fields = bytes.split(|byte| *byte == 0).map(string);
+        let id = fields.next().expect("commit id");
+        ensure!(oid(&id), "无法识别 Git 历史提交：{id}");
+        Ok(Some(Commit {
+            id,
+            parents: fields
+                .next()
+                .expect("commit parents")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            short: fields.next().expect("short id"),
+            author: fields.next().expect("author"),
+            date: fields.next().expect("date"),
+            subject: fields.next().expect("subject"),
+        }))
+    }
+}
+
+impl Drop for LogReader {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn parse_reference(line: &[u8]) -> Option<Reference> {
@@ -518,27 +546,25 @@ fn parse_reference(line: &[u8]) -> Option<Reference> {
     })
 }
 
-fn parse_commits(bytes: &[u8]) -> Vec<Commit> {
-    let fields: Vec<_> = bytes.split(|ch| *ch == 0).collect();
-    fields
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .filter_map(|row| {
-            let id = string(row[0]);
-            oid(&id).then(|| Commit {
-                id,
-                parents: string(row[1])
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect(),
-                short: string(row[2]),
-                author: string(row[3]),
-                date: string(row[4]),
-                subject: string(row[5]),
-            })
-        })
-        .collect()
+#[cfg(test)]
+struct HistorySample {
+    info: History,
+    commits: Vec<Commit>,
+}
+
+#[cfg(test)]
+fn history(root: &Path, scope: &HistoryScope, limit: usize) -> Result<HistorySample> {
+    let (info, source) = history_snapshot(root, scope)?;
+    let mut commits = Vec::new();
+    if let Some(mut reader) = source.open(0)? {
+        for _ in 0..limit {
+            let Some(commit) = reader.next_commit()? else {
+                break;
+            };
+            commits.push(commit);
+        }
+    }
+    Ok(HistorySample { info, commits })
 }
 
 pub fn status(root: &Path) -> Result<Status> {
@@ -1042,29 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn history_page_only_reports_truncation_if_more_records_exist() {
-        let commit = Commit {
-            id: String::new(),
-            parents: Vec::new(),
-            short: String::new(),
-            author: String::new(),
-            date: String::new(),
-            subject: String::new(),
-        };
-        let mut history = History {
-            commits: vec![commit.clone(); MAX_HISTORY - 1],
-            ..History::default()
-        };
-        assert_eq!(history.page(), HistoryPage::Complete);
-        history.has_more = true;
-        assert_eq!(history.page(), HistoryPage::More);
-        history.commits.push(commit);
-        assert_eq!(history.page(), HistoryPage::Truncated);
-        history.has_more = false;
-        assert_eq!(history.page(), HistoryPage::Complete);
-    }
-
-    #[test]
     fn discovers_gitlinks_and_checks_for_a_local_submodule_worktree() -> Result<()> {
         let sandbox = tempfile::tempdir()?;
         let parent = sandbox.path().join("parent");
@@ -1276,6 +1279,7 @@ mod tests {
             ("gone", "origin/old", TrackingState::Gone),
         ] {
             let reference = snapshot
+                .info
                 .refs
                 .iter()
                 .find(|reference| reference.name == format!("refs/heads/{name}"))
@@ -1337,16 +1341,20 @@ mod tests {
             "v1",
         ])?;
         assert_eq!(worktrees(&root)?.len(), 2);
-        assert_eq!(history(&linked, &HistoryScope::All, PAGE)?.branch, "review");
+        assert_eq!(
+            history(&linked, &HistoryScope::All, PAGE)?.info.branch,
+            "review"
+        );
 
         let history = history(&root, &HistoryScope::All, PAGE)?;
         assert_eq!(history.commits.len(), 4);
         let merge = &history.commits[0];
-        assert_eq!(history.head.as_ref(), Some(&merge.id));
+        assert_eq!(history.info.head.as_ref(), Some(&merge.id));
         assert_eq!(merge.parents.len(), 2);
         let base = history.commits.last().expect("root commit");
         assert!(
             history
+                .info
                 .refs
                 .iter()
                 .any(|reference| reference.label() == "v1" && reference.target == base.id)

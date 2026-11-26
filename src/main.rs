@@ -7,6 +7,7 @@ mod app;
 mod diff;
 mod git;
 mod graph;
+mod history;
 mod settings;
 mod tasks;
 mod theme;

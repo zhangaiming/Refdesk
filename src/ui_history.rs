@@ -1,6 +1,7 @@
 use crate::app::{Desk, Selection};
-use crate::git::{Commit, History, HistoryPage, HistoryScope, Reference};
+use crate::git::{Commit, History, HistoryScope, PAGE, Reference};
 use crate::graph::{GraphRow, Span};
+use crate::history::{SearchDirection, matches_search};
 use crate::theme;
 use crate::ui::{
     CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, paint_baseline,
@@ -10,10 +11,11 @@ use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, 
 
 const SUBJECT_SIZE: f32 = 14.0;
 const GRAPH_INSET: f32 = 9.0;
+const HISTORY_PREFETCH_DISTANCE: f32 = 12.0 * ROW;
 
 enum Click {
     Worktree,
-    Commit(Commit, bool),
+    Commit(usize, Commit, bool),
 }
 
 impl Desk {
@@ -22,8 +24,6 @@ impl Desk {
         let id = ui.make_persistent_id("find-commit");
         let shortcut =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
-        let history = self.state().and_then(|state| state.history.as_ref());
-        let count = history.map_or(0, |history| history.commits.len());
         let working = self.state().map(|state| state.changes().len());
         let scope = self
             .state()
@@ -112,6 +112,15 @@ impl Desk {
         if clear_filter {
             self.filter(ctx, HistoryScope::Head);
         }
+        let query = self.search.trim().to_lowercase();
+        let direction = if previous {
+            Some(SearchDirection::Previous)
+        } else if next {
+            Some(SearchDirection::Next)
+        } else {
+            None
+        };
+        self.request_history_search(ctx, &query, direction);
         ui.add_space(5.0);
         if let Some(error) = self.state().and_then(|state| state.history_error.as_ref()) {
             ui.colored_label(colors.removed.foreground, error);
@@ -122,66 +131,18 @@ impl Desk {
             });
             return;
         };
-        let query = self.search.trim().to_lowercase();
-        // Keep commit positions stable while searching, so edges still point to their parents.
-        let hits = state
-            .history
-            .as_ref()
-            .map(|history| {
-                history
-                    .commits
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, commit)| {
-                        (!query.is_empty() && matches_search(commit, history, &query))
-                            .then_some(index)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut search_row = self.search_row;
-        let mut scroll_to = self.scroll_to;
-
-        if head {
-            scroll_to = state.history.as_ref().and_then(|history| {
-                history
-                    .head
-                    .as_ref()
-                    .and_then(|head| history.commits.iter().position(|commit| &commit.id == head))
-            });
-        } else if !hits.is_empty() && (next || previous) {
-            let current = search_row.and_then(|index| hits.iter().position(|hit| *hit == index));
-            let next = if previous {
-                current.map_or(hits.len() - 1, |index| {
-                    (index + hits.len() - 1) % hits.len()
-                })
-            } else {
-                current.map_or(0, |index| (index + 1) % hits.len())
-            };
-            search_row = Some(hits[next]);
-            scroll_to = search_row;
-        }
+        let history = state.history.as_ref();
+        let summary = history.map_or_else(Default::default, |history| history.summary);
+        let lanes = summary.lanes;
+        let head_index = summary.head_row;
+        let scroll_to = if head { head_index } else { self.scroll_to };
         let width = ui.available_width() - ui.spacing().scroll.allocated_width();
-        let graph_width = graph_width(width, state.graph.lanes);
+        let graph_width = graph_width(width, lanes);
         table_header(ui, width, graph_width);
         let baseline_offset = centered_baseline(ui.painter(), FontId::proportional(SUBJECT_SIZE));
-        let page = state
-            .history
-            .as_ref()
-            .map_or(HistoryPage::Complete, History::page);
-        let rows = state
-            .history
-            .as_ref()
-            .map_or(0, |history| history.commits.len());
-        let head_index = state.history.as_ref().and_then(|history| {
-            history
-                .head
-                .as_ref()
-                .and_then(|head| history.commits.iter().position(|commit| &commit.id == head))
-        });
+        let rows = summary.loaded;
         let mut click = None;
-        let mut more = false;
-        ui.scope(|ui| {
+        let scroll = ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt(("commit-list", self.graph_reset))
@@ -191,9 +152,17 @@ impl Desk {
                 scroll = scroll.vertical_scroll_offset(index as f32 * ROW);
             }
             scroll.show_rows(ui, ROW, rows + 1, |ui, visible| {
+                let mut missing_label = false;
                 for index in visible {
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(width, ROW), Sense::click());
+                    let cached = index.checked_sub(1).and_then(|row| history?.row(row));
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(width, ROW),
+                        if index == 0 || cached.is_some() {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        },
+                    );
                     if index == 0 {
                         let selected = matches!(self.selection, Selection::Worktree);
                         row_fill(ui, rect, selected, &response, false);
@@ -249,49 +218,59 @@ impl Desk {
                         }
                         continue;
                     }
-                    let Some(history) = state.history.as_ref() else {
+                    let Some((cached, history)) = cached.zip(history) else {
+                        if !missing_label && rect.intersects(ui.clip_rect()) {
+                            let label = if state.history_error.is_some() && !state.history_busy {
+                                "历史页不可用"
+                            } else {
+                                "读取历史…"
+                            };
+                            ui.painter().text(
+                                rect.left_center() + Vec2::new(graph_width + 4.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                FontId::proportional(DETAIL_SIZE),
+                                colors.muted,
+                            );
+                            missing_label = true;
+                        }
                         continue;
                     };
-                    let commit = &history.commits[index - 1];
+                    let history = &history.cache.info;
+                    let commit = &cached.commit;
+                    let graph = &cached.graph;
                     let selected = match &self.selection {
-                        Selection::Commit { right, left } => {
+                        Selection::Commit { right, left, .. } => {
                             commit.id == right.id
                                 || left.as_ref().is_some_and(|left| commit.id == left.id)
                         }
                         Selection::Worktree => false,
                     };
-                    let matched = hits.binary_search(&(index - 1)).is_ok();
+                    let matched = !query.is_empty() && matches_search(commit, history, &query);
                     row_fill(ui, rect, selected, &response, matched);
-                    if let Some(graph) = state.graph.rows.get(index - 1) {
-                        if let Some(head) = head_index
-                            && index <= head + 1
-                        {
-                            let x = rect.left() + GRAPH_INSET;
-                            let end = if index == head + 1 {
-                                pos2(
-                                    lane_x(rect, graph_width, state.graph.lanes, graph.lane),
-                                    rect.center().y,
-                                )
-                            } else {
-                                pos2(x, rect.bottom())
-                            };
-                            worktree_link(ui, pos2(x, rect.top()), end);
-                        }
-                        draw_rails(
-                            ui,
-                            rect,
-                            graph_width,
-                            state.graph.lanes,
-                            graph,
-                            commit.parents.len() > 1,
-                            history.head.as_ref() == Some(&commit.id),
-                        );
+                    if let Some(head) = head_index
+                        && index <= head + 1
+                    {
+                        let x = rect.left() + GRAPH_INSET;
+                        let end = if index == head + 1 {
+                            pos2(
+                                lane_x(rect, graph_width, lanes, graph.lane),
+                                rect.center().y,
+                            )
+                        } else {
+                            pos2(x, rect.bottom())
+                        };
+                        worktree_link(ui, pos2(x, rect.top()), end);
                     }
-                    let lane_color = state
-                        .graph
-                        .rows
-                        .get(index - 1)
-                        .map(|row| colors.lane(row.color));
+                    draw_rails(
+                        ui,
+                        rect,
+                        graph_width,
+                        lanes,
+                        graph,
+                        commit.parents.len() > 1,
+                        history.head.as_ref() == Some(&commit.id),
+                    );
                     draw_commit(
                         ui,
                         rect,
@@ -299,10 +278,11 @@ impl Desk {
                         history,
                         commit,
                         !query.is_empty() && !matched && !selected,
-                        lane_color,
+                        Some(colors.lane(graph.color)),
                     );
                     if response.clicked() {
                         click = Some(Click::Commit(
+                            index - 1,
                             commit.clone(),
                             ctx.input(|input| input.modifiers.command),
                         ));
@@ -313,13 +293,13 @@ impl Desk {
                             ui.close_menu();
                         }
                         if ui.button("打开提交详情").clicked() {
-                            click = Some(Click::Commit(commit.clone(), false));
+                            click = Some(Click::Commit(index - 1, commit.clone(), false));
                             ui.close_menu();
                         }
                         if matches!(self.selection, Selection::Commit { .. })
                             && ui.button("与选中提交比较").clicked()
                         {
-                            click = Some(Click::Commit(commit.clone(), true));
+                            click = Some(Click::Commit(index - 1, commit.clone(), true));
                             ui.close_menu();
                         }
                     });
@@ -358,61 +338,55 @@ impl Desk {
                         );
                     });
                 }
-            });
+            })
         });
+        let scroll = scroll.inner;
+        let bottom = scroll.state.offset.y + scroll.inner_rect.height();
+        let remaining = scroll.content_size.y - bottom;
+        let first = ((scroll.state.offset.y / ROW).floor() as usize).saturating_sub(1);
+        let last = ((bottom / ROW).ceil() as usize)
+            .saturating_sub(1)
+            .max(first);
+        let pages = (first / PAGE).saturating_sub(1)..(last / PAGE + 2);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if query.is_empty() {
-                    format!("{count} 条提交")
+                    format!("{rows} 条提交")
                 } else {
-                    format!("{} / {count} 条匹配", hits.len())
+                    match self.history_search_result() {
+                        Some(Ok(count)) => format!("{count} / {rows} 条匹配"),
+                        Some(Err(error)) => format!("搜索失败：{error}"),
+                        None if rows == 0 => "0 / 0 条匹配".into(),
+                        None => "搜索中…".into(),
+                    }
                 })
                 .color(colors.muted)
                 .small(),
             );
-            if let Some(history) = state.history.as_ref() {
+            if history.is_some() {
                 ui.label(
-                    RichText::new(format!("· {} ms", history.elapsed_ms))
+                    RichText::new(format!("· {} ms", summary.elapsed_ms))
                         .color(colors.subtle)
                         .small(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match page {
-                    HistoryPage::Truncated => {
-                        ui.label(RichText::new("已达显示上限").small().color(colors.muted));
-                    }
-                    HistoryPage::More if !busy => {
-                        more = small_button(ui, "加载更多").clicked();
-                    }
-                    _ => {}
-                }
                 if let Selection::Commit { left: Some(_), .. } = self.selection {
                     ui.label(RichText::new("两提交比较").small().color(colors.accent));
                 }
             });
         });
-        self.search_row = search_row;
         self.scroll_to = None;
-        if more {
-            self.more(ctx);
-        }
+        self.request_history_window(ctx, pages, remaining <= HISTORY_PREFETCH_DISTANCE);
         match click {
             Some(Click::Worktree) => self.choose_worktree(),
-            Some(Click::Commit(commit, extend)) => self.choose_commit(ctx, commit, extend),
+            Some(Click::Commit(row, commit, extend)) => {
+                self.choose_commit(ctx, row, commit, extend)
+            }
             None => {}
         }
     }
-}
-
-fn matches_search(commit: &Commit, history: &History, needle: &str) -> bool {
-    commit.subject.to_lowercase().contains(needle)
-        || commit.author.to_lowercase().contains(needle)
-        || commit.id.contains(needle)
-        || history.refs.iter().any(|reference| {
-            reference.target == commit.id && reference.label().to_lowercase().contains(needle)
-        })
 }
 
 fn graph_width(width: f32, lanes: usize) -> f32 {

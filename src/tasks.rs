@@ -7,6 +7,7 @@ type Task = Box<dyn FnOnce() + Send>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReadKind {
     History,
+    HistorySearch,
     Status,
     Details,
     Diff,

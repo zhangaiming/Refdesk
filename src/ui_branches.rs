@@ -446,7 +446,7 @@ impl Desk {
         let count = self
             .state()
             .and_then(|state| state.history.as_ref())
-            .map(|history| history.refs.len());
+            .map(|history| history.cache.info.refs.len());
         let mut new = false;
         let mut action = None;
         ui.horizontal(|ui| {
@@ -475,6 +475,7 @@ impl Desk {
         if let Some(state) = self.state()
             && let Some(history) = &state.history
         {
+            let history = &history.cache.info;
             let needle = self.branch_query.trim().to_lowercase();
             let selection = state.filter.checks();
             let groups = build_groups(&history.refs, &history.branch, &needle, &selection);

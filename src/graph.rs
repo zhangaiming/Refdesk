@@ -1,13 +1,14 @@
 use crate::git::Commit;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Span {
     Top,
     Middle,
     Bottom,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Rail {
     pub from: usize,
     pub to: usize,
@@ -16,106 +17,122 @@ pub struct Rail {
     pub color: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GraphRow {
     pub lane: usize,
     pub color: usize,
     pub rails: Vec<Rail>,
 }
 
-#[derive(Default)]
+#[cfg(test)]
 pub struct Graph {
     pub rows: Vec<GraphRow>,
     pub lanes: usize,
 }
 
 #[derive(Clone)]
-struct Pending<'a> {
-    id: &'a str,
+struct Pending {
+    id: String,
     color: usize,
 }
 
+#[cfg(test)]
 impl Graph {
     pub fn build(commits: &[Commit]) -> Self {
-        let mut graph = Self::default();
-        let mut pending: Vec<Option<Pending<'_>>> = Vec::new();
-        let mut color = 0;
-        let mut next_color = || {
-            let value = color;
-            color += 1;
-            value
-        };
-
-        for commit in commits {
-            let incoming = pending.clone();
-            let existing = occupied_by(&pending, &commit.id);
-            let lane = existing.unwrap_or_else(|| free_lane(&pending, 0));
-            let dot_color = existing
-                .and_then(|index| pending[index].take())
-                .map_or_else(&mut next_color, |entry| entry.color);
-
-            let mut rails = Vec::new();
-            for (index, entry) in incoming.iter().enumerate() {
-                if let Some(entry) = entry {
-                    rails.push(Rail {
-                        from: index,
-                        to: index,
-                        start: Span::Top,
-                        end: if index == lane {
-                            Span::Middle
-                        } else {
-                            Span::Bottom
-                        },
-                        color: entry.color,
-                    });
-                }
-            }
-            for (index, parent) in commit.parents.iter().enumerate() {
-                let to = occupied_by(&pending, parent).unwrap_or_else(|| {
-                    let to = if index == 0 {
-                        lane
-                    } else {
-                        free_lane(&pending, lane + 1)
-                    };
-                    let rail_color = if index == 0 { dot_color } else { next_color() };
-                    if pending.len() <= to {
-                        pending.resize(to + 1, None);
-                    }
-                    pending[to] = Some(Pending {
-                        id: parent,
-                        color: rail_color,
-                    });
-                    to
-                });
-                rails.push(Rail {
-                    from: lane,
-                    to,
-                    start: Span::Middle,
-                    end: Span::Bottom,
-                    color: pending[to].as_ref().expect("allocated lane").color,
-                });
-            }
-            while pending.last().is_some_and(Option::is_none) {
-                pending.pop();
-            }
-            graph.lanes = graph.lanes.max(lane + 1).max(pending.len());
-            graph.rows.push(GraphRow {
-                lane,
-                color: dot_color,
-                rails,
-            });
+        let mut builder = GraphBuilder::default();
+        let rows = commits.iter().map(|commit| builder.push(commit)).collect();
+        Self {
+            rows,
+            lanes: builder.lanes,
         }
-        graph
     }
 }
 
-fn occupied_by(slots: &[Option<Pending<'_>>], id: &str) -> Option<usize> {
+#[derive(Clone, Default)]
+pub struct GraphBuilder {
+    pending: Vec<Option<Pending>>,
+    color: usize,
+    pub lanes: usize,
+}
+
+impl GraphBuilder {
+    pub fn push(&mut self, commit: &Commit) -> GraphRow {
+        let existing = occupied_by(&self.pending, &commit.id);
+        let lane = existing.unwrap_or_else(|| free_lane(&self.pending, 0));
+        let mut rails = Vec::new();
+        for (index, entry) in self.pending.iter().enumerate() {
+            if let Some(entry) = entry {
+                rails.push(Rail {
+                    from: index,
+                    to: index,
+                    start: Span::Top,
+                    end: if index == lane {
+                        Span::Middle
+                    } else {
+                        Span::Bottom
+                    },
+                    color: entry.color,
+                });
+            }
+        }
+
+        let dot_color = existing
+            .and_then(|index| self.pending[index].take())
+            .map_or_else(|| self.next_color(), |entry| entry.color);
+        for (index, parent) in commit.parents.iter().enumerate() {
+            let to = occupied_by(&self.pending, parent).unwrap_or_else(|| {
+                let to = if index == 0 {
+                    lane
+                } else {
+                    free_lane(&self.pending, lane + 1)
+                };
+                let color = if index == 0 {
+                    dot_color
+                } else {
+                    self.next_color()
+                };
+                if self.pending.len() <= to {
+                    self.pending.resize(to + 1, None);
+                }
+                self.pending[to] = Some(Pending {
+                    id: parent.clone(),
+                    color,
+                });
+                to
+            });
+            rails.push(Rail {
+                from: lane,
+                to,
+                start: Span::Middle,
+                end: Span::Bottom,
+                color: self.pending[to].as_ref().expect("allocated lane").color,
+            });
+        }
+        while self.pending.last().is_some_and(Option::is_none) {
+            self.pending.pop();
+        }
+        self.lanes = self.lanes.max(lane + 1).max(self.pending.len());
+        GraphRow {
+            lane,
+            color: dot_color,
+            rails,
+        }
+    }
+
+    fn next_color(&mut self) -> usize {
+        let color = self.color;
+        self.color += 1;
+        color
+    }
+}
+
+fn occupied_by(slots: &[Option<Pending>], id: &str) -> Option<usize> {
     slots
         .iter()
         .position(|entry| entry.as_ref().is_some_and(|entry| entry.id == id))
 }
 
-fn free_lane(slots: &[Option<Pending<'_>>], start: usize) -> usize {
+fn free_lane(slots: &[Option<Pending>], start: usize) -> usize {
     (start..slots.len())
         .find(|&index| slots[index].is_none())
         .or_else(|| (0..start.min(slots.len())).find(|&index| slots[index].is_none()))
