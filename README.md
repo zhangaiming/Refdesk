@@ -26,6 +26,8 @@ Refdesk 是 Windows 上的 Rust Git 桌面客户端。左边放仓库和分支�
 
 Windows 桌面版默认在 `%LOCALAPPDATA%\Refdesk\logs` 写入 INFO 级别日志。日志记录启动与退出、仓库激活、提交图和状态就绪、Git 操作及差异失败。文件名包含启动时间、进程 ID 和 UTC 日期，按日滚动，自动清理超过七天的已关闭日志。
 
+分支筛选的 INFO 日志包含等待新图的耗时、最大绘制间隔和缺页帧数。DEBUG 日志可以按请求号查看分页新增了多少条提交、从磁盘读回了多少页，以及搜索匹配数。
+
 启动前可设置 `REFDESK_LOG_DIR` 指定日志目录，或设置 `REFDESK_LOG_LEVEL=DEBUG` 记录后台请求和缓存细节。支持 `TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR`、`OFF`。未设置或值无效时使用 INFO。日志只保存在本机，工作树用会话内的匿名编号表示。
 
 ## 构建和验证

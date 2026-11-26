@@ -572,6 +572,11 @@ impl Desk {
     }
 
     fn deactivate_history(&mut self, path: &Path) {
+        if self.active.as_deref() == Some(path)
+            && let Some(presentation) = &mut self.presentation
+        {
+            presentation.deactivate();
+        }
         self.tasks.cancel(path, Some(ReadKind::HistorySearch));
         if let Some(history) = self
             .repos
@@ -591,7 +596,7 @@ impl Desk {
         path: &Path,
         source: &'static str,
         check_superproject: bool,
-        checked_refs: Option<usize>,
+        filter_log: Option<(&'static str, usize)>,
     ) {
         let active = self.active.as_deref() == Some(path);
         if active {
@@ -599,8 +604,17 @@ impl Desk {
             self.search_row = None;
         }
         let request = self.next();
-        if active && let Some(timings) = &mut self.timings {
-            timings.change_history_scope(path, request, checked_refs);
+        if active && let Some(presentation) = &mut self.presentation {
+            let previous =
+                presentation.change_history_filter(request, filter_log, self.timings.is_some());
+            if let Some(timings) = &mut self.timings {
+                if let Some(previous) = previous {
+                    timings.history_filter_finished("history-filter-superseded", path, previous);
+                }
+                if let Some((_, checked_refs)) = filter_log {
+                    timings.history_filter_requested(path, request, checked_refs);
+                }
+            }
         }
         let state = self
             .repos
@@ -658,7 +672,9 @@ impl Desk {
                         source,
                         active,
                         commits = summary.loaded,
+                        page_size = git::PAGE,
                         pages = pages.len(),
+                        has_more = summary.has_more,
                         "history_built"
                     );
                     Ok(Some(HistoryView {
@@ -733,16 +749,16 @@ impl Desk {
             return;
         }
         state.filter = filter.clone();
-        let checked_refs = match &filter {
-            HistoryScope::Head => 1,
-            HistoryScope::All => 0,
-            HistoryScope::Selected(refs) => refs.len(),
+        let filter_log = match &filter {
+            HistoryScope::Head => ("head", 1),
+            HistoryScope::All => ("all", 0),
+            HistoryScope::Selected(refs) => ("selected", refs.len()),
         };
         self.settings.branch_selection.insert(path.clone(), filter);
         state.history_viewport = 0..2;
         self.graph_reset += 1;
         self.search_row = None;
-        self.queue_history(ctx, &path, "filter", false, Some(checked_refs));
+        self.queue_history(ctx, &path, "filter", false, Some(filter_log));
         self.save();
     }
 
@@ -788,6 +804,11 @@ impl Desk {
             Work::Latest(ReadKind::History, &path, request),
             move || {
                 let started = Instant::now();
+                let source = if extend { "more" } else { "cache_window" };
+                let loaded_before = summary.loaded;
+                let retained_pages = pages.len();
+                let page_start = range.start;
+                let page_end = range.end;
                 let result = (|| {
                     let summary = if extend {
                         cache.load_through(summary.page_count() + 1, &canceled)?
@@ -798,9 +819,15 @@ impl Desk {
                     tracing::debug!(
                         worktree = log.worktree,
                         request,
-                        source = if extend { "more" } else { "cache_window" },
+                        generation,
+                        source,
+                        page_start,
+                        page_end,
                         commits = summary.loaded,
+                        commits_added = summary.loaded.saturating_sub(loaded_before),
                         pages = pages.len(),
+                        cache_pages_read = pages.len().saturating_sub(retained_pages),
+                        has_more = summary.has_more,
                         "history_window_loaded"
                     );
                     Ok(Some(HistoryView {
@@ -815,6 +842,15 @@ impl Desk {
                 } else if canceled.load(Ordering::Relaxed) {
                     "canceled"
                 } else {
+                    tracing::debug!(
+                        worktree = log.worktree,
+                        request,
+                        generation,
+                        source,
+                        page_start,
+                        page_end,
+                        "history_window_failed"
+                    );
                     "failed"
                 };
                 log.complete(started, outcome);
@@ -881,16 +917,37 @@ impl Desk {
             Work::Latest(ReadKind::HistorySearch, &path, request),
             move || {
                 let started = Instant::now();
-                let result = readable(cache.search(&query, loaded, anchor, direction, &canceled));
-                let outcome = if result.is_ok() {
-                    "ok"
-                } else if canceled.load(Ordering::Relaxed) {
-                    "canceled"
-                } else {
-                    "failed"
+                let result = cache.search(&query, loaded, anchor, direction, &canceled);
+                let outcome = match &result {
+                    Ok(found) => {
+                        tracing::debug!(
+                            worktree = log.worktree,
+                            request,
+                            generation,
+                            commits = loaded,
+                            matches = found.count,
+                            located = found.target.is_some(),
+                            "history_search_finished"
+                        );
+                        "ok"
+                    }
+                    Err(_) if canceled.load(Ordering::Relaxed) => "canceled",
+                    Err(error) => {
+                        let (error_kind, exit_code) = git::error_kind(error);
+                        tracing::warn!(
+                            kind = "history_search",
+                            worktree = log.worktree,
+                            request,
+                            generation,
+                            error_kind,
+                            exit_code,
+                            "read_failed"
+                        );
+                        "failed"
+                    }
                 };
                 log.complete(started, outcome);
-                Event::HistorySearch(log.worktree, request, result)
+                Event::HistorySearch(log.worktree, request, readable(result))
             },
         );
     }
@@ -1236,6 +1293,11 @@ impl Desk {
                         }
                         Err(error) => {
                             logging::read_failed("history", &path, request, &error);
+                            if self.active.as_ref() == Some(&path)
+                                && let Some(presentation) = &mut self.presentation
+                            {
+                                presentation.history_filter_failed(request);
+                            }
                             state.history_error = Some(format!("{error:#}"));
                             state.history_failed_window = pending;
                         }
@@ -1473,8 +1535,11 @@ impl Desk {
     }
 
     pub fn report_history_frame(&mut self, generation: Option<u64>, rows: usize, missing: bool) {
-        if let (Some(timings), Some(path)) = (&mut self.timings, &self.active) {
-            timings.history_frame(path, generation, rows, missing);
+        if let Some(presentation) = &mut self.presentation
+            && let Some(sample) = presentation.history_frame(generation, rows, missing)
+            && let (Some(timings), Some(path)) = (&mut self.timings, &self.active)
+        {
+            timings.history_filter_finished("history-filter-ready", path, sample);
         }
     }
 

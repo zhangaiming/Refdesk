@@ -193,6 +193,28 @@ pub(crate) struct Presentation {
     started: Instant,
     graph: bool,
     status: bool,
+    history_filter: Option<HistoryFilterTiming>,
+    drawn_history: Option<u64>,
+}
+
+struct HistoryFilterTiming {
+    request: u64,
+    started: Instant,
+    last_frame: Instant,
+    frames: u32,
+    max_gap: Duration,
+    missing_frames: u32,
+    intermediate_graphs: u32,
+}
+
+pub(crate) struct HistoryFilterSample {
+    pub request: u64,
+    pub elapsed_ms: u64,
+    pub commits: usize,
+    pub frames: u32,
+    pub max_gap_ms: u64,
+    pub missing_frames: u32,
+    pub intermediate_graphs: u32,
 }
 
 impl Presentation {
@@ -217,6 +239,8 @@ impl Presentation {
             started: Instant::now(),
             graph: false,
             status: false,
+            history_filter: None,
+            drawn_history: None,
         }
     }
 
@@ -245,6 +269,103 @@ impl Presentation {
                 "status_ready"
             );
         }
+    }
+
+    pub fn change_history_filter(
+        &mut self,
+        request: u64,
+        scope: Option<(&'static str, usize)>,
+        record_timings: bool,
+    ) -> Option<HistoryFilterSample> {
+        let previous = self.finish_history_filter("superseded", 0);
+        if let Some((mode, checked_refs)) = scope
+            && (record_timings || tracing::enabled!(tracing::Level::INFO))
+        {
+            let started = Instant::now();
+            self.history_filter = Some(HistoryFilterTiming {
+                request,
+                started,
+                last_frame: started,
+                frames: 0,
+                max_gap: Duration::ZERO,
+                missing_frames: 0,
+                intermediate_graphs: 0,
+            });
+            tracing::debug!(
+                worktree = self.worktree,
+                request,
+                mode,
+                checked_refs,
+                "history_filter_requested"
+            );
+        }
+        previous
+    }
+
+    pub fn history_frame(
+        &mut self,
+        generation: Option<u64>,
+        commits: usize,
+        missing: bool,
+    ) -> Option<HistoryFilterSample> {
+        let previous = std::mem::replace(&mut self.drawn_history, generation);
+        let pending = self.history_filter.as_mut()?;
+        let now = Instant::now();
+        pending.max_gap = pending.max_gap.max(now.duration_since(pending.last_frame));
+        pending.last_frame = now;
+        pending.frames += 1;
+        pending.missing_frames += u32::from(generation.is_none() || missing);
+        if generation == Some(pending.request) && !missing {
+            return self.finish_history_filter("ready", commits);
+        }
+        if generation.is_some() && generation != previous && generation != Some(pending.request) {
+            pending.intermediate_graphs += 1;
+        }
+        None
+    }
+
+    pub fn history_filter_failed(&mut self, request: u64) {
+        if self
+            .history_filter
+            .as_ref()
+            .is_some_and(|pending| pending.request == request)
+        {
+            self.finish_history_filter("failed", 0);
+        }
+    }
+
+    pub fn deactivate(&mut self) {
+        self.finish_history_filter("deactivated", 0);
+    }
+
+    fn finish_history_filter(
+        &mut self,
+        outcome: &'static str,
+        commits: usize,
+    ) -> Option<HistoryFilterSample> {
+        let pending = self.history_filter.take()?;
+        let sample = HistoryFilterSample {
+            request: pending.request,
+            elapsed_ms: millis(pending.started.elapsed()),
+            commits,
+            frames: pending.frames,
+            max_gap_ms: millis(pending.max_gap),
+            missing_frames: pending.missing_frames,
+            intermediate_graphs: pending.intermediate_graphs,
+        };
+        tracing::info!(
+            worktree = self.worktree,
+            request = sample.request,
+            outcome,
+            elapsed_ms = sample.elapsed_ms,
+            commits,
+            frames = sample.frames,
+            max_gap_ms = sample.max_gap_ms,
+            missing_frames = sample.missing_frames,
+            intermediate_graphs = sample.intermediate_graphs,
+            "history_filter_finished"
+        );
+        Some(sample)
     }
 }
 
@@ -330,6 +451,7 @@ fn remove_closed_log(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek};
 
     #[test]
     fn log_level_defaults_to_info() {
@@ -337,6 +459,67 @@ mod tests {
         assert_eq!(parse_level(Some("missing")), LevelFilter::INFO);
         assert_eq!(parse_level(Some(" debug ")), LevelFilter::DEBUG);
         assert_eq!(parse_level(Some("OFF")), LevelFilter::OFF);
+    }
+
+    #[test]
+    fn history_filter_logs_one_anonymized_result_per_request() -> Result<()> {
+        let mut output = tempfile::tempfile()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.try_clone()?)
+            .finish();
+        let path = Path::new("C:/test/private-worktree");
+        tracing::subscriber::with_default(subscriber, || {
+            let mut view = Presentation::activate(path, 1, false, false);
+            assert!(view.history_frame(Some(7), 32, false).is_none());
+            assert!(
+                view.change_history_filter(8, Some(("selected", 2)), false)
+                    .is_none()
+            );
+            assert!(view.history_frame(Some(7), 32, false).is_none());
+            assert!(view.history_frame(Some(6), 32, false).is_none());
+            assert!(view.history_frame(Some(6), 32, true).is_none());
+            let replaced = view
+                .change_history_filter(9, Some(("head", 1)), false)
+                .unwrap();
+            assert_eq!(
+                (
+                    replaced.request,
+                    replaced.frames,
+                    replaced.missing_frames,
+                    replaced.intermediate_graphs
+                ),
+                (8, 3, 1, 1)
+            );
+            view.history_filter_failed(8);
+            let ready = view.history_frame(Some(9), 32, false).unwrap();
+            assert_eq!((ready.request, ready.commits), (9, 32));
+            assert!(view.history_frame(Some(9), 32, false).is_none());
+            view.change_history_filter(10, Some(("selected", 2)), false);
+            view.history_filter_failed(10);
+            assert!(view.history_frame(Some(10), 32, false).is_none());
+        });
+
+        output.rewind()?;
+        let mut contents = String::new();
+        output.read_to_string(&mut contents)?;
+        let results: Vec<_> = contents
+            .lines()
+            .filter(|line| line.contains("history_filter_finished"))
+            .collect();
+        assert_eq!(results.len(), 3);
+        for (line, (id, outcome)) in
+            results
+                .iter()
+                .zip([(8, "superseded"), (9, "ready"), (10, "failed")])
+        {
+            assert!(line.contains(&format!("worktree={} request={id}", worktree_id(path))));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+        }
+        assert!(!contents.contains("private-worktree"));
+        Ok(())
     }
 
     #[test]
