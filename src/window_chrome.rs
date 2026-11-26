@@ -1,4 +1,4 @@
-use crate::theme::ThemeId;
+use crate::theme::{Palette, Theme};
 use crate::ui::{ToolbarRegions, WindowButtons};
 use eframe::egui::{Color32, Context, Rect};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -46,7 +46,7 @@ struct FrameState {
     regions: Cell<HitRegions>,
     maximize_hovered: Cell<bool>,
     maximize_pressed: Cell<bool>,
-    theme: Cell<ThemeId>,
+    palette: Cell<Palette>,
     context: Context,
 }
 
@@ -75,7 +75,7 @@ pub(crate) struct WindowChrome {
 }
 
 impl WindowChrome {
-    pub(crate) fn install(creation: &eframe::CreationContext<'_>, theme: ThemeId) -> Option<Self> {
+    pub(crate) fn install(creation: &eframe::CreationContext<'_>, theme: &Theme) -> Option<Self> {
         let RawWindowHandle::Win32(handle) = creation.window_handle().ok()?.as_raw() else {
             return None;
         };
@@ -85,7 +85,7 @@ impl WindowChrome {
             regions: Cell::default(),
             maximize_hovered: Cell::new(false),
             maximize_pressed: Cell::new(false),
-            theme: Cell::new(theme),
+            palette: Cell::new(theme.palette),
             context: creation.egui_ctx.clone(),
         });
 
@@ -125,14 +125,14 @@ impl WindowChrome {
         }
     }
 
-    pub(crate) fn apply_theme(&self, theme: ThemeId) {
-        self.state.theme.set(theme);
+    pub(crate) fn apply_theme(&self, theme: &Theme) {
+        self.state.palette.set(theme.palette);
         set_attribute(
             self.hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-            u32::from(theme.is_dark()),
+            u32::from(theme.mode == eframe::egui::Theme::Dark),
         );
-        set_border(self.hwnd, theme, unsafe {
+        set_border(self.hwnd, theme.palette, unsafe {
             GetForegroundWindow() == self.hwnd
         });
     }
@@ -208,7 +208,7 @@ unsafe extern "system" fn window_proc(
                 min_size.y = (min_size.y - standard_top_inset(hwnd)).max(1);
                 return result;
             }
-            WM_NCACTIVATE => set_border(hwnd, state.theme.get(), wparam != 0),
+            WM_NCACTIVATE => set_border(hwnd, state.palette.get(), wparam != 0),
             WM_DPICHANGED | WM_SIZE => {
                 state.regions.set(HitRegions::default());
                 state.set_maximize_hovered(false);
@@ -353,8 +353,7 @@ fn standard_top_inset(hwnd: HWND) -> i32 {
     -frame.top
 }
 
-fn set_border(hwnd: HWND, theme: ThemeId, active: bool) {
-    let palette = theme.palette();
+fn set_border(hwnd: HWND, palette: Palette, active: bool) {
     let color = if active {
         palette.window_active_border
     } else {

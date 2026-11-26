@@ -1,0 +1,46 @@
+{
+  "name": "浅灰蓝",
+  "mode": "light",
+  "palette": {
+    "base": "#FFFFFF",
+    "panel": "#F8F8F8",
+    "chrome": "#F0F0F0",
+    "control": "#E9E9E9",
+    "hover": "#E8EFF5",
+    "selection": "#CCE6FF",
+    "border": "#C6C6C6",
+    "divider": "#E4E4E4",
+    "accent": "#225D93",
+    "text": "#222222",
+    "muted": "#50545A",
+    "subtle": "#5B6066",
+    "warning": "#7A4D12",
+    "splitter_hover": "#7794AF",
+    "tree_guide": "#B3BBC2",
+    "window_active_border": "#9CABB9",
+    "close_hover": "#C42B1C",
+    "close_pressed": "#AA2318",
+    "added": {
+      "foreground": "#26633B",
+      "background": "#E8F4E8",
+      "border": "#6D9C78"
+    },
+    "removed": {
+      "foreground": "#972F35",
+      "background": "#FFEDED",
+      "border": "#C8787C"
+    },
+    "close_foreground": "#FFFFFF",
+    "shadow": 42,
+    "lanes": [
+      "#34373B",
+      "#28638F",
+      "#934E25",
+      "#71519B",
+      "#7C5D18",
+      "#236E76",
+      "#9B3E63",
+      "#526727"
+    ]
+  }
+}

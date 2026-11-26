@@ -6,6 +6,7 @@ use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
 use crate::logging::{self, Presentation, ReadLog};
 use crate::settings::{self, Settings, Tool};
 use crate::tasks::{ReadKind, Scheduler};
+use crate::theme::{self, Theme};
 use crate::timing::{FrameCapture, Timings};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -118,6 +119,8 @@ pub(crate) struct Desk {
     #[cfg(windows)]
     pub window_chrome: Option<crate::window_chrome::WindowChrome>,
     pub settings: Settings,
+    pub themes: Vec<Theme>,
+    pub active_theme: usize,
     pub active: Option<PathBuf>,
     pub repos: HashMap<PathBuf, Repository>,
     restore_active: Option<PathBuf>,
@@ -241,12 +244,24 @@ impl Desk {
             elapsed_ms = logging::millis(restoring.elapsed()),
             "session_restored"
         );
+        let themes_path = settings::themes_path();
+        if let Err(error) = theme::install_examples(&themes_path) {
+            warning.get_or_insert_with(|| format!("写入示例主题失败：{error}"));
+        }
         let status_is_error = warning.is_some();
-        settings.theme.apply(ctx);
+        let themes = Theme::load(&themes_path);
+        let active_theme = themes
+            .iter()
+            .position(|theme| theme.id.eq_ignore_ascii_case(&settings.theme))
+            .unwrap_or_default();
+        let theme = &themes[active_theme];
+        theme.apply(ctx);
         let mut desk = Self {
             #[cfg(windows)]
-            window_chrome: crate::window_chrome::WindowChrome::install(creation, settings.theme),
+            window_chrome: crate::window_chrome::WindowChrome::install(creation, theme),
             settings,
+            themes,
+            active_theme,
             active: None,
             repos: HashMap::new(),
             restore_active,

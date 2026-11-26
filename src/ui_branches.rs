@@ -315,7 +315,7 @@ fn branch_line(
                     (format!("−{behind}"), colors.warning),
                 ]
             }
-            state => vec![(state.caption(), tracking_color(state, colors))],
+            state => vec![(state.caption(), tracking_color(state, &colors))],
         };
         counts = status
             .into_iter()

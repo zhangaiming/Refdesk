@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::{diff, git, theme::ThemeId};
+use crate::{diff, git, theme::DEFAULT_THEME_ID};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolMode {
@@ -71,7 +71,7 @@ pub struct Settings {
     pub changes_only: bool,
     pub prefetch_history: bool,
     pub branch_selection: BTreeMap<PathBuf, git::HistoryScope>,
-    pub theme: ThemeId,
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -83,7 +83,7 @@ impl Default for Settings {
             changes_only: false,
             prefetch_history: true,
             branch_selection: BTreeMap::new(),
-            theme: ThemeId::default(),
+            theme: DEFAULT_THEME_ID.into(),
         }
     }
 }
@@ -96,6 +96,10 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("Refdesk")
         .join("settings.json")
+}
+
+pub(crate) fn themes_path() -> PathBuf {
+    config_path().with_file_name("themes")
 }
 
 impl Settings {
@@ -432,9 +436,9 @@ mod tests {
     fn old_and_unknown_theme_settings_keep_the_rest_of_the_session() {
         let old = r#"{"repositories":["repo"], "active":"repo", "changes_only":true}"#;
         let unknown = r#"{"repositories":["repo"], "active":"repo", "changes_only":true, "theme":"future-preset"}"#;
-        for config in [old, unknown] {
+        for (config, id) in [(old, DEFAULT_THEME_ID), (unknown, "future-preset")] {
             let settings: Settings = serde_json::from_str(config).unwrap();
-            assert_eq!(settings.theme, ThemeId::WarmDark);
+            assert_eq!(settings.theme, id);
             assert_eq!(settings.repositories, [PathBuf::from("repo")]);
             assert_eq!(settings.active, Some(PathBuf::from("repo")));
             assert!(settings.changes_only);
@@ -443,24 +447,22 @@ mod tests {
 
     #[test]
     fn every_theme_round_trips_with_its_stable_id() {
-        for (theme, id) in [
-            (ThemeId::WarmDark, "warm-dark"),
-            (ThemeId::CoolDark, "cool-dark"),
-            (ThemeId::CoolLight, "cool-light"),
-            (ThemeId::WarmLight, "warm-light"),
-            (ThemeId::NeutralLight, "neutral-light"),
-            (ThemeId::NeutralDark, "neutral-dark"),
+        for id in [
+            "warm-dark",
+            "cool-dark",
+            "cool-light",
+            "warm-light",
+            "neutral-light",
+            "neutral-dark",
+            "custom-theme",
         ] {
             let settings = Settings {
-                theme,
+                theme: id.into(),
                 ..Default::default()
             };
             let json = serde_json::to_value(&settings).unwrap();
             assert_eq!(json["theme"], id);
-            assert_eq!(
-                serde_json::from_value::<Settings>(json).unwrap().theme,
-                theme
-            );
+            assert_eq!(serde_json::from_value::<Settings>(json).unwrap().theme, id);
         }
     }
 

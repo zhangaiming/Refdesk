@@ -1,6 +1,6 @@
 use crate::app::{Desk, Dialog};
 use crate::git::Operation;
-use crate::theme::{self, ThemeId};
+use crate::theme::{self, Theme};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Galley, Layout, Margin, Painter, Rect, RichText,
     Sense, Stroke, UiBuilder, Vec2, emath::GuiRounding, pos2, text::LayoutJob,
@@ -223,28 +223,52 @@ fn title_button(text: &str) -> egui::Button<'_> {
     compact_button(text).min_size(Vec2::new(25.0, TITLE_BUTTON_HEIGHT))
 }
 
-fn appearance_menu(ui: &mut egui::Ui, current: ThemeId) -> egui::InnerResponse<Option<ThemeId>> {
+enum AppearanceAction {
+    Select(usize),
+    #[cfg(windows)]
+    OpenDirectory,
+}
+
+fn appearance_menu(
+    ui: &mut egui::Ui,
+    themes: &[Theme],
+    current: usize,
+) -> egui::InnerResponse<Option<AppearanceAction>> {
     let menu = egui::menu::menu_custom_button(ui, title_button("外观"), |ui| {
         let colors = theme::palette(ui.ctx());
         ui.set_min_width(106.0);
-        let mut selected = current;
-        for (index, (label, themes)) in ThemeId::GROUPS.into_iter().enumerate() {
-            if index > 0 {
-                ui.separator();
-            }
-            ui.label(RichText::new(label).small().color(colors.muted));
-            for theme in themes {
-                if ui
-                    .selectable_value(&mut selected, theme, theme.label())
-                    .clicked()
+        let selected = egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                let mut selected = None;
+                for (mode, label) in [(egui::Theme::Light, "亮色"), (egui::Theme::Dark, "暗色")]
                 {
-                    ui.close_menu();
+                    if mode == egui::Theme::Dark {
+                        ui.separator();
+                    }
+                    ui.label(RichText::new(label).small().color(colors.muted));
+                    for (index, theme) in themes.iter().enumerate().filter(|(_, t)| t.mode == mode)
+                    {
+                        if ui.selectable_label(index == current, &theme.name).clicked() {
+                            selected = Some(index);
+                            ui.close_menu();
+                        }
+                    }
                 }
+                selected
+            })
+            .inner;
+        #[cfg(windows)]
+        {
+            ui.separator();
+            if ui.button("自定义主题...").clicked() {
+                ui.close_menu();
+                return Some(AppearanceAction::OpenDirectory);
             }
         }
-        selected
+        selected.map(AppearanceAction::Select)
     });
-    egui::InnerResponse::new(menu.inner.filter(|theme| *theme != current), menu.response)
+    egui::InnerResponse::new(menu.inner.flatten(), menu.response)
 }
 
 fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused: bool) -> Rect {
@@ -570,14 +594,25 @@ impl eframe::App for Desk {
             .add(separators);
         self.dialogs(ctx);
         self.report_frame(ctx);
-        if let Some(theme) = next_theme {
-            self.settings.theme = theme;
-            theme.apply(ctx);
-            #[cfg(windows)]
-            if let Some(chrome) = &self.window_chrome {
-                chrome.apply_theme(theme);
+        match next_theme {
+            Some(AppearanceAction::Select(index)) => {
+                self.active_theme = index;
+                let theme = &self.themes[index];
+                self.settings.theme.clone_from(&theme.id);
+                theme.apply(ctx);
+                #[cfg(windows)]
+                if let Some(chrome) = &self.window_chrome {
+                    chrome.apply_theme(theme);
+                }
+                self.save();
             }
-            self.save();
+            #[cfg(windows)]
+            Some(AppearanceAction::OpenDirectory) => {
+                if let Err(error) = theme::open_directory(&crate::settings::themes_path()) {
+                    self.tell(format!("无法打开自定义主题目录：{error}"), true);
+                }
+            }
+            None => {}
         }
     }
 }
@@ -589,7 +624,7 @@ impl Desk {
         ctx: &egui::Context,
         height: f32,
         caption: Option<WindowButtons>,
-    ) -> (ToolbarRegions, Option<ThemeId>) {
+    ) -> (ToolbarRegions, Option<AppearanceAction>) {
         let colors = theme::palette(ctx);
         let active = self.active.clone();
         let can_run = active
@@ -653,7 +688,7 @@ impl Desk {
         if diff_tools.clicked() {
             self.tools_open = true;
         }
-        let appearance = appearance_menu(&mut tools, self.settings.theme);
+        let appearance = appearance_menu(&mut tools, &self.themes, self.active_theme);
         let tools_bounds = diff_tools.rect.union(appearance.response.rect);
         let caption_area = Rect::from_min_max(pos2(caption_x, row.top()), row.max);
         let maximize =

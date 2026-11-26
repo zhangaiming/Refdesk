@@ -1,0 +1,46 @@
+{
+  "name": "炭灰紫",
+  "mode": "dark",
+  "palette": {
+    "base": "#282828",
+    "panel": "#2C2C2C",
+    "chrome": "#343332",
+    "control": "#3C3B3A",
+    "hover": "#404048",
+    "selection": "#414A78",
+    "border": "#585756",
+    "divider": "#373737",
+    "accent": "#CDD3FF",
+    "text": "#EDEDEC",
+    "muted": "#CBCACE",
+    "subtle": "#C0BFC6",
+    "warning": "#EAC18E",
+    "splitter_hover": "#77799C",
+    "tree_guide": "#56565C",
+    "window_active_border": "#797789",
+    "close_hover": "#C42B1C",
+    "close_pressed": "#AA2318",
+    "added": {
+      "foreground": "#ACD6AA",
+      "background": "#303E34",
+      "border": "#729B78"
+    },
+    "removed": {
+      "foreground": "#F4B1AB",
+      "background": "#432F2E",
+      "border": "#B76E69"
+    },
+    "close_foreground": "#FFFFFF",
+    "shadow": 104,
+    "lanes": [
+      "#D6D6D7",
+      "#9FBDF0",
+      "#ECB583",
+      "#CDB1EF",
+      "#E6CC80",
+      "#8CCDD3",
+      "#EDA0B5",
+      "#B8CE86"
+    ]
+  }
+}

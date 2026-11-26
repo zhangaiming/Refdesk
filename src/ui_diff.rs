@@ -203,7 +203,7 @@ impl Desk {
                                             ui,
                                             left,
                                             line.old.as_ref(),
-                                            colors,
+                                            &colors,
                                             match line.kind {
                                                 Kind::Remove | Kind::Replace => {
                                                     Some((colors.removed, '−'))
@@ -215,7 +215,7 @@ impl Desk {
                                             ui,
                                             right,
                                             line.new.as_ref(),
-                                            colors,
+                                            &colors,
                                             match line.kind {
                                                 Kind::Add | Kind::Replace => {
                                                     Some((colors.added, '+'))

@@ -61,6 +61,7 @@
 - [x] 在 banshu/common 比较 `battle_presentation_duration.xlsx` 的提交差异，逐套检查旧值和新值的填充、边框、文字和定位框。截图复核后降低了亮色下表单占位提示的视觉权重，并重新截图。
 - [x] Windows GNU Release 构建、格式检查、严格 Clippy、24 项 Release 测试和 OpenSpec 严格校验通过。会话测试覆盖四个 ID 往返及缺失、未知 ID 的兼容回退。
 - [x] 在 Windows GNU Release 的隔离样例仓库核对浅灰蓝和炭灰紫的菜单分组与即时切换，验证文本和 Excel 差异保留。实测浅灰蓝重启恢复，以及启动器按会话打开炭灰紫。Windows 150% 缩放下检查 930×610 和 1480×850 逻辑点的对应视口。格式检查、严格 Clippy、34 项 Release 测试和 7 项 OpenSpec 严格校验通过。
+- [x] 在隔离的 Windows Release 会话验证首次写入两份主题 JSON、用户编辑后重启重读、删除后回退且不补写。在「外观」确认四套内置与两份外部示例的分组，并从「自定义主题...」打开对应的资源管理器目录。格式检查、严格 Clippy、37 项 Release 测试和 7 项 OpenSpec 严格校验通过。
 
 ## 窗格接缝与分支分组
 

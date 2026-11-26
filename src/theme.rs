@@ -1,103 +1,240 @@
 use eframe::egui::{self, Color32, Stroke};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, de};
+use std::{fs, io, path::Path};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum ThemeId {
-    CoolDark,
-    CoolLight,
-    WarmLight,
-    NeutralLight,
-    NeutralDark,
-    #[default]
-    #[serde(other)]
-    WarmDark,
+pub(crate) const DEFAULT_THEME_ID: &str = "warm-dark";
+const EXAMPLES: [(&str, &str); 2] = [
+    (
+        "neutral-light.json",
+        include_str!("../assets/themes/neutral-light.json"),
+    ),
+    (
+        "neutral-dark.json",
+        include_str!("../assets/themes/neutral-dark.json"),
+    ),
+];
+
+pub(crate) fn install_examples(directory: &Path) -> io::Result<()> {
+    use io::{ErrorKind, Write};
+
+    let marker = directory.with_file_name(".theme-examples-installed");
+    if marker.try_exists()? {
+        return Ok(());
+    }
+    fs::create_dir_all(directory)?;
+    for (name, contents) in EXAMPLES {
+        let path = directory.join(name);
+        if path.try_exists()? {
+            continue;
+        }
+
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(contents.as_bytes())?;
+        match file.persist_noclobber(path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+    }
+    match fs::File::create_new(marker) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
-impl ThemeId {
-    pub(crate) const GROUPS: [(&'static str, [Self; 3]); 2] = [
-        (
-            "亮色",
-            [Self::CoolLight, Self::WarmLight, Self::NeutralLight],
-        ),
-        ("暗色", [Self::WarmDark, Self::CoolDark, Self::NeutralDark]),
-    ];
+#[cfg(windows)]
+pub(crate) fn open_directory(directory: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::WarmDark => "暖灰绿",
-            Self::CoolDark => "深蓝灰",
-            Self::CoolLight => "冷白蓝",
-            Self::WarmLight => "暖白棕",
-            Self::NeutralLight => "浅灰蓝",
-            Self::NeutralDark => "炭灰紫",
-        }
-    }
+    fs::create_dir_all(directory)?;
+    let absolute = std::path::absolute(directory)?;
+    let path: Vec<_> = absolute.as_os_str().encode_wide().chain([0]).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            null(),
+            path.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    anyhow::ensure!(result as isize > 32, "Windows 返回错误 {}", result as isize);
+    Ok(())
+}
 
-    pub(crate) fn is_dark(self) -> bool {
-        matches!(self, Self::WarmDark | Self::CoolDark | Self::NeutralDark)
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Theme {
+    #[serde(skip)]
+    pub id: String,
+    pub name: String,
+    #[serde(deserialize_with = "deserialize_mode")]
+    pub mode: egui::Theme,
+    pub palette: Palette,
+}
 
-    pub(crate) fn palette(self) -> &'static Palette {
-        match self {
-            Self::WarmDark => &WARM_DARK,
-            Self::CoolDark => &COOL_DARK,
-            Self::CoolLight => &COOL_LIGHT,
-            Self::WarmLight => &WARM_LIGHT,
-            Self::NeutralLight => &NEUTRAL_LIGHT,
-            Self::NeutralDark => &NEUTRAL_DARK,
-        }
-    }
+impl Theme {
+    pub(crate) fn load(directory: &Path) -> Vec<Self> {
+        use egui::Theme::{Dark, Light};
 
-    pub(crate) fn apply(self, ctx: &egui::Context) {
-        let mode = if self.is_dark() {
-            egui::Theme::Dark
-        } else {
-            egui::Theme::Light
+        let mut themes: Vec<_> = [
+            (DEFAULT_THEME_ID, "暖灰绿", Dark, WARM_DARK),
+            ("cool-dark", "深蓝灰", Dark, COOL_DARK),
+            ("cool-light", "冷白蓝", Light, COOL_LIGHT),
+            ("warm-light", "暖白棕", Light, WARM_LIGHT),
+        ]
+        .into_iter()
+        .map(|(id, name, mode, palette)| Self {
+            id: id.into(),
+            name: name.into(),
+            mode,
+            palette,
+        })
+        .collect();
+
+        let Ok(entries) = fs::read_dir(directory) else {
+            return themes;
         };
-        ctx.set_visuals_of(mode, self.palette().visuals(mode));
-        ctx.set_theme(mode);
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("workbench-theme"), self));
+        let mut files: Vec<_> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            })
+            .collect();
+        files.sort_unstable();
+
+        for path in files {
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let id = stem.to_ascii_lowercase();
+            if id.trim().is_empty() || themes.iter().any(|theme| theme.id == id) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+            let Ok(mut theme) = serde_json::from_slice::<Self>(bytes) else {
+                continue;
+            };
+            theme.name = theme.name.trim().to_owned();
+            if !theme.name.is_empty() {
+                theme.id = id;
+                themes.push(theme);
+            }
+        }
+        themes
+    }
+
+    pub(crate) fn apply(&self, ctx: &egui::Context) {
+        ctx.set_visuals_of(self.mode, self.palette.visuals(self.mode));
+        ctx.set_theme(self.mode);
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("workbench-theme"), self.palette));
         ctx.request_repaint();
     }
 }
 
-pub(crate) fn palette(ctx: &egui::Context) -> &'static Palette {
-    ctx.data(|data| data.get_temp::<ThemeId>(egui::Id::new("workbench-theme")))
-        .unwrap_or_default()
-        .palette()
+pub(crate) fn palette(ctx: &egui::Context) -> Palette {
+    ctx.data(|data| data.get_temp(egui::Id::new("workbench-theme")))
+        .unwrap_or(WARM_DARK)
 }
 
-#[derive(Clone, Copy)]
+fn deserialize_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<egui::Theme, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Mode {
+        Light,
+        Dark,
+    }
+
+    Ok(match Mode::deserialize(deserializer)? {
+        Mode::Light => egui::Theme::Light,
+        Mode::Dark => egui::Theme::Dark,
+    })
+}
+
+fn deserialize_color<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Color32, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    let hex = value
+        .strip_prefix('#')
+        .filter(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| de::Error::custom("expected a #RRGGBB color"))?;
+    u32::from_str_radix(hex, 16)
+        .map(rgb)
+        .map_err(de::Error::custom)
+}
+
+fn deserialize_lanes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[Color32; 8], D::Error> {
+    #[derive(Deserialize)]
+    struct HexColor(#[serde(deserialize_with = "deserialize_color")] Color32);
+
+    Ok(<[HexColor; 8]>::deserialize(deserializer)?.map(|color| color.0))
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChangeColors {
+    #[serde(deserialize_with = "deserialize_color")]
     pub foreground: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub background: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub border: Color32,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Palette {
+    #[serde(deserialize_with = "deserialize_color")]
     pub base: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub panel: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub chrome: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub control: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub hover: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub selection: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub border: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub divider: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub accent: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub text: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub muted: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub subtle: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub warning: Color32,
     pub added: ChangeColors,
     pub removed: ChangeColors,
+    #[serde(deserialize_with = "deserialize_color")]
     pub splitter_hover: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub tree_guide: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub window_active_border: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub close_hover: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub close_pressed: Color32,
+    #[serde(deserialize_with = "deserialize_color")]
     pub close_foreground: Color32,
     shadow: u8,
+    #[serde(deserialize_with = "deserialize_lanes")]
     lanes: [Color32; 8],
 }
 
@@ -343,88 +480,82 @@ const WARM_LIGHT: Palette = Palette {
     ],
 };
 
-const NEUTRAL_LIGHT: Palette = Palette {
-    base: rgb(0xFFFFFF),
-    panel: rgb(0xF8F8F8),
-    chrome: rgb(0xF0F0F0),
-    control: rgb(0xE9E9E9),
-    hover: rgb(0xE8EFF5),
-    selection: rgb(0xCCE6FF),
-    border: rgb(0xC6C6C6),
-    divider: rgb(0xE4E4E4),
-    accent: rgb(0x225D93),
-    text: rgb(0x222222),
-    muted: rgb(0x50545A),
-    subtle: rgb(0x5B6066),
-    warning: rgb(0x7A4D12),
-    added: ChangeColors {
-        foreground: rgb(0x26633B),
-        background: rgb(0xE8F4E8),
-        border: rgb(0x6D9C78),
-    },
-    removed: ChangeColors {
-        foreground: rgb(0x972F35),
-        background: rgb(0xFFEDED),
-        border: rgb(0xC8787C),
-    },
-    splitter_hover: rgb(0x7794AF),
-    tree_guide: rgb(0xB3BBC2),
-    window_active_border: rgb(0x9CABB9),
-    close_hover: rgb(0xC42B1C),
-    close_pressed: rgb(0xAA2318),
-    close_foreground: Color32::WHITE,
-    shadow: 42,
-    lanes: [
-        rgb(0x34373B),
-        rgb(0x28638F),
-        rgb(0x934E25),
-        rgb(0x71519B),
-        rgb(0x7C5D18),
-        rgb(0x236E76),
-        rgb(0x9B3E63),
-        rgb(0x526727),
-    ],
-};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-const NEUTRAL_DARK: Palette = Palette {
-    base: rgb(0x282828),
-    panel: rgb(0x2C2C2C),
-    chrome: rgb(0x343332),
-    control: rgb(0x3C3B3A),
-    hover: rgb(0x404048),
-    selection: rgb(0x414A78),
-    border: rgb(0x585756),
-    divider: rgb(0x373737),
-    accent: rgb(0xCDD3FF),
-    text: rgb(0xEDEDEC),
-    muted: rgb(0xCBCACE),
-    subtle: rgb(0xC0BFC6),
-    warning: rgb(0xEAC18E),
-    added: ChangeColors {
-        foreground: rgb(0xACD6AA),
-        background: rgb(0x303E34),
-        border: rgb(0x729B78),
-    },
-    removed: ChangeColors {
-        foreground: rgb(0xF4B1AB),
-        background: rgb(0x432F2E),
-        border: rgb(0xB76E69),
-    },
-    splitter_hover: rgb(0x77799C),
-    tree_guide: rgb(0x56565C),
-    window_active_border: rgb(0x797789),
-    close_hover: rgb(0xC42B1C),
-    close_pressed: rgb(0xAA2318),
-    close_foreground: Color32::WHITE,
-    shadow: 104,
-    lanes: [
-        rgb(0xD6D6D7),
-        rgb(0x9FBDF0),
-        rgb(0xECB583),
-        rgb(0xCDB1EF),
-        rgb(0xE6CC80),
-        rgb(0x8CCDD3),
-        rgb(0xEDA0B5),
-        rgb(0xB8CE86),
-    ],
-};
+    const LIGHT: &str = EXAMPLES[0].1;
+    const DARK: &str = EXAMPLES[1].1;
+
+    #[test]
+    fn installs_examples_once_and_preserves_existing_examples() {
+        let data = tempfile::tempdir().unwrap();
+        let directory = data.path().join("themes");
+        fs::create_dir(&directory).unwrap();
+        let light = directory.join(EXAMPLES[0].0);
+        let dark = directory.join(EXAMPLES[1].0);
+        let custom = LIGHT.replace("浅灰蓝", "我的浅色");
+        fs::write(&light, &custom).unwrap();
+
+        install_examples(&directory).unwrap();
+        assert_eq!(fs::read_to_string(&light).unwrap(), custom);
+        assert_eq!(fs::read_to_string(&dark).unwrap(), DARK);
+        fs::remove_file(&dark).unwrap();
+        fs::remove_file(&light).unwrap();
+        fs::remove_dir(&directory).unwrap();
+
+        install_examples(&directory).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn four_built_in_themes_work_without_a_theme_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let themes = Theme::load(&directory.path().join("missing"));
+        let ids: Vec<_> = themes.iter().map(|theme| theme.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [DEFAULT_THEME_ID, "cool-dark", "cool-light", "warm-light"]
+        );
+    }
+
+    #[test]
+    fn loads_valid_theme_files_and_skips_invalid_or_reserved_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for (file, json) in [
+            ("neutral-light.json", LIGHT),
+            ("我的主题.JSON", &format!("\u{feff}{DARK}")),
+            ("WARM-DARK.json", LIGHT),
+            ("broken.json", "{"),
+            ("bad-color.json", &LIGHT.replace("#FFFFFF", "#ZZZZZZ")),
+            (
+                "bad-lanes.json",
+                &LIGHT.replace("\"#526727\"", "\"#526727\", \"#FFFFFF\""),
+            ),
+            ("notes.txt", LIGHT),
+        ] {
+            fs::write(directory.path().join(file), json).unwrap();
+        }
+        let themes = Theme::load(directory.path());
+        assert_eq!(themes.len(), 6);
+        assert_eq!(themes[0].palette.base, WARM_DARK.base);
+        let light = themes
+            .iter()
+            .find(|theme| theme.id == "neutral-light")
+            .unwrap();
+        assert_eq!(light.name, "浅灰蓝");
+        assert_eq!(light.mode, egui::Theme::Light);
+        assert_eq!(light.palette.selection, rgb(0xCCE6FF));
+        let dark = themes.iter().find(|theme| theme.id == "我的主题").unwrap();
+        assert_eq!(dark.name, "炭灰紫");
+        assert_eq!(dark.mode, egui::Theme::Dark);
+        assert_eq!(dark.palette.lane(7), rgb(0xB8CE86));
+        let ctx = egui::Context::default();
+        dark.apply(&ctx);
+        assert_eq!(palette(&ctx).base, rgb(0x282828));
+        assert_eq!(
+            ctx.style_of(dark.mode).visuals.selection.bg_fill,
+            dark.palette.selection
+        );
+    }
+}
