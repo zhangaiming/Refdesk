@@ -5,7 +5,7 @@ use crate::diff::{self, Kind, Line, TextChanges, TextDocument};
 use crate::logging::ReadLog;
 use crate::syntax::{Role, Span};
 use crate::theme::{self, ChangeColors, Palette};
-use crate::ui::{compact_button, paint};
+use crate::ui::{Checkbox, compact_button, paint};
 use crate::ui_diff::{Panel, column_rect};
 use eframe::egui::{
     self, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2, text::LayoutJob,
@@ -167,10 +167,8 @@ impl TextView {
             {
                 jump = targets.1;
             }
-            let response = ui.add_enabled(
-                changes.is_some(),
-                egui::Checkbox::new(changes_only, "仅显示变更"),
-            );
+            let response =
+                ui.add_enabled(changes.is_some(), Checkbox::new(changes_only, "仅显示变更"));
             if response.changed() {
                 self.navigation = TextDiffNavigation::default();
                 self.scroll_version += 1;

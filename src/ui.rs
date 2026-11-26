@@ -146,6 +146,61 @@ pub(crate) fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(compact_button(text))
 }
 
+pub(crate) struct Checkbox<'a> {
+    checked: &'a mut bool,
+    label: egui::WidgetText,
+    indeterminate: bool,
+}
+
+impl<'a> Checkbox<'a> {
+    pub(crate) fn new(checked: &'a mut bool, label: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            checked,
+            label: label.into(),
+            indeterminate: false,
+        }
+    }
+
+    pub(crate) fn indeterminate(mut self, indeterminate: bool) -> Self {
+        self.indeterminate = indeterminate;
+        self
+    }
+}
+
+impl egui::Widget for Checkbox<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        ui.scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            // Suppress egui's mark while retaining its box, text color and checkbox behavior.
+            for visuals in [
+                &mut widgets.noninteractive,
+                &mut widgets.inactive,
+                &mut widgets.hovered,
+                &mut widgets.active,
+                &mut widgets.open,
+            ] {
+                visuals.fg_stroke.width = 0.0;
+            }
+            let response = ui.add(
+                egui::Checkbox::new(self.checked, self.label).indeterminate(self.indeterminate),
+            );
+            if ui.is_rect_visible(response.rect) && (self.indeterminate || *self.checked) {
+                let icon = if self.indeterminate {
+                    egui::include_image!("../assets/icons/branch-mixed.svg")
+                } else {
+                    egui::include_image!("../assets/icons/branch-checked.svg")
+                };
+                let (_, icon_rect) = ui.spacing().icon_rectangles(response.rect);
+                egui::Image::new(icon)
+                    .tint(ui.style().interact(&response).fg_stroke.color)
+                    .paint_at(ui, icon_rect);
+            }
+            response
+        })
+        .inner
+    }
+}
+
 pub(crate) fn load_save_icon(ctx: &egui::Context) -> egui::TextureHandle {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/save.png"))
         .expect("embedded save icon must be a valid PNG");
@@ -902,10 +957,10 @@ impl Desk {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("···", |ui| {
                     if ui
-                        .checkbox(
+                        .add(Checkbox::new(
                             &mut self.settings.prefetch_history,
                             "后台预读其他仓库的提交图",
-                        )
+                        ))
                         .on_hover_text(
                             "当前仓库优先。其他已登记仓库逐个预读日志，子模块在打开时加载。",
                         )
