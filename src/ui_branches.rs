@@ -7,7 +7,7 @@ use crate::ui::{
 };
 use eframe::egui::{
     self, Align, Color32, FontId, Galley, Layout, Painter, RichText, Sense, Stroke, Vec2,
-    collapsing_header::CollapsingState, pos2,
+    collapsing_header::CollapsingState, pos2, text::LayoutJob,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -152,15 +152,30 @@ impl BranchView<'_> {
                 self.action = Some(BranchAction::Filter(HistoryScope::Selected(selection)));
             }
             ui.add_space(BRANCH_INSET);
-            change_open = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(format!("{label}  {}", group.total)).size(BRANCH_NAME_SIZE),
-                    )
-                    .truncate()
-                    .sense(egui::Sense::click()),
-                )
-                .clicked();
+            let colors = theme::palette(ui.ctx());
+            let font = FontId::proportional(BRANCH_NAME_SIZE);
+            let directory = label.strip_suffix('/');
+            let mut title = LayoutJob::simple_singleline(
+                directory.unwrap_or(label).to_owned(),
+                font.clone(),
+                colors.text,
+            );
+            if directory.is_some() {
+                title.append("/", 0.0, egui::TextFormat::simple(font, colors.subtle));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(BRANCH_INSET);
+                ui.label(
+                    RichText::new(group.total.to_string())
+                        .size(BRANCH_NAME_SIZE)
+                        .color(colors.subtle),
+                );
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    change_open = ui
+                        .add(egui::Label::new(title).truncate().sense(Sense::click()))
+                        .clicked();
+                });
+            });
         });
         if self.searching {
             header.set_open(true);

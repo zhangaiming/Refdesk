@@ -3,7 +3,7 @@ use crate::git::Operation;
 use crate::theme::{self, ThemeId};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Galley, Layout, Margin, Painter, Rect, RichText,
-    Sense, Stroke, UiBuilder, Vec2, pos2, text::LayoutJob,
+    Sense, Stroke, UiBuilder, Vec2, emath::GuiRounding, pos2, text::LayoutJob,
 };
 use std::path::PathBuf;
 
@@ -347,11 +347,23 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
     maximize_rect
 }
 
-fn panel(fill: Color32, border: Color32, horizontal: i8, vertical: i8) -> Frame {
+fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
     Frame::new()
         .fill(fill)
         .inner_margin(Margin::symmetric(horizontal, vertical))
-        .stroke(Stroke::new(1.0_f32, border))
+}
+
+fn panel_separator_color(ctx: &egui::Context, panel_id: egui::Id) -> Color32 {
+    let colors = theme::palette(ctx);
+    // egui's SidePanel and TopBottomPanel use this ID for their resize handle.
+    if ctx
+        .read_response(panel_id.with("__resize"))
+        .is_some_and(|handle| handle.hovered() || handle.dragged())
+    {
+        colors.splitter_hover
+    } else {
+        colors.border
+    }
 }
 
 pub(crate) fn split_panel_height(
@@ -444,49 +456,117 @@ impl eframe::App for Desk {
         } else {
             TOOLBAR_HEIGHT
         };
-        let (toolbar, next_theme) = egui::TopBottomPanel::top("workbench")
+        let title = egui::TopBottomPanel::top("workbench")
             .exact_height(toolbar_height)
             .show_separator_line(false)
             .frame(Frame::new())
-            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption))
-            .inner;
+            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption));
+        let (toolbar, next_theme) = title.inner;
         #[cfg(windows)]
         if let Some(chrome) = &self.window_chrome {
             chrome.set_toolbar_regions(toolbar, ctx.pixels_per_point());
         }
         #[cfg(not(windows))]
         let _ = toolbar;
-        egui::TopBottomPanel::bottom("status")
-            .frame(panel(colors.chrome, colors.border, 12, 2))
+        let status = egui::TopBottomPanel::bottom("status")
+            .show_separator_line(false)
+            .frame(panel(colors.chrome, 13, 3))
             .show(ctx, |ui| self.status_line(ui));
-        egui::SidePanel::left("navigation")
-            .resizable(true)
-            .default_width(crate::timing::capture_sidebar().unwrap_or(221.0))
-            .width_range(184.0..=navigation_limit)
-            .frame(panel(colors.panel, colors.border, 11, 9))
-            .show(ctx, |ui| self.navigation(ui, ctx));
-        egui::TopBottomPanel::bottom("diff-view")
-            .resizable(true)
-            .default_height(diff_height)
-            .height_range(135.0..=(ctx.screen_rect().height() * 0.57).max(135.0))
-            .frame(panel(colors.panel, colors.border, 11, 8))
+
+        let navigation_id = egui::Id::new("navigation");
+        let diff_id = egui::Id::new("diff-view");
+        let inspector_id = egui::Id::new("commit-and-files");
+        let (navigation, diff, inspector) = egui::CentralPanel::default()
+            .frame(Frame::NONE)
             .show(ctx, |ui| {
-                ui.set_min_height(ui.available_height());
-                self.diff_panel(ui, ctx);
-            });
-        egui::SidePanel::right("commit-and-files")
-            .resizable(true)
-            .default_width(inspector_width)
-            .width_range(220.0..=inspector_limit)
-            .frame(panel(colors.panel, colors.border, 11, 9))
-            .show(ctx, |ui| self.inspector(ui, ctx));
-        egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(colors.base)
-                    .inner_margin(Margin::symmetric(11, 9)),
-            )
-            .show(ctx, |ui| self.history_panel(ui, ctx));
+                let content_style = ui.style().clone();
+                // egui draws its own hover and drag strokes even with separators disabled.
+                let widgets = &mut ui.visuals_mut().widgets;
+                widgets.hovered.fg_stroke = Stroke::NONE;
+                widgets.active.fg_stroke = Stroke::NONE;
+
+                let navigation = egui::SidePanel::left(navigation_id)
+                    .show_separator_line(false)
+                    .default_width(crate::timing::capture_sidebar().unwrap_or(221.0))
+                    .width_range(184.0..=navigation_limit)
+                    .frame(panel(colors.panel, 12, 10))
+                    .show_inside(ui, |ui| {
+                        ui.set_style(content_style.clone());
+                        self.navigation(ui, ctx);
+                    });
+                let diff = egui::TopBottomPanel::bottom(diff_id)
+                    .resizable(true)
+                    .show_separator_line(false)
+                    .default_height(diff_height)
+                    .height_range(135.0..=(viewport.y * 0.57).max(135.0))
+                    .frame(panel(colors.panel, 12, 9))
+                    .show_inside(ui, |ui| {
+                        ui.set_style(content_style.clone());
+                        ui.set_min_height(ui.available_height());
+                        self.diff_panel(ui, ctx);
+                    });
+                let inspector = egui::SidePanel::right(inspector_id)
+                    .show_separator_line(false)
+                    .default_width(inspector_width)
+                    .width_range(220.0..=inspector_limit)
+                    .frame(panel(colors.panel, 12, 10))
+                    .show_inside(ui, |ui| {
+                        ui.set_style(content_style.clone());
+                        self.inspector(ui, ctx);
+                    });
+                ui.set_style(content_style);
+                egui::CentralPanel::default()
+                    .frame(panel(colors.base, 11, 9))
+                    .show_inside(ui, |ui| self.history_panel(ui, ctx));
+                (
+                    navigation.response.rect,
+                    diff.response.rect,
+                    inspector.response.rect,
+                )
+            })
+            .inner;
+
+        let scale = ctx.pixels_per_point();
+        let pixel = 1.0 / scale;
+        let title = title.response.rect.round_to_pixels(scale);
+        let status = status.response.rect.round_to_pixels(scale);
+        let navigation = navigation.round_to_pixels(scale);
+        let diff = diff.round_to_pixels(scale);
+        let inspector = inspector.round_to_pixels(scale);
+        // A mesh keeps one-pixel rectangles sharp, including where the edges meet.
+        let mut separators = egui::Mesh::default();
+        for (rect, color) in [
+            (
+                Rect::from_min_max(
+                    pos2(title.left(), title.bottom() - pixel),
+                    title.right_bottom(),
+                ),
+                colors.border,
+            ),
+            (
+                Rect::from_min_size(status.min, Vec2::new(status.width(), pixel)),
+                colors.border,
+            ),
+            (
+                Rect::from_min_max(
+                    pos2(navigation.right() - pixel, title.bottom()),
+                    pos2(navigation.right(), status.top()),
+                ),
+                panel_separator_color(ctx, navigation_id),
+            ),
+            (
+                Rect::from_min_size(diff.min, Vec2::new(diff.width(), pixel)),
+                panel_separator_color(ctx, diff_id),
+            ),
+            (
+                Rect::from_min_max(inspector.min, pos2(inspector.left() + pixel, diff.top())),
+                panel_separator_color(ctx, inspector_id),
+            ),
+        ] {
+            separators.add_colored_rect(rect, color);
+        }
+        ctx.layer_painter(egui::LayerId::background())
+            .add(separators);
         self.dialogs(ctx);
         self.report_frame(ctx);
         if let Some(theme) = next_theme {
@@ -577,11 +657,6 @@ impl Desk {
         let caption_area = Rect::from_min_max(pos2(caption_x, row.top()), row.max);
         let maximize =
             caption.map(|buttons| window_buttons(ui, caption_area, buttons, self.focused));
-        ui.painter().hline(
-            row.x_range(),
-            row.bottom() - 0.5,
-            Stroke::new(1.0_f32, colors.border),
-        );
         if let (Some(root), Some((title, operation))) = (active, action) {
             match operation {
                 Operation::Fetch => self.operate(ctx, root, operation),
