@@ -2,9 +2,14 @@ use crate::app::{Desk, Selection};
 use crate::git::{Area, Operation};
 use crate::ui::{
     ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, SELECTION, SHADE, heading, paint,
+    panel_divider, split_panel_height,
 };
-use eframe::egui::{self, Align, FontId, Layout, RichText, Sense, Vec2};
+use eframe::egui::{self, Align, FontId, Layout, RichText, Sense, UiBuilder, Vec2};
 use std::path::Path;
+
+const COMMIT_PANEL_MIN_HEIGHT: f32 = 144.0;
+const COMMIT_PANEL_MAX_HEIGHT: f32 = 320.0;
+const FILES_PANEL_MIN_HEIGHT: f32 = 132.0;
 
 impl Desk {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -20,81 +25,107 @@ impl Desk {
                 .filter(|file| file.area == Area::Staged)
                 .count()
         });
+        let splitter_id = ui.id().with("commit-files-splitter");
+        let default_height = (ui.available_height() * 0.43).min(215.0);
+        let height = split_panel_height(
+            ui,
+            splitter_id,
+            default_height,
+            (COMMIT_PANEL_MIN_HEIGHT..=COMMIT_PANEL_MAX_HEIGHT).into(),
+            FILES_PANEL_MIN_HEIGHT,
+        );
+        let (_, section) = ui.allocate_space(Vec2::new(ui.available_width(), height));
         let mut commit = false;
-        let height = (ui.available_height() * 0.43).clamp(104.0, 215.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                ui.set_min_height(height);
+        {
+            let mut commit_panel = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("commit-section")
+                    .max_rect(section)
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            commit_panel.set_clip_rect(ui.clip_rect().intersect(section));
+            let ui = &mut commit_panel;
+            ui.horizontal(|ui| {
+                heading(ui, if worktree { "提交" } else { "提交详情" }, None);
+                if self.details_busy {
+                    ui.spinner();
+                }
+            });
+            ui.add_space(4.0);
+            if worktree {
+                let footer_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+                let editor_height = (ui.available_height() - footer_height).max(0.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("commit-message")
+                    .max_height(editor_height)
+                    .min_scrolled_height(editor_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Keep the editor frame inside the scroll viewport in every state.
+                        let widgets = &mut ui.visuals_mut().widgets;
+                        widgets.hovered.expansion = 0.0;
+                        widgets.active.expansion = 0.0;
+                        ui.add_enabled(
+                            active.is_some(),
+                            egui::TextEdit::multiline(&mut self.editor)
+                                .hint_text("写下本次提交的说明…")
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY)
+                                .min_size(Vec2::new(0.0, editor_height)),
+                        );
+                    });
                 ui.horizontal(|ui| {
-                    heading(ui, if worktree { "提交" } else { "提交详情" }, None);
-                    if self.details_busy {
-                        ui.spinner();
-                    }
-                });
-                ui.add_space(4.0);
-                if worktree {
-                    ui.add_enabled(
-                        active.is_some(),
-                        egui::TextEdit::multiline(&mut self.editor)
-                            .hint_text("写下本次提交的说明…")
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
+                    ui.label(
+                        RichText::new(format!("{staged} 项已暂存"))
+                            .small()
+                            .color(MUTE),
                     );
-                    ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        commit = ui
+                            .add_enabled(
+                                staged > 0 && !self.editor.trim().is_empty() && !busy,
+                                egui::Button::new(RichText::new("提交").color(ACCENT).strong()),
+                            )
+                            .clicked();
+                    });
+                });
+            } else if let Some(details) = &self.details {
+                egui::ScrollArea::vertical()
+                    .id_salt("commit-detail")
+                    .max_height(ui.available_height().max(0.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&details.title).size(14.0).strong().color(INK));
                         ui.label(
-                            RichText::new(format!("{staged} 项已暂存"))
-                                .small()
+                            RichText::new(format!("{} · {}", details.author, details.date))
+                                .size(11.0)
                                 .color(MUTE),
                         );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            commit = ui
-                                .add_enabled(
-                                    staged > 0 && !self.editor.trim().is_empty() && !busy,
-                                    egui::Button::new(RichText::new("提交").color(ACCENT).strong()),
-                                )
-                                .clicked();
-                        });
-                    });
-                } else if let Some(details) = &self.details {
-                    let body_height = (height - 42.0).max(45.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("commit-detail")
-                        .max_height(body_height)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(&details.title).size(14.0).strong().color(INK));
-                            ui.label(
-                                RichText::new(format!("{} · {}", details.author, details.date))
-                                    .size(11.0)
-                                    .color(MUTE),
-                            );
-                            let (summary, rest) = details
-                                .message
-                                .split_once('\n')
-                                .unwrap_or((&details.message, ""));
-                            if details.title != summary {
-                                ui.label(RichText::new(summary).small().color(MUTE));
-                            }
-                            if !rest.trim().is_empty() {
-                                ui.label(RichText::new(rest.trim()).size(12.0).color(MUTE));
-                            }
-                            if let Selection::Commit { right, .. } = &self.selection {
-                                ui.label(
-                                    RichText::new(&right.short).monospace().small().color(FAINT),
-                                )
+                        let (summary, rest) = details
+                            .message
+                            .split_once('\n')
+                            .unwrap_or((&details.message, ""));
+                        if details.title != summary {
+                            ui.label(RichText::new(summary).small().color(MUTE));
+                        }
+                        if !rest.trim().is_empty() {
+                            ui.label(RichText::new(rest.trim()).size(12.0).color(MUTE));
+                        }
+                        if let Selection::Commit { right, .. } = &self.selection {
+                            ui.label(RichText::new(&right.short).monospace().small().color(FAINT))
                                 .on_hover_text(&right.id);
-                            }
-                        });
-                } else if let Some(error) = &self.details_error {
-                    ui.colored_label(RED, error);
-                }
-            },
-        );
+                        }
+                    });
+            } else if let Some(error) = &self.details_error {
+                egui::ScrollArea::vertical()
+                    .id_salt("commit-error")
+                    .max_height(ui.available_height().max(0.0))
+                    .show(ui, |ui| ui.colored_label(RED, error));
+            }
+        }
         if commit && let Some(root) = active {
             self.operate(ctx, root, Operation::Commit(self.editor.trim().to_owned()));
         }
-        ui.separator();
+        panel_divider(ui, splitter_id);
         self.files(ui, ctx);
     }
 

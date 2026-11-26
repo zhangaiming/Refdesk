@@ -28,6 +28,8 @@ const TOOLBAR_HEIGHT: f32 = 40.0;
 const TITLE_HEIGHT: f32 = 34.0;
 const TITLE_BUTTON_HEIGHT: f32 = 24.0;
 const WINDOW_BUTTON_WIDTH: f32 = 46.0;
+const SPLITTER_HEIGHT: f32 = 8.0;
+const SPLITTER_HIGHLIGHT: Color32 = Color32::from_rgb(84, 81, 75);
 
 pub(crate) struct WindowButtons {
     pub maximized: bool,
@@ -309,6 +311,49 @@ fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
         .stroke(Stroke::new(1.0_f32, BORDER))
 }
 
+pub(crate) fn split_panel_height(
+    ui: &egui::Ui,
+    splitter_id: egui::Id,
+    default_height: f32,
+    upper_bounds: egui::Rangef,
+    lower_min: f32,
+) -> f32 {
+    let gap = ui.spacing().item_spacing.y;
+    let maximum = (ui.available_height() - lower_min - 2.0 * gap - SPLITTER_HEIGHT)
+        .clamp(0.0, upper_bounds.max);
+    let minimum = upper_bounds.min.min(maximum);
+    // Read the interaction before laying out the list, as egui's panels do.
+    let button = egui::PointerButton::Primary;
+    if let Some(resize) = ui.ctx().read_response(splitter_id)
+        && (resize.dragged_by(button) || resize.drag_stopped_by(button))
+        && let Some(pointer) = resize.interact_pointer_pos()
+    {
+        let height = pointer.y - ui.next_widget_position().y - gap - SPLITTER_HEIGHT / 2.0;
+        ui.data_mut(|data| data.insert_temp(splitter_id, height.clamp(minimum, maximum)));
+    }
+    ui.data(|data| data.get_temp::<f32>(splitter_id))
+        .unwrap_or(default_height)
+        .clamp(minimum, maximum)
+}
+
+pub(crate) fn panel_divider(ui: &mut egui::Ui, splitter_id: egui::Id) -> egui::Response {
+    let (_, divider) = ui.allocate_space(Vec2::new(ui.available_width(), SPLITTER_HEIGHT));
+    let splitter = ui
+        .interact(divider, splitter_id, Sense::drag())
+        .on_hover_and_drag_cursor(egui::CursorIcon::ResizeVertical);
+    let line = if splitter.hovered() || splitter.dragged() {
+        SPLITTER_HIGHLIGHT
+    } else {
+        BORDER
+    };
+    ui.painter().hline(
+        divider.x_range(),
+        divider.center().y,
+        Stroke::new(1.0_f32, line),
+    );
+    splitter
+}
+
 pub(crate) fn heading(ui: &mut egui::Ui, name: &str, count: Option<usize>) {
     ui.label(RichText::new(name).size(15.0).strong().color(INK));
     if let Some(count) = count {
@@ -546,21 +591,24 @@ impl Desk {
 
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         const REPO_ROW_HEIGHT: f32 = 23.0;
+        const MIN_REPO_ROWS: usize = 4;
+        const MAX_DEFAULT_REPO_ROWS: usize = 6;
+        const MIN_BRANCH_HEIGHT: f32 = 180.0;
         const REPO_ICON_SIZE: f32 = 16.0;
         const REPO_INDENT: f32 = 14.0;
         const MAX_REPO_DEPTH: usize = 4;
         let mut select = None;
         let mut forget = None;
         let repositories = self.repository_rows();
-        let repo_limit = (ui.available_height() * 0.40).clamp(84.0, 290.0);
-        let repo_h = if repositories.is_empty() {
-            42.0
-        } else {
-            let gaps = repositories.len() - 1;
-            (repositories.len() as f32 * REPO_ROW_HEIGHT
-                + gaps as f32 * ui.spacing().item_spacing.y)
-                .min(repo_limit)
-        };
+        let gap = ui.spacing().item_spacing.y;
+        let row_stride = REPO_ROW_HEIGHT + gap;
+        let half_row = REPO_ROW_HEIGHT / 2.0;
+        let fit_rows = ((ui.available_height() * 0.40 - half_row) / row_stride).floor() as usize;
+        let default_limit =
+            fit_rows.clamp(MIN_REPO_ROWS, MAX_DEFAULT_REPO_ROWS) as f32 * row_stride + half_row;
+        let preferred_min = MIN_REPO_ROWS as f32 * row_stride + half_row;
+        let content_height = repositories.len() as f32 * row_stride - gap;
+        let default_height = content_height.clamp(preferred_min, default_limit);
         ui.horizontal(|ui| {
             heading(ui, "仓库", Some(repositories.len()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -591,6 +639,15 @@ impl Desk {
                 }
             });
         });
+        let splitter_id = ui.id().with("repository-splitter");
+        let preferred_max = 2.0 * (MAX_DEFAULT_REPO_ROWS as f32 * row_stride + half_row);
+        let repo_h = split_panel_height(
+            ui,
+            splitter_id,
+            default_height,
+            (preferred_min..=preferred_max).into(),
+            MIN_BRANCH_HEIGHT,
+        );
         egui::ScrollArea::vertical()
             .id_salt("repositories")
             .max_height(repo_h)
@@ -728,8 +785,89 @@ impl Desk {
         if let Some(path) = forget {
             self.dialog = Some(Dialog::Forget(path));
         }
-        ui.add_space(5.0);
-        ui.separator();
+        panel_divider(ui, splitter_id);
         self.branches(ui, ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, RawInput};
+
+    #[test]
+    fn panel_splitter_uses_release_position_and_clamps_height() {
+        check_splitter_bounds(179.5, 123.5, 359.0, 180.0);
+        check_splitter_bounds(215.0, 144.0, 320.0, 132.0);
+    }
+
+    fn check_splitter_bounds(default_height: f32, min: f32, max: f32, lower_min: f32) {
+        let ctx = egui::Context::default();
+        let splitter = egui::Id::new("panel-divider-test");
+        let frame = |events, screen_height| {
+            let mut result = (0.0, Rect::ZERO, 0.0);
+            let _ = ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(500.0, screen_height),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let height = split_panel_height(
+                            ui,
+                            splitter,
+                            default_height,
+                            (min..=max).into(),
+                            lower_min,
+                        );
+                        ui.allocate_space(Vec2::new(ui.available_width(), height));
+                        let divider = panel_divider(ui, splitter).rect;
+                        result = (height, divider, ui.available_height());
+                    });
+                },
+            );
+            result
+        };
+        let mouse_button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let (initial_height, divider, _) = frame(vec![], 800.0);
+        assert_eq!(initial_height, default_height);
+
+        let start = divider.center();
+        frame(
+            vec![Event::PointerMoved(start), mouse_button(start, true)],
+            800.0,
+        );
+        let end = pos2(start.x, 650.0);
+        let (height, _, _) = frame(
+            vec![Event::PointerMoved(end), mouse_button(end, false)],
+            800.0,
+        );
+        assert_eq!(height, max);
+        let (height, _, remaining) = frame(vec![], 440.0);
+        assert!(height < max);
+        assert_eq!(remaining, lower_min);
+
+        let (height, divider, _) = frame(vec![], 800.0);
+        assert_eq!(height, max);
+        let start = divider.center();
+        frame(
+            vec![Event::PointerMoved(start), mouse_button(start, true)],
+            800.0,
+        );
+        let end = pos2(start.x, 60.0);
+        let (height, _, _) = frame(
+            vec![Event::PointerMoved(end), mouse_button(end, false)],
+            800.0,
+        );
+        assert_eq!(height, min);
     }
 }
