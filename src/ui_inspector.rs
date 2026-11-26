@@ -2,8 +2,8 @@ use crate::app::{Desk, Selection};
 use crate::git::{Area, Change, Operation};
 use crate::theme;
 use crate::ui::{
-    ROW, centered_baseline, fit_line, heading, paint_baseline, panel_divider, save_icon_button,
-    split_panel_height,
+    ROW, centered_baseline, filter_field, fit_line, heading, paint_baseline, panel_divider,
+    save_icon_button, split_panel_height,
 };
 use eframe::egui::{self, Align, FontId, Layout, Rect, RichText, Sense, UiBuilder, Vec2};
 use std::collections::HashMap;
@@ -90,6 +90,31 @@ fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
 enum FileRow<'a> {
     Group(&'static str, usize),
     File(&'a Change),
+}
+
+fn file_rows<'a>(files: &'a [Change], worktree: bool, query: &str) -> Vec<FileRow<'a>> {
+    let needle = query.trim().replace('\\', "/").to_lowercase();
+    let matches = |file: &&Change| needle.is_empty() || file.path.to_lowercase().contains(&needle);
+    let mut rows = Vec::with_capacity(files.len() + 2);
+    if worktree {
+        for (name, area) in [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)] {
+            let group_start = rows.len();
+            rows.extend(
+                files
+                    .iter()
+                    .filter(|file| file.area == area)
+                    .filter(matches)
+                    .map(FileRow::File),
+            );
+            let count = rows.len() - group_start;
+            if count > 0 {
+                rows.insert(group_start, FileRow::Group(name, count));
+            }
+        }
+    } else {
+        rows.extend(files.iter().filter(matches).map(FileRow::File));
+    }
+    rows
 }
 
 fn file_name_and_directory(path: &str) -> (&str, &str) {
@@ -286,6 +311,7 @@ impl Desk {
         let colors = theme::palette(ctx);
         let worktree = matches!(self.selection, Selection::Worktree);
         let state = self.state();
+        let status_busy = state.is_some_and(|state| state.status_busy);
         let count = if worktree {
             state.map_or(0, |state| state.changes().len())
         } else {
@@ -302,23 +328,22 @@ impl Desk {
         let mut staging = None;
         ui.horizontal(|ui| {
             heading(ui, "文件", Some(count));
-            if worktree && state.is_some_and(|state| state.status_busy) {
+            if worktree && status_busy {
                 ui.spinner();
             }
         });
+        let query_changed = ui
+            .add(
+                filter_field(
+                    &mut self.file_query,
+                    RichText::new("筛选文件…").color(colors.subtle),
+                )
+                .desired_width(f32::INFINITY),
+            )
+            .changed();
+        let state = self.state();
         if worktree && let Some(error) = state.and_then(|state| state.status_error.as_ref()) {
             ui.colored_label(colors.removed.foreground, error);
-        }
-        if count == 0 && !state.is_some_and(|state| state.status_busy) && !self.details_busy {
-            ui.label(
-                RichText::new(if worktree {
-                    "没有待比较的文件"
-                } else {
-                    "该提交没有文件变更"
-                })
-                .color(colors.muted)
-                .small(),
-            );
         }
         let files = if worktree {
             state.map(|state| state.changes()).unwrap_or_default()
@@ -328,18 +353,25 @@ impl Desk {
                 .map(|details| details.files.as_slice())
                 .unwrap_or_default()
         };
-        let mut entries = Vec::with_capacity(files.len() + 2);
-        if worktree {
-            for (name, area) in [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)] {
-                let group = files.iter().filter(|file| file.area == area);
-                let count = group.clone().count();
-                if count > 0 {
-                    entries.push(FileRow::Group(name, count));
-                    entries.extend(group.map(FileRow::File));
-                }
+        let entries = file_rows(files, worktree, &self.file_query);
+        if entries.is_empty() {
+            if !files.is_empty() {
+                ui.label(
+                    RichText::new("未找到匹配的文件")
+                        .color(colors.muted)
+                        .small(),
+                );
+            } else if !status_busy && !self.details_busy {
+                ui.label(
+                    RichText::new(if worktree {
+                        "没有待比较的文件"
+                    } else {
+                        "该提交没有文件变更"
+                    })
+                    .color(colors.muted)
+                    .small(),
+                );
             }
-        } else {
-            entries.extend(files.iter().map(FileRow::File));
         }
         let mut directories_by_name: HashMap<&str, Vec<&str>> = HashMap::new();
         for file in files {
@@ -348,9 +380,13 @@ impl Desk {
         }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            egui::ScrollArea::vertical()
-                .id_salt(("file-list", self.details_busy))
-                .auto_shrink([false, false])
+            let list = egui::ScrollArea::vertical().id_salt(("file-list", self.details_busy));
+            let list = if query_changed {
+                list.vertical_scroll_offset(0.0)
+            } else {
+                list
+            };
+            list.auto_shrink([false, false])
                 .show_rows(ui, ROW, entries.len(), |ui, visible| {
                     let name_font = FontId::proportional(13.0);
                     let code_font = FontId::monospace(12.0);
@@ -508,5 +544,64 @@ impl Desk {
         {
             self.operate(ctx, root, operation);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(path: &str, area: Area) -> Change {
+        Change {
+            path: path.to_owned(),
+            old_path: None,
+            code: 'M',
+            area,
+            left_gitlink: false,
+            right_gitlink: false,
+        }
+    }
+
+    #[test]
+    fn file_filter_matches_names_and_relative_paths() {
+        let files = [
+            change("文档/Sample Notes.md", Area::Commit),
+            change("other/Sample Notes.md", Area::Commit),
+        ];
+        let rows = file_rows(&files, false, " 文档\\sAMPLE n ");
+        let [FileRow::File(file)] = rows.as_slice() else {
+            panic!("expected one matching file");
+        };
+        assert!(std::ptr::eq(*file, &files[0]));
+        assert_eq!(file_rows(&files, false, "SAMPLE NOTES").len(), 2);
+        assert_eq!(file_rows(&files, false, "  ").len(), 2);
+        assert!(file_rows(&files, false, "missing").is_empty());
+    }
+
+    #[test]
+    fn file_filter_counts_matching_rows_and_hides_empty_groups() {
+        let files = [
+            change("src/main.rs", Area::Staged),
+            change("src/main.rs", Area::Unstaged),
+            change("README.md", Area::Unstaged),
+        ];
+        let rows = file_rows(&files, true, "src/");
+        let [
+            FileRow::Group("已暂存", 1),
+            FileRow::File(staged),
+            FileRow::Group("未暂存", 1),
+            FileRow::File(unstaged),
+        ] = rows.as_slice()
+        else {
+            panic!("expected one matching file in each group");
+        };
+        assert_eq!(staged.area, Area::Staged);
+        assert_eq!(unstaged.area, Area::Unstaged);
+
+        let readme = file_rows(&files, true, "readme");
+        assert!(matches!(
+            readme.as_slice(),
+            [FileRow::Group("未暂存", 1), FileRow::File(file)] if file.path == "README.md"
+        ));
     }
 }

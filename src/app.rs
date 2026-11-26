@@ -134,6 +134,7 @@ pub(crate) struct Desk {
     pub editor: String,
     pub search: String,
     pub branch_query: String,
+    pub file_query: String,
     pub search_row: Option<usize>,
     history_search: Option<HistorySearch>,
     pub scroll_to: Option<usize>,
@@ -262,6 +263,7 @@ impl Desk {
             editor: String::new(),
             search: String::new(),
             branch_query: String::new(),
+            file_query: String::new(),
             search_row: None,
             history_search: None,
             scroll_to: None,
@@ -503,6 +505,7 @@ impl Desk {
         self.clear_diff();
         self.search.clear();
         self.branch_query.clear();
+        self.file_query.clear();
         self.cancel_history_search();
         self.search_row = None;
         self.scroll_to = None;
