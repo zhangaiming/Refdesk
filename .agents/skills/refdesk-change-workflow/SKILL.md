@@ -11,6 +11,12 @@ description: 处理 Refdesk 修改前的 OpenSpec change，以及提交前的规
 2. 有对应 change 就沿用。缺少对应 change 时，在修改项目文件前运行 `openspec new change <kebab-case-name>`。用 `openspec status --change <name> --json` 检查产物依赖，并通过 `openspec instructions <artifact> --change <name> --json` 填写必要产物。纯重构、工具或文档维护仅在没有规格行为变化时在 `.openspec.yaml` 声明 `skip_specs: true`。
 3. 用户已要求实施时，按当前 change 的任务继续并记录已完成的验证。只读调查、审查和仅提交已有改动的请求按各自范围处理；补录已完成的工作需用户明确提出。
 
+## 主题与界面
+
+- 新增或修改控件、弹层、图标、列表状态或自绘区域前，在对应 change 的任务中列出受影响的界面状态及主题验收项。标准控件使用共享样式，自绘从当前 `Palette` 取语义色。 [主题接入约定](../../../DESIGN.md#使用主题色板)
+- 调整色板角色或主题格式时，把内置色板、示例 JSON、旧文件兼容和会话 ID 纳入同一变更。用户可观察的格式、加载或恢复行为变化同步 OpenSpec 增量规格和使用说明。 [维护约定](../../../DESIGN.md#维护主题配置) · [外部主题用法](../../../README.md#外部主题)
+- 关闭任务和提交前按实际改动核对主题覆盖，记录实测主题和状态。 [主题验收](../refdesk-verify/SKILL.md#主题验收)
+
 ## 运行日志
 
 - 新增或调整日志事件、字段、级别、目录或保留策略时，先查阅现有用法和行为约定。启动方式、环境变量或默认值有变化时更新使用说明，行为约定有变化时在对应 OpenSpec change 中维护增量规格。 [使用说明](../../../README.md#运行日志) · [运行日志主规格](../../../openspec/specs/runtime-logging/spec.md)
