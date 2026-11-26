@@ -97,14 +97,18 @@ enum FileRow<'a> {
     File(&'a Change),
 }
 
+pub(crate) fn file_filter(query: &str) -> impl Fn(&&Change) -> bool + use<> {
+    let needle = query.trim().replace('\\', "/").to_lowercase();
+    move |file| needle.is_empty() || file.path.to_lowercase().contains(&needle)
+}
+
 fn file_rows<'a>(
     files: &'a [Change],
     worktree: bool,
     query: &str,
     collapsed_groups: &[Area],
 ) -> Vec<FileRow<'a>> {
-    let needle = query.trim().replace('\\', "/").to_lowercase();
-    let matches = |file: &&Change| needle.is_empty() || file.path.to_lowercase().contains(&needle);
+    let matches = file_filter(query);
     let mut rows = Vec::with_capacity(files.len() + 2);
     if worktree {
         for (name, area) in [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)] {
@@ -113,7 +117,7 @@ fn file_rows<'a>(
                 files
                     .iter()
                     .filter(|file| file.area == area)
-                    .filter(matches)
+                    .filter(&matches)
                     .map(FileRow::File),
             );
             let count = rows.len() - group_start;
@@ -354,6 +358,7 @@ impl Desk {
                 .desired_width(f32::INFINITY),
             )
             .changed();
+        let reset_scroll = std::mem::take(&mut self.reset_file_scroll) || query_changed;
         let state = self.state();
         if worktree && let Some(error) = state.and_then(|state| state.status_error.as_ref()) {
             ui.colored_label(colors.removed.foreground, error);
@@ -398,7 +403,7 @@ impl Desk {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let list = egui::ScrollArea::vertical().id_salt(("file-list", self.details_busy));
-            let list = if query_changed {
+            let list = if reset_scroll {
                 list.vertical_scroll_offset(0.0)
             } else {
                 list

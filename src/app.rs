@@ -135,6 +135,7 @@ pub(crate) struct Desk {
     pub search: String,
     pub branch_query: String,
     pub file_query: String,
+    pub reset_file_scroll: bool,
     pub search_row: Option<usize>,
     history_search: Option<HistorySearch>,
     pub scroll_to: Option<usize>,
@@ -271,6 +272,7 @@ impl Desk {
             search: String::new(),
             branch_query: String::new(),
             file_query: String::new(),
+            reset_file_scroll: false,
             search_row: None,
             history_search: None,
             scroll_to: None,
@@ -982,6 +984,14 @@ impl Desk {
         let Some(history) = &self.repos[&root].history else {
             return;
         };
+        if let Selection::Commit {
+            right, left: None, ..
+        } = &self.selection
+            && right.id == item.id
+            && (self.details_busy || self.details.is_some())
+        {
+            return;
+        }
         let generation = history.generation;
         let loaded = history.summary.loaded;
         let cache = Arc::clone(&history.cache);
@@ -1405,7 +1415,18 @@ impl Desk {
                     self.selection = selection;
                     self.details_busy = false;
                     match result {
-                        Ok(details) => self.details = Some(details),
+                        Ok(details) => {
+                            let first = details
+                                .files
+                                .iter()
+                                .find(crate::ui_inspector::file_filter(&self.file_query))
+                                .cloned();
+                            self.details = Some(details);
+                            self.reset_file_scroll = true;
+                            if let Some(file) = first {
+                                self.choose_file(ctx, file);
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(kind = "details", worktree, request, "read_failed");
                             self.details_error = Some(error);
