@@ -314,20 +314,15 @@ fn code(
     );
     let x = rect.left() + 54.0;
     let content = Rect::from_min_max(pos2(x, rect.top()), rect.max);
-    if syntax.is_empty() && inline.is_empty() {
-        paint(ui, content, x, text, FontId::monospace(12.0), colors.text);
-    } else {
-        let inline_background = change.map_or(Color32::TRANSPARENT, |(change, _)| {
-            change.background.lerp_to_gamma(change.border, 0.26)
-        });
-        let painter = ui
-            .painter()
-            .with_clip_rect(content.intersect(ui.clip_rect()));
-        let galley =
-            painter.layout_job(code_layout(text, colors, syntax, inline, inline_background));
-        let origin = pos2(x, rect.center().y - galley.size().y * 0.5);
-        painter.galley(origin, galley, colors.text);
-    }
+    let inline_background = change.map_or(Color32::TRANSPARENT, |(change, _)| {
+        change.background.lerp_to_gamma(change.border, 0.26)
+    });
+    let painter = ui
+        .painter()
+        .with_clip_rect(content.intersect(ui.clip_rect()));
+    let galley = painter.layout_job(code_layout(text, colors, syntax, inline, inline_background));
+    let origin = pos2(x, rect.center().y - galley.size().y * 0.5);
+    painter.galley(origin, galley, colors.text);
 }
 
 fn code_layout(
@@ -337,6 +332,10 @@ fn code_layout(
     inline: &[Range<usize>],
     inline_background: Color32,
 ) -> LayoutJob {
+    let font = FontId::monospace(12.0);
+    if syntax.is_empty() && inline.is_empty() {
+        return LayoutJob::simple_singleline(text.to_owned(), font, colors.text);
+    }
     let mut job = LayoutJob {
         break_on_newline: false,
         ..Default::default()
@@ -374,7 +373,7 @@ fn code_layout(
             &text[start..end],
             0.0,
             TextFormat {
-                font_id: FontId::monospace(12.0),
+                font_id: font.clone(),
                 color: foreground,
                 background,
                 ..Default::default()
@@ -394,6 +393,38 @@ fn code_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_and_decorated_rows_share_a_baseline_with_fallback_glyphs() {
+        let mut definitions = egui::FontDefinitions::default();
+        let emoji = definitions.font_data.get_mut("NotoEmoji-Regular").unwrap();
+        Arc::make_mut(emoji).tweak.baseline_offset_factor = 0.25;
+        let fonts = egui::epaint::text::Fonts::new(1.5, 1024, definitions);
+        let colors = theme::palette(&egui::Context::default());
+        let text = "H😀H";
+        let syntax = [Span {
+            range: 1..text.len() - 1,
+            role: Role::String,
+        }];
+        let plain = fonts.layout_job(code_layout(text, &colors, &[], &[], Color32::TRANSPARENT));
+        let decorated = fonts.layout_job(code_layout(
+            text,
+            &colors,
+            &syntax,
+            std::slice::from_ref(&(0..text.len())),
+            Color32::RED,
+        ));
+        let glyphs = &plain.rows[0].glyphs;
+        assert_ne!(glyphs[0].font_impl_ascent, glyphs[1].font_impl_ascent);
+        assert_eq!(glyphs[0].pos.y, glyphs[1].pos.y);
+        assert_eq!(glyphs.len(), decorated.rows[0].glyphs.len());
+        assert!(
+            glyphs
+                .iter()
+                .zip(&decorated.rows[0].glyphs)
+                .all(|(plain, decorated)| plain.chr == decorated.chr && plain.pos == decorated.pos)
+        );
+    }
 
     #[test]
     fn hiding_context_preserves_separate_change_blocks() {

@@ -44,6 +44,9 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 embed-resource = "3.0"
 
+[patch.crates-io]
+epaint = { path = "vendor/epaint-0.31.1" }
+
 [profile.release]
 lto = "thin"
 strip = true
