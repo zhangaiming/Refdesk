@@ -2,9 +2,9 @@ use crate::app::{Desk, Selection};
 use crate::git::{Area, Change, Operation};
 use crate::ui::{
     ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, ROW, SELECTION, SHADE, centered_baseline,
-    fit_line, heading, paint_baseline, panel_divider, split_panel_height,
+    fit_line, heading, paint_baseline, panel_divider, save_icon_button, split_panel_height,
 };
-use eframe::egui::{self, Align, FontId, Layout, RichText, Sense, UiBuilder, Vec2};
+use eframe::egui::{self, Align, FontId, Layout, Rect, RichText, Sense, UiBuilder, Vec2};
 use std::collections::HashMap;
 
 const COMMIT_PANEL_MIN_HEIGHT: f32 = 144.0;
@@ -13,6 +13,76 @@ const FILES_PANEL_MIN_HEIGHT: f32 = 132.0;
 const FILE_NAME_INSET: f32 = 24.0;
 const FILE_RIGHT_INSET: f32 = 7.0;
 const FILE_COLUMN_GAP: f32 = 8.0;
+const COPY_SHA_LABEL: &str = "复制 SHA";
+const COPY_TOAST_DURATION: f32 = 1.1;
+
+#[derive(Clone, Copy)]
+struct CopyShaToast {
+    pointer: egui::Pos2,
+    started: f64,
+}
+
+fn copy_sha_button(ui: &mut egui::Ui, icon: &egui::TextureHandle, sha: &str, toast_id: egui::Id) {
+    let response = save_icon_button(ui, icon, COPY_SHA_LABEL, FAINT);
+    if response.clicked() {
+        ui.ctx().copy_text(sha.to_owned());
+        let toast = CopyShaToast {
+            pointer: response
+                .interact_pointer_pos()
+                .unwrap_or(response.rect.center()),
+            started: ui.input(|input| input.time),
+        };
+        ui.data_mut(|data| data.insert_temp(toast_id, toast));
+    }
+    if response.hovered() && ui.data(|data| data.get_temp::<CopyShaToast>(toast_id).is_none()) {
+        response.show_tooltip_text(COPY_SHA_LABEL);
+    }
+}
+
+fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
+    let Some(toast) = ctx.data(|data| data.get_temp::<CopyShaToast>(toast_id)) else {
+        return;
+    };
+    let elapsed = ctx.input(|input| (input.time - toast.started) as f32);
+    if elapsed >= COPY_TOAST_DURATION {
+        ctx.data_mut(|data| data.remove::<CopyShaToast>(toast_id));
+        return;
+    }
+    let fade_in = (elapsed / 0.15).clamp(0.0, 1.0);
+    let fade_out = ((COPY_TOAST_DURATION - elapsed) / 0.27).clamp(0.0, 1.0);
+    let opacity = fade_in * fade_out;
+    let drift = 6.0 * (1.0 - (1.0 - (elapsed / 0.28).clamp(0.0, 1.0)).powi(3));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, toast_id));
+    let text = painter.layout_no_wrap("已复制".into(), FontId::proportional(12.0), INK);
+    let padding = Vec2::new(8.0, 4.0);
+    let size = text.size() + padding * 2.0;
+    let bounds = ctx.screen_rect().shrink(6.0);
+    let target = toast.pointer + Vec2::new(12.0, 13.0);
+    let position = egui::pos2(
+        target.x.min(bounds.right() - size.x).max(bounds.left()),
+        target
+            .y
+            .min(bounds.bottom() - size.y - 6.0)
+            .max(bounds.top())
+            + drift,
+    );
+    let rect = Rect::from_min_size(position, size);
+    let visuals = ctx.style();
+    let visuals = &visuals.visuals;
+    painter.rect(
+        rect,
+        5.0,
+        visuals.window_fill.gamma_multiply(opacity),
+        egui::Stroke::new(1.0_f32, visuals.window_stroke.color.gamma_multiply(opacity)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley_with_override_text_color(
+        position + padding,
+        text,
+        visuals.text_color().gamma_multiply(opacity),
+    );
+    ctx.request_repaint();
+}
 
 enum FileRow<'a> {
     Group(&'static str, usize),
@@ -71,6 +141,7 @@ fn file_directory(
 
 impl Desk {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let toast_id = ui.id().with("copy-sha-toast");
         let worktree = matches!(self.selection, Selection::Worktree);
         let active = self.active.clone();
         let busy = active
@@ -169,8 +240,14 @@ impl Desk {
                             ui.label(RichText::new(rest.trim()).size(12.0).color(MUTE));
                         }
                         if let Selection::Commit { right, .. } = &self.selection {
-                            ui.label(RichText::new(&right.short).monospace().small().color(FAINT))
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                ui.label(
+                                    RichText::new(&right.short).monospace().small().color(FAINT),
+                                )
                                 .on_hover_text(&right.id);
+                                copy_sha_button(ui, &self.save_icon, &right.id, toast_id);
+                            });
                         }
                     });
             } else if let Some(error) = &self.details_error {
@@ -185,6 +262,7 @@ impl Desk {
         }
         panel_divider(ui, splitter_id);
         self.files(ui, ctx);
+        paint_copy_sha_toast(ctx, toast_id);
     }
 
     fn files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

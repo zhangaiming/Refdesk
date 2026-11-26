@@ -167,6 +167,55 @@ pub(crate) fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(compact_button(text))
 }
 
+pub(crate) fn load_save_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/save.png"))
+        .expect("embedded save icon must be a valid PNG");
+    ctx.load_texture(
+        "save-icon",
+        egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        ),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+pub(crate) fn save_icon_button(
+    ui: &mut egui::Ui,
+    icon: &egui::TextureHandle,
+    label: &str,
+    color: Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    let widgets = ui.style().interact(&response);
+    if response.hovered() || response.is_pointer_button_down_on() || response.has_focus() {
+        painter.rect_filled(rect, widgets.corner_radius, widgets.weak_bg_fill);
+    }
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            widgets.corner_radius,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.image(
+        icon.id(),
+        Rect::from_center_size(rect.center(), Vec2::splat(15.0)),
+        Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)),
+        color,
+    );
+    response
+}
+
 pub(crate) fn filter_field<'a>(value: &'a mut String, hint: &str) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(value)
         .hint_text(hint)
