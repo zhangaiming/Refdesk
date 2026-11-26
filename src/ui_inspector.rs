@@ -14,6 +14,7 @@ const FILES_PANEL_MIN_HEIGHT: f32 = 132.0;
 const FILE_NAME_INSET: f32 = 24.0;
 const FILE_RIGHT_INSET: f32 = 7.0;
 const FILE_COLUMN_GAP: f32 = 8.0;
+const FILE_GROUP_VERTICAL_INSET: f32 = 3.0;
 const COPY_SHA_LABEL: &str = "复制 SHA";
 const COPY_TOAST_DURATION: f32 = 1.1;
 
@@ -88,11 +89,20 @@ fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
 }
 
 enum FileRow<'a> {
-    Group(&'static str, usize),
+    Group {
+        name: &'static str,
+        area: Area,
+        count: usize,
+    },
     File(&'a Change),
 }
 
-fn file_rows<'a>(files: &'a [Change], worktree: bool, query: &str) -> Vec<FileRow<'a>> {
+fn file_rows<'a>(
+    files: &'a [Change],
+    worktree: bool,
+    query: &str,
+    collapsed_groups: &[Area],
+) -> Vec<FileRow<'a>> {
     let needle = query.trim().replace('\\', "/").to_lowercase();
     let matches = |file: &&Change| needle.is_empty() || file.path.to_lowercase().contains(&needle);
     let mut rows = Vec::with_capacity(files.len() + 2);
@@ -108,7 +118,10 @@ fn file_rows<'a>(files: &'a [Change], worktree: bool, query: &str) -> Vec<FileRo
             );
             let count = rows.len() - group_start;
             if count > 0 {
-                rows.insert(group_start, FileRow::Group(name, count));
+                if collapsed_groups.contains(&area) {
+                    rows.truncate(group_start);
+                }
+                rows.insert(group_start, FileRow::Group { name, area, count });
             }
         }
     } else {
@@ -353,7 +366,11 @@ impl Desk {
                 .map(|details| details.files.as_slice())
                 .unwrap_or_default()
         };
-        let entries = file_rows(files, worktree, &self.file_query);
+        let collapsed_groups_id = ui.id().with("collapsed-file-groups");
+        let collapsed_groups = ctx
+            .data(|data| data.get_temp::<Vec<Area>>(collapsed_groups_id))
+            .unwrap_or_default();
+        let entries = file_rows(files, worktree, &self.file_query, &collapsed_groups);
         if entries.is_empty() {
             if !files.is_empty() {
                 ui.label(
@@ -392,16 +409,50 @@ impl Desk {
                     let code_font = FontId::monospace(12.0);
                     let baseline_offset = centered_baseline(ui.painter(), name_font.clone());
                     for index in visible {
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), ROW),
-                            Sense::click(),
-                        );
+                        let (row_id, rect) =
+                            ui.allocate_space(Vec2::new(ui.available_width(), ROW));
                         let painter = ui.painter();
                         let right = rect.right() - FILE_RIGHT_INSET;
                         let baseline = rect.center().y + baseline_offset;
                         let file = match entries[index] {
-                            FileRow::Group(name, count) => {
-                                painter.rect_filled(rect, 4.0, colors.control);
+                            FileRow::Group { name, area, count } => {
+                                let response = ui
+                                    .interact(rect, collapsed_groups_id.with(name), Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::CollapsingHeader,
+                                        ui.is_enabled(),
+                                        name,
+                                    )
+                                });
+                                let collapsed = collapsed_groups.contains(&area);
+                                if response.clicked() {
+                                    ctx.data_mut(|data| {
+                                        let groups = data.get_temp_mut_or_default::<Vec<Area>>(
+                                            collapsed_groups_id,
+                                        );
+                                        if collapsed {
+                                            groups.retain(|group| *group != area);
+                                        } else {
+                                            groups.push(area);
+                                        }
+                                    });
+                                    ctx.request_repaint();
+                                }
+                                let fill = if response.hovered() || response.has_focus() {
+                                    colors.hover
+                                } else {
+                                    colors.control
+                                };
+                                let background =
+                                    rect.shrink2(Vec2::new(0.0, FILE_GROUP_VERTICAL_INSET));
+                                painter.rect_filled(background, 4.0, fill);
+                                let marker = painter.layout_no_wrap(
+                                    if collapsed { "+" } else { "-" }.to_owned(),
+                                    code_font.clone(),
+                                    colors.muted,
+                                );
                                 let title = painter.layout_no_wrap(
                                     name.to_owned(),
                                     FontId::proportional(11.0),
@@ -414,7 +465,14 @@ impl Desk {
                                 );
                                 paint_baseline(
                                     painter,
-                                    rect.left() + 7.0,
+                                    rect.left() + 6.0,
+                                    baseline,
+                                    marker,
+                                    colors.muted,
+                                );
+                                paint_baseline(
+                                    painter,
+                                    rect.left() + FILE_NAME_INSET,
                                     baseline,
                                     title,
                                     colors.muted,
@@ -430,6 +488,7 @@ impl Desk {
                             }
                             FileRow::File(file) => file,
                         };
+                        let response = ui.interact(rect, row_id, Sense::click());
                         let is_selected = self.file.as_ref().is_some_and(|current| {
                             current.path == file.path && current.area == file.area
                         });
@@ -568,14 +627,14 @@ mod tests {
             change("文档/Sample Notes.md", Area::Commit),
             change("other/Sample Notes.md", Area::Commit),
         ];
-        let rows = file_rows(&files, false, " 文档\\sAMPLE n ");
+        let rows = file_rows(&files, false, " 文档\\sAMPLE n ", &[]);
         let [FileRow::File(file)] = rows.as_slice() else {
             panic!("expected one matching file");
         };
         assert!(std::ptr::eq(*file, &files[0]));
-        assert_eq!(file_rows(&files, false, "SAMPLE NOTES").len(), 2);
-        assert_eq!(file_rows(&files, false, "  ").len(), 2);
-        assert!(file_rows(&files, false, "missing").is_empty());
+        assert_eq!(file_rows(&files, false, "SAMPLE NOTES", &[]).len(), 2);
+        assert_eq!(file_rows(&files, false, "  ", &[]).len(), 2);
+        assert!(file_rows(&files, false, "missing", &[]).is_empty());
     }
 
     #[test]
@@ -585,11 +644,19 @@ mod tests {
             change("src/main.rs", Area::Unstaged),
             change("README.md", Area::Unstaged),
         ];
-        let rows = file_rows(&files, true, "src/");
+        let rows = file_rows(&files, true, "src/", &[]);
         let [
-            FileRow::Group("已暂存", 1),
+            FileRow::Group {
+                area: Area::Staged,
+                count: 1,
+                ..
+            },
             FileRow::File(staged),
-            FileRow::Group("未暂存", 1),
+            FileRow::Group {
+                area: Area::Unstaged,
+                count: 1,
+                ..
+            },
             FileRow::File(unstaged),
         ] = rows.as_slice()
         else {
@@ -598,10 +665,28 @@ mod tests {
         assert_eq!(staged.area, Area::Staged);
         assert_eq!(unstaged.area, Area::Unstaged);
 
-        let readme = file_rows(&files, true, "readme");
+        let readme = file_rows(&files, true, "readme", &[]);
         assert!(matches!(
             readme.as_slice(),
-            [FileRow::Group("未暂存", 1), FileRow::File(file)] if file.path == "README.md"
+            [FileRow::Group { area: Area::Unstaged, count: 1, .. }, FileRow::File(file)] if file.path == "README.md"
+        ));
+    }
+
+    #[test]
+    fn collapsed_group_keeps_matching_count_and_hides_only_its_files() {
+        let files = [
+            change("src/main.rs", Area::Staged),
+            change("README.md", Area::Staged),
+            change("src/lib.rs", Area::Unstaged),
+        ];
+        let rows = file_rows(&files, true, "src/", &[Area::Staged]);
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                FileRow::Group { area: Area::Staged, count: 1, .. },
+                FileRow::Group { area: Area::Unstaged, count: 1, .. },
+                FileRow::File(file),
+            ] if file.path == "src/lib.rs"
         ));
     }
 }
