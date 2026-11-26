@@ -707,7 +707,6 @@ pub fn status(root: &Path) -> Result<Status> {
             "--branch",
             "-z",
             "--untracked-files=all",
-            "--ignore-submodules=dirty",
         ],
     )?;
     let mut fields = bytes.split(|&byte| byte == 0);
@@ -1517,6 +1516,33 @@ mod tests {
             diff_snapshot(&parent, &pair.right, local, pair.right_gitlink)?,
             format!("Subproject commit {tip}\n").as_bytes()
         );
+
+        let ignore_key = format!("submodule.{local}.ignore");
+        git(
+            &parent,
+            &["config", "--file", ".gitmodules", &ignore_key, "all"],
+        )?;
+        let state = status(&parent)?;
+        assert!(state.files.iter().all(|file| file.path != local));
+        assert!(state.files.iter().any(|file| file.path == ".gitmodules"));
+
+        git(&parent, &["config", "--local", &ignore_key, "dirty"])?;
+        let state = status(&parent)?;
+        assert!(state.files.iter().any(|file| {
+            file.path == local && file.area == Area::Unstaged && file.is_gitlink()
+        }));
+        git(&parent, &["config", "--local", "--unset", &ignore_key])?;
+
+        git(&parent, &["add", "--force", "--", local])?;
+        let state = status(&parent)?;
+        let staged: Vec<_> = state
+            .files
+            .iter()
+            .filter(|file| file.path == local)
+            .collect();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].area, Area::Staged);
+        assert!(staged[0].is_gitlink());
 
         git(&parent, &["update-index", "--force-remove", "--", local])?;
         let state = status(&parent)?;
