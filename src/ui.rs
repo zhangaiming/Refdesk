@@ -11,10 +11,10 @@ pub(crate) const ROW: f32 = 25.0;
 pub(crate) const DETAIL_SIZE: f32 = 12.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
 const TOOLBAR_HEIGHT: f32 = 40.0;
-const TITLE_HEIGHT: f32 = 34.0;
+pub(crate) const TITLE_HEIGHT: f32 = 34.0;
 const TITLE_BUTTON_HEIGHT: f32 = 24.0;
 const TITLE_BUTTON_MIN_WIDTH: f32 = 25.0;
-const WINDOW_BUTTON_WIDTH: f32 = 46.0;
+pub(crate) const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 const SPLITTER_HEIGHT: f32 = 8.0;
 
 pub(crate) struct WindowButtons {
@@ -277,7 +277,6 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
             maximize_label,
             ViewportCommand::Maximized(!buttons.maximized),
         ),
-        ("关闭", ViewportCommand::Close),
     ];
     let mut maximize_rect = Rect::NOTHING;
     for (index, (label, command)) in items.into_iter().enumerate() {
@@ -300,28 +299,17 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
         let pressed =
             response.is_pointer_button_down_on() || (index == 1 && buttons.maximize_pressed);
         let hovered = response.hovered() || (index == 1 && buttons.maximize_hovered);
-        let close = index == 2;
         let painter = ui.painter();
         if hovered || pressed {
-            let fill = match (close, pressed) {
-                (true, true) => colors.close_pressed,
-                (true, false) => colors.close_hover,
-                (false, true) => colors.selection,
-                (false, false) => colors.hover,
+            let fill = if pressed {
+                colors.selection
+            } else {
+                colors.hover
             };
             painter.rect_filled(rect, 0.0, fill);
         }
-        if response.has_focus() {
-            painter.rect_stroke(
-                rect.shrink(2.0),
-                2.0,
-                Stroke::new(1.0_f32, colors.accent),
-                egui::StrokeKind::Inside,
-            );
-        }
-        let ink = if close && (hovered || pressed) {
-            colors.close_foreground
-        } else if focused || hovered {
+        paint_caption_focus(ui, &response);
+        let ink = if focused || hovered {
             colors.text
         } else {
             colors.muted
@@ -348,19 +336,69 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
                 ));
                 painter.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
             }
-            1 => {
-                painter.rect_stroke(glyph, 0.0, stroke, egui::StrokeKind::Inside);
-            }
             _ => {
-                painter.line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
-                painter.line_segment([glyph.left_bottom(), glyph.right_top()], stroke);
+                painter.rect_stroke(glyph, 0.0, stroke, egui::StrokeKind::Inside);
             }
         }
         if index != 1 {
             response.on_hover_text(label);
         }
     }
+    let close_rect = Rect::from_min_max(
+        pos2(area.right() - WINDOW_BUTTON_WIDTH, area.top()),
+        area.max,
+    );
+    if window_close_button(ui, close_rect, focused, egui::CornerRadius::ZERO).clicked() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+    }
     maximize_rect
+}
+
+pub(crate) fn window_close_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    focused: bool,
+    rounding: egui::CornerRadius,
+) -> egui::Response {
+    let colors = theme::palette(ui.ctx());
+    let response = ui.interact(rect, ui.id().with("window-close"), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "关闭")
+    });
+    let pressed = response.is_pointer_button_down_on();
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    let ink = if pressed || hovered {
+        let fill = if pressed {
+            colors.close_pressed
+        } else {
+            colors.close_hover
+        };
+        painter.rect_filled(rect, rounding, fill);
+        colors.close_foreground
+    } else if focused {
+        colors.text
+    } else {
+        colors.muted
+    };
+    paint_caption_focus(ui, &response);
+    let glyph = Rect::from_center_size(rect.center(), Vec2::splat(10.0));
+    let stroke = Stroke::new(1.0_f32, ink);
+    painter.line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
+    painter.line_segment([glyph.left_bottom(), glyph.right_top()], stroke);
+    response.on_hover_text("关闭")
+}
+
+fn paint_caption_focus(ui: &egui::Ui, response: &egui::Response) {
+    if response.has_focus() {
+        let colors = theme::palette(ui.ctx());
+        ui.painter().rect_stroke(
+            response.rect.shrink(2.0),
+            2.0,
+            Stroke::new(1.0_f32, colors.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
@@ -455,7 +493,9 @@ impl eframe::App for Desk {
         self.position_capture(ctx);
         self.background_status(ctx);
         self.prefetch(ctx);
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+        if self.dialog.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5))
+        {
             self.refresh(ctx);
         }
         let viewport = ctx.screen_rect().size();

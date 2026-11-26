@@ -22,8 +22,8 @@ impl Desk {
     pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         let id = ui.make_persistent_id("find-commit");
-        let shortcut =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
+        let shortcut = self.dialog.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
         let working = self.state().map(|state| state.changes().len());
         let scope = self
             .state()
