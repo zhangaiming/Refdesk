@@ -266,7 +266,7 @@ impl BranchView<'_> {
                     }
                 }
                 response.context_menu(|ui| {
-                    if ui.button("只显示此引用的历史").clicked() {
+                    if ui.button("只选择此引用").clicked() {
                         self.only(reference);
                         ui.close_menu();
                     }

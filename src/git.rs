@@ -483,12 +483,15 @@ pub fn history_snapshot(root: &Path, scope: &HistoryScope) -> Result<(History, H
         .status
         .success()
         .then(|| trim(&head_result.stdout));
-    let branch_result = output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"], true)?;
-    let branch = if branch_result.status.success() {
-        trim(&branch_result.stdout)
-    } else {
-        "Detached HEAD".to_owned()
-    };
+    let branch_result = output(root, &["symbolic-ref", "--quiet", "HEAD"], true)?;
+    let head_ref = branch_result
+        .status
+        .success()
+        .then(|| trim(&branch_result.stdout));
+    let branch = head_ref
+        .as_deref()
+        .map_or("Detached HEAD", short_ref)
+        .to_owned();
     let ref_bytes = checked(command(Some(root), true)
         .env("LC_ALL", "C")
         .args([
@@ -506,23 +509,41 @@ pub fn history_snapshot(root: &Path, scope: &HistoryScope) -> Result<(History, H
         .filter_map(parse_reference)
         .collect::<Vec<_>>();
     let targets = match scope {
-        HistoryScope::Head => head.iter().cloned().collect(),
         HistoryScope::All => refs
             .iter()
             .map(|reference| reference.target.clone())
             .chain(head.iter().cloned())
             .collect(),
-        HistoryScope::Selected(filter) => {
-            let mut targets: BTreeSet<_> = refs
-                .iter()
-                .filter(|reference| filter.contains(&reference.name))
-                .map(|reference| reference.target.clone())
-                .collect();
-            if filter.contains("HEAD")
-                && let Some(head) = &head
-            {
-                targets.insert(head.clone());
+        HistoryScope::Head | HistoryScope::Selected(_) => {
+            let selects_ref =
+                |name: &str| matches!(scope, HistoryScope::Selected(names) if names.contains(name));
+            let selects_head = matches!(scope, HistoryScope::Head) || selects_ref("HEAD");
+            let mut targets = BTreeSet::new();
+            if selects_head {
+                targets.extend(head.iter().cloned());
             }
+            let mut upstreams = BTreeSet::new();
+            for reference in &refs {
+                let selected = selects_ref(&reference.name);
+                if selected {
+                    targets.insert(reference.target.clone());
+                }
+                let selected_head = selects_head
+                    && head.is_some()
+                    && head_ref.as_deref() == Some(reference.name.as_str());
+                if (selected || selected_head)
+                    && reference.name.starts_with("refs/heads/")
+                    && let Some(upstream) = &reference.upstream
+                    && upstream.name.starts_with("refs/remotes/")
+                {
+                    upstreams.insert(upstream.name.as_str());
+                }
+            }
+            targets.extend(
+                refs.iter()
+                    .filter(|reference| upstreams.contains(reference.name.as_str()))
+                    .map(|reference| reference.target.clone()),
+            );
             targets.into_iter().collect()
         }
     };
@@ -1520,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn git_tracks_each_branch_against_its_own_upstream() -> Result<()> {
+    fn git_uses_configured_upstreams_for_counts_and_history() -> Result<()> {
         let sandbox = tempfile::tempdir()?;
         let root = sandbox.path();
         let git = |args: &[&str]| checked(output(root, args, false)?);
@@ -1601,6 +1622,39 @@ mod tests {
             assert_eq!(tracking.label(), upstream);
             assert_eq!(tracking.state, state);
         }
+
+        let select = |names: &[&str]| {
+            HistoryScope::Selected(names.iter().map(|name| (*name).to_owned()).collect())
+        };
+        let assert_history = |scope: HistoryScope, expected: &[&str]| -> Result<()> {
+            let log = history(root, &scope, PAGE)?;
+            let subjects: BTreeSet<_> = log
+                .commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect();
+            assert_eq!(subjects, expected.iter().copied().collect(), "{scope:?}");
+            assert_eq!(log.commits.len(), expected.len(), "{scope:?}");
+            Ok(())
+        };
+        let diverged = ["base", "second", "third", "side"];
+        assert_history(select(&["refs/heads/review"]), &diverged)?;
+        assert_history(
+            select(&["refs/heads/review", "refs/remotes/origin/main"]),
+            &diverged,
+        )?;
+        assert_history(HistoryScope::Head, &diverged)?;
+        assert_history(select(&["HEAD"]), &diverged)?;
+        for name in [
+            "refs/heads/behind",
+            "refs/heads/synced",
+            "refs/remotes/origin/main",
+        ] {
+            assert_history(select(&[name]), &["base", "second", "third"])?;
+        }
+        assert_history(select(&["refs/heads/gone"]), &["base"])?;
+        git(&["switch", "--detach", "review"])?;
+        assert_history(HistoryScope::Head, &["base", "side"])?;
         Ok(())
     }
 
