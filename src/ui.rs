@@ -1,26 +1,12 @@
 use crate::app::{Desk, Dialog};
 use crate::git::Operation;
+use crate::theme::{self, ThemeId};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Galley, Layout, Margin, Painter, Rect, RichText,
     Sense, Stroke, UiBuilder, Vec2, pos2, text::LayoutJob,
 };
 use std::path::PathBuf;
 
-pub(crate) const BASE: Color32 = Color32::from_rgb(24, 24, 23);
-pub(crate) const PANEL: Color32 = Color32::from_rgb(31, 31, 30);
-pub(crate) const CHROME: Color32 = Color32::from_rgb(37, 36, 34);
-pub(crate) const SHADE: Color32 = Color32::from_rgb(44, 43, 40);
-pub(crate) const HOVER: Color32 = Color32::from_rgb(50, 49, 46);
-pub(crate) const SELECTION: Color32 = Color32::from_rgb(52, 58, 49);
-pub(crate) const BORDER: Color32 = Color32::from_rgb(62, 60, 55);
-pub(crate) const DIVIDER: Color32 = Color32::from_rgb(37, 36, 34);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(178, 205, 160);
-pub(crate) const INK: Color32 = Color32::from_rgb(236, 233, 225);
-pub(crate) const MUTE: Color32 = Color32::from_rgb(193, 187, 177);
-pub(crate) const FAINT: Color32 = Color32::from_rgb(166, 161, 151);
-pub(crate) const RED: Color32 = Color32::from_rgb(239, 149, 143);
-pub(crate) const GREEN: Color32 = Color32::from_rgb(151, 208, 155);
-pub(crate) const GOLD: Color32 = Color32::from_rgb(229, 183, 128);
 pub(crate) const ROW: f32 = 25.0;
 pub(crate) const DETAIL_SIZE: f32 = 12.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
@@ -29,7 +15,6 @@ const TITLE_HEIGHT: f32 = 34.0;
 const TITLE_BUTTON_HEIGHT: f32 = 24.0;
 const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 const SPLITTER_HEIGHT: f32 = 8.0;
-const SPLITTER_HIGHLIGHT: Color32 = Color32::from_rgb(84, 81, 75);
 
 pub(crate) struct WindowButtons {
     pub maximized: bool,
@@ -43,40 +28,20 @@ pub(crate) struct ToolbarRegions {
     pub maximize: Option<Rect>,
 }
 
-pub fn install_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(8.0, 5.0);
-    style.spacing.button_padding = Vec2::new(9.0, 4.0);
-    style.spacing.interact_size = Vec2::new(36.0, CONTROL_HEIGHT);
-    style.visuals = egui::Visuals::dark();
-    style.visuals.override_text_color = Some(INK);
-    style.visuals.window_fill = PANEL;
-    style.visuals.panel_fill = BASE;
-    style.visuals.extreme_bg_color = BASE;
-    style.visuals.faint_bg_color = SHADE;
-    style.visuals.selection.bg_fill = SELECTION;
-    style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
-    style.visuals.widgets.inactive.bg_fill = SHADE;
-    style.visuals.widgets.inactive.weak_bg_fill = SHADE;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(0.6_f32, BORDER);
-    style.visuals.widgets.hovered.bg_fill = HOVER;
-    style.visuals.widgets.hovered.weak_bg_fill = HOVER;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(0.8_f32, ACCENT.gamma_multiply(0.48));
-    style.visuals.widgets.active.bg_fill = SELECTION;
-    style.visuals.widgets.active.weak_bg_fill = SELECTION;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
-    style.visuals.widgets.open.bg_fill = SELECTION;
-    style.visuals.widgets.open.weak_bg_fill = SELECTION;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    for (role, size) in [
-        (egui::TextStyle::Body, 14.0),
-        (egui::TextStyle::Button, 13.0),
-        (egui::TextStyle::Small, 11.0),
-        (egui::TextStyle::Heading, 21.0),
-    ] {
-        style.text_styles.insert(role, FontId::proportional(size));
-    }
-    ctx.set_style(style);
+pub fn install_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = Vec2::new(8.0, 5.0);
+        style.spacing.button_padding = Vec2::new(9.0, 4.0);
+        style.spacing.interact_size = Vec2::new(36.0, CONTROL_HEIGHT);
+        for (role, size) in [
+            (egui::TextStyle::Body, 14.0),
+            (egui::TextStyle::Button, 13.0),
+            (egui::TextStyle::Small, 11.0),
+            (egui::TextStyle::Heading, 21.0),
+        ] {
+            style.text_styles.insert(role, FontId::proportional(size));
+        }
+    });
     let mut fonts = egui::FontDefinitions::default();
     if let Some(windows) = std::env::var_os("WINDIR") {
         let path = PathBuf::from(windows).join("Fonts");
@@ -136,7 +101,7 @@ pub(crate) fn fit_line(
 }
 
 pub(crate) fn centered_baseline(painter: &Painter, font: FontId) -> f32 {
-    let sample = painter.layout_no_wrap("Ag".into(), font, INK);
+    let sample = painter.layout_no_wrap("Ag".into(), font, Color32::PLACEHOLDER);
     galley_baseline(&sample) - sample.size().y / 2.0
 }
 
@@ -216,7 +181,10 @@ pub(crate) fn save_icon_button(
     response
 }
 
-pub(crate) fn filter_field<'a>(value: &'a mut String, hint: &str) -> egui::TextEdit<'a> {
+pub(crate) fn filter_field(
+    value: &mut String,
+    hint: impl Into<egui::WidgetText>,
+) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(value)
         .hint_text(hint)
         .margin(Margin::symmetric(6, 3))
@@ -225,17 +193,18 @@ pub(crate) fn filter_field<'a>(value: &'a mut String, hint: &str) -> egui::TextE
 }
 
 fn toolbar_mark(ui: &mut egui::Ui) {
+    let colors = theme::palette(ui.ctx());
     let (mark, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-    ui.painter().rect_filled(mark, 4.0, SELECTION);
+    ui.painter().rect_filled(mark, 4.0, colors.selection);
     let point = mark.center();
     for (a, b) in [
         (point + Vec2::new(-4.0, -5.0), point + Vec2::new(-4.0, 5.0)),
         (point + Vec2::new(-4.0, 2.0), point + Vec2::new(4.0, -4.0)),
     ] {
         ui.painter()
-            .line_segment([a, b], Stroke::new(1.5_f32, ACCENT));
-        ui.painter().circle_filled(a, 1.7, ACCENT);
-        ui.painter().circle_filled(b, 1.7, ACCENT);
+            .line_segment([a, b], Stroke::new(1.5_f32, colors.accent));
+        ui.painter().circle_filled(a, 1.7, colors.accent);
+        ui.painter().circle_filled(b, 1.7, colors.accent);
     }
 }
 
@@ -253,7 +222,32 @@ fn title_button(text: &str) -> egui::Button<'_> {
     compact_button(text).min_size(Vec2::new(25.0, TITLE_BUTTON_HEIGHT))
 }
 
+fn appearance_menu(ui: &mut egui::Ui, current: ThemeId) -> egui::InnerResponse<Option<ThemeId>> {
+    let menu = egui::menu::menu_custom_button(ui, title_button("外观"), |ui| {
+        let colors = theme::palette(ui.ctx());
+        ui.set_min_width(106.0);
+        let mut selected = current;
+        for (index, (label, themes)) in ThemeId::GROUPS.into_iter().enumerate() {
+            if index > 0 {
+                ui.separator();
+            }
+            ui.label(RichText::new(label).small().color(colors.muted));
+            for theme in themes {
+                if ui
+                    .selectable_value(&mut selected, theme, theme.label())
+                    .clicked()
+                {
+                    ui.close_menu();
+                }
+            }
+        }
+        selected
+    });
+    egui::InnerResponse::new(menu.inner.filter(|theme| *theme != current), menu.response)
+}
+
 fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused: bool) -> Rect {
+    let colors = theme::palette(ui.ctx());
     use egui::{ViewportCommand, WidgetInfo, WidgetType};
 
     let maximize_label = if buttons.maximized {
@@ -294,10 +288,10 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
         let painter = ui.painter();
         if hovered || pressed {
             let fill = match (close, pressed) {
-                (true, true) => Color32::from_rgb(170, 35, 24),
-                (true, false) => Color32::from_rgb(196, 43, 28),
-                (false, true) => SELECTION,
-                (false, false) => HOVER,
+                (true, true) => colors.close_pressed,
+                (true, false) => colors.close_hover,
+                (false, true) => colors.selection,
+                (false, false) => colors.hover,
             };
             painter.rect_filled(rect, 0.0, fill);
         }
@@ -305,16 +299,16 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
             painter.rect_stroke(
                 rect.shrink(2.0),
                 2.0,
-                Stroke::new(1.0_f32, ACCENT),
+                Stroke::new(1.0_f32, colors.accent),
                 egui::StrokeKind::Inside,
             );
         }
         let ink = if close && (hovered || pressed) {
-            Color32::WHITE
+            colors.close_foreground
         } else if focused || hovered {
-            INK
+            colors.text
         } else {
-            MUTE
+            colors.muted
         };
         let stroke = Stroke::new(1.0_f32, ink);
         let center = rect.center();
@@ -353,11 +347,11 @@ fn window_buttons(ui: &mut egui::Ui, area: Rect, buttons: WindowButtons, focused
     maximize_rect
 }
 
-fn panel(fill: Color32, horizontal: i8, vertical: i8) -> Frame {
+fn panel(fill: Color32, border: Color32, horizontal: i8, vertical: i8) -> Frame {
     Frame::new()
         .fill(fill)
         .inner_margin(Margin::symmetric(horizontal, vertical))
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .stroke(Stroke::new(1.0_f32, border))
 }
 
 pub(crate) fn split_panel_height(
@@ -386,14 +380,15 @@ pub(crate) fn split_panel_height(
 }
 
 pub(crate) fn panel_divider(ui: &mut egui::Ui, splitter_id: egui::Id) -> egui::Response {
+    let colors = theme::palette(ui.ctx());
     let (_, divider) = ui.allocate_space(Vec2::new(ui.available_width(), SPLITTER_HEIGHT));
     let splitter = ui
         .interact(divider, splitter_id, Sense::drag())
         .on_hover_and_drag_cursor(egui::CursorIcon::ResizeVertical);
     let line = if splitter.hovered() || splitter.dragged() {
-        SPLITTER_HIGHLIGHT
+        colors.splitter_hover
     } else {
-        BORDER
+        colors.border
     };
     ui.painter().hline(
         divider.x_range(),
@@ -404,15 +399,20 @@ pub(crate) fn panel_divider(ui: &mut egui::Ui, splitter_id: egui::Id) -> egui::R
 }
 
 pub(crate) fn heading(ui: &mut egui::Ui, name: &str, count: Option<usize>) {
-    ui.label(RichText::new(name).size(15.0).strong().color(INK));
+    let colors = theme::palette(ui.ctx());
+    ui.label(RichText::new(name).size(15.0).strong().color(colors.text));
     if let Some(count) = count {
-        ui.label(RichText::new(count.to_string()).color(FAINT).small());
+        ui.label(
+            RichText::new(count.to_string())
+                .color(colors.subtle)
+                .small(),
+        );
     }
 }
 
 impl eframe::App for Desk {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BASE.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
@@ -422,6 +422,7 @@ impl eframe::App for Desk {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let colors = theme::palette(ctx);
         self.events(ctx);
         self.position_capture(ctx);
         self.background_status(ctx);
@@ -443,31 +444,32 @@ impl eframe::App for Desk {
         } else {
             TOOLBAR_HEIGHT
         };
-        let toolbar = egui::TopBottomPanel::top("workbench")
+        let (toolbar, next_theme) = egui::TopBottomPanel::top("workbench")
             .exact_height(toolbar_height)
             .show_separator_line(false)
             .frame(Frame::new())
-            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption));
+            .show(ctx, |ui| self.toolbar(ui, ctx, toolbar_height, caption))
+            .inner;
         #[cfg(windows)]
         if let Some(chrome) = &self.window_chrome {
-            chrome.set_toolbar_regions(toolbar.inner, ctx.pixels_per_point());
+            chrome.set_toolbar_regions(toolbar, ctx.pixels_per_point());
         }
         #[cfg(not(windows))]
         let _ = toolbar;
         egui::TopBottomPanel::bottom("status")
-            .frame(panel(CHROME, 12, 2))
+            .frame(panel(colors.chrome, colors.border, 12, 2))
             .show(ctx, |ui| self.status_line(ui));
         egui::SidePanel::left("navigation")
             .resizable(true)
             .default_width(crate::timing::capture_sidebar().unwrap_or(221.0))
             .width_range(184.0..=navigation_limit)
-            .frame(panel(PANEL, 11, 9))
+            .frame(panel(colors.panel, colors.border, 11, 9))
             .show(ctx, |ui| self.navigation(ui, ctx));
         egui::TopBottomPanel::bottom("diff-view")
             .resizable(true)
             .default_height(diff_height)
             .height_range(135.0..=(ctx.screen_rect().height() * 0.57).max(135.0))
-            .frame(panel(PANEL, 11, 8))
+            .frame(panel(colors.panel, colors.border, 11, 8))
             .show(ctx, |ui| {
                 ui.set_min_height(ui.available_height());
                 self.diff_panel(ui, ctx);
@@ -476,17 +478,26 @@ impl eframe::App for Desk {
             .resizable(true)
             .default_width(inspector_width)
             .width_range(220.0..=inspector_limit)
-            .frame(panel(PANEL, 11, 9))
+            .frame(panel(colors.panel, colors.border, 11, 9))
             .show(ctx, |ui| self.inspector(ui, ctx));
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(BASE)
+                    .fill(colors.base)
                     .inner_margin(Margin::symmetric(11, 9)),
             )
             .show(ctx, |ui| self.history_panel(ui, ctx));
         self.dialogs(ctx);
         self.report_frame(ctx);
+        if let Some(theme) = next_theme {
+            self.settings.theme = theme;
+            theme.apply(ctx);
+            #[cfg(windows)]
+            if let Some(chrome) = &self.window_chrome {
+                chrome.apply_theme(theme);
+            }
+            self.save();
+        }
     }
 }
 
@@ -497,7 +508,8 @@ impl Desk {
         ctx: &egui::Context,
         height: f32,
         caption: Option<WindowButtons>,
-    ) -> ToolbarRegions {
+    ) -> (ToolbarRegions, Option<ThemeId>) {
+        let colors = theme::palette(ctx);
         let active = self.active.clone();
         let can_run = active
             .as_ref()
@@ -508,7 +520,7 @@ impl Desk {
         spacing.button_padding.y = 2.0;
         let (row, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
-        ui.painter().rect_filled(row, 0.0, CHROME);
+        ui.painter().rect_filled(row, 0.0, colors.chrome);
 
         let start = row.left() + 14.0;
         let caption_x = row.right()
@@ -560,13 +572,15 @@ impl Desk {
         if diff_tools.clicked() {
             self.tools_open = true;
         }
+        let appearance = appearance_menu(&mut tools, self.settings.theme);
+        let tools_bounds = diff_tools.rect.union(appearance.response.rect);
         let caption_area = Rect::from_min_max(pos2(caption_x, row.top()), row.max);
         let maximize =
             caption.map(|buttons| window_buttons(ui, caption_area, buttons, self.focused));
         ui.painter().hline(
             row.x_range(),
             row.bottom() - 0.5,
-            Stroke::new(1.0_f32, BORDER),
+            Stroke::new(1.0_f32, colors.border),
         );
         if let (Some(root), Some((title, operation))) = (active, action) {
             match operation {
@@ -591,17 +605,19 @@ impl Desk {
             }
         }
         let action_bounds = actions.min_rect();
-        ToolbarRegions {
+        let regions = ToolbarRegions {
             drag: Rect::from_min_max(
                 pos2(action_bounds.right() + 8.0, row.top()),
-                pos2(diff_tools.rect.left() - 8.0, row.bottom() - 1.0),
+                pos2(tools_bounds.left() - 8.0, row.bottom() - 1.0),
             ),
-            controls: [action_bounds, diff_tools.rect, caption_area],
+            controls: [action_bounds, tools_bounds, caption_area],
             maximize,
-        }
+        };
+        (regions, appearance.inner)
     }
 
     fn status_line(&self, ui: &mut egui::Ui) {
+        let colors = theme::palette(ui.ctx());
         ui.horizontal(|ui| {
             let busy = self
                 .state()
@@ -610,11 +626,11 @@ impl Desk {
                 || self.diff_busy
                 || !self.operations.is_empty();
             let color = if self.status_is_error {
-                RED
+                colors.removed.foreground
             } else if busy {
-                GOLD
+                colors.warning
             } else {
-                ACCENT
+                colors.accent
             };
             ui.label(RichText::new("●").size(9.0).color(color));
             let message = if self.status_message.is_empty() {
@@ -629,7 +645,11 @@ impl Desk {
             ui.add(
                 egui::Label::new(
                     RichText::new(message)
-                        .color(if self.status_is_error { RED } else { MUTE })
+                        .color(if self.status_is_error {
+                            colors.removed.foreground
+                        } else {
+                            colors.muted
+                        })
                         .small(),
                 )
                 .truncate(),
@@ -639,6 +659,7 @@ impl Desk {
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         const REPO_ROW_HEIGHT: f32 = 23.0;
         const MIN_REPO_ROWS: usize = 4;
         const MAX_DEFAULT_REPO_ROWS: usize = 6;
@@ -703,7 +724,7 @@ impl Desk {
             .min_scrolled_height(repo_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let guide_stroke = Stroke::new(1.0_f32, MUTE.gamma_multiply(0.26));
+                let guide_stroke = Stroke::new(1.0_f32, colors.tree_guide);
                 let mut guide_starts = [0.0; MAX_REPO_DEPTH];
                 if repositories.is_empty() {
                     ui.add_space(7.0);
@@ -738,13 +759,23 @@ impl Desk {
                         Sense::click(),
                     );
                     if active || response.hovered() {
-                        ui.painter()
-                            .rect_filled(rect, 4.0, if active { SELECTION } else { HOVER });
+                        ui.painter().rect_filled(
+                            rect,
+                            4.0,
+                            if active {
+                                colors.selection
+                            } else {
+                                colors.hover
+                            },
+                        );
                     }
                     if active {
                         let y = (rect.top() + 4.0)..=(rect.bottom() - 4.0);
-                        ui.painter()
-                            .vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, ACCENT));
+                        ui.painter().vline(
+                            rect.left() + 1.0,
+                            y,
+                            Stroke::new(2.0_f32, colors.accent),
+                        );
                     }
                     let symbol = Rect::from_center_size(
                         pos2(
@@ -766,8 +797,15 @@ impl Desk {
                     if row.depth < MAX_REPO_DEPTH {
                         guide_starts[row.depth] = symbol.bottom() + 1.5;
                     }
-                    ui.painter()
-                        .rect_filled(symbol, 4.0, if active { SELECTION } else { SHADE });
+                    ui.painter().rect_filled(
+                        symbol,
+                        4.0,
+                        if active {
+                            colors.selection
+                        } else {
+                            colors.control
+                        },
+                    );
                     ui.painter().text(
                         symbol.center(),
                         Align2::CENTER_CENTER,
@@ -777,15 +815,15 @@ impl Desk {
                             .to_uppercase()
                             .collect::<String>(),
                         FontId::proportional(10.0),
-                        if active { ACCENT } else { MUTE },
+                        if active { colors.accent } else { colors.muted },
                     );
-                    let name_color = if available { INK } else { MUTE };
+                    let name_color = if available { colors.text } else { colors.muted };
                     let detail_color = if !available {
-                        RED
+                        colors.removed.foreground
                     } else if active {
-                        ACCENT
+                        colors.accent
                     } else {
-                        MUTE
+                        colors.muted
                     };
                     let text_rect = Rect::from_min_max(
                         pos2(symbol.right() + 6.0, rect.top()),

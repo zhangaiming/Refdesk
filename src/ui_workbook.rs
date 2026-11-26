@@ -1,5 +1,6 @@
 use crate::diff::{CellPosition, Kind, WorkbookDiff, WorksheetDiff, address, column_name};
-use crate::ui::{ACCENT, BASE, BORDER, GREEN, INK, MUTE, RED, SHADE, fit_line, small_button};
+use crate::theme;
+use crate::ui::{fit_line, small_button};
 use crate::ui_diff::diff_header;
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, Vec2, pos2, vec2};
 use std::ops::Range;
@@ -25,8 +26,9 @@ impl SheetView {
         left: &str,
         right: &str,
     ) -> Option<String> {
+        let colors = theme::palette(ui.ctx());
         if workbook.sheets.is_empty() {
-            ui.label(egui::RichText::new("工作簿没有可显示的工作表").color(MUTE));
+            ui.label(egui::RichText::new("工作簿没有可显示的工作表").color(colors.muted));
             return None;
         }
         let mut selected = self
@@ -89,14 +91,14 @@ impl SheetView {
             ui.label(
                 egui::RichText::new(format!("全簿 {} 处变化", workbook.total))
                     .small()
-                    .color(MUTE),
+                    .color(colors.muted),
             );
             if let Some(status) = match workbook.sheets[selected].kind {
                 Kind::Add => Some("工作表已新增"),
                 Kind::Remove => Some("工作表已删除"),
                 _ => None,
             } {
-                ui.label(egui::RichText::new(status).small().color(MUTE));
+                ui.label(egui::RichText::new(status).small().color(colors.muted));
             }
         });
 
@@ -203,22 +205,23 @@ fn paint_pane(
     side: usize,
     focus: Option<CellPosition>,
 ) {
+    let colors = theme::palette(ui.ctx());
     let root = ui.painter().with_clip_rect(ui.clip_rect().intersect(pane));
     let data_origin = pane.min + vec2(ROW_HEADER, COLUMN_HEADER);
     let body = Rect::from_min_max(data_origin, pane.max);
     let grid = root.with_clip_rect(body);
     let row_font = FontId::monospace(11.0);
-    let line = Stroke::new(1.0_f32, BORDER);
-    root.rect_filled(pane, 0.0, BASE);
+    let line = Stroke::new(1.0_f32, colors.border);
+    root.rect_filled(pane, 0.0, colors.base);
     root.rect_filled(
         Rect::from_min_max(pane.min, pos2(pane.right(), data_origin.y)),
         0.0,
-        SHADE,
+        colors.control,
     );
     root.rect_filled(
         Rect::from_min_max(pane.min, pos2(data_origin.x, pane.bottom())),
         0.0,
-        SHADE,
+        colors.control,
     );
     let row_gutter = root.with_clip_rect(Rect::from_min_max(
         pos2(pane.left(), data_origin.y),
@@ -229,7 +232,11 @@ fn paint_pane(
         pos2(pane.right(), data_origin.y),
     ));
     let origin = data_origin - visible.offset;
-    let color = if side == 0 { RED } else { GREEN };
+    let change = if side == 0 {
+        colors.removed
+    } else {
+        colors.added
+    };
     for column in visible.columns.clone() {
         let x = origin.x + column as f32 * CELL_WIDTH;
         column_gutter.text(
@@ -237,7 +244,7 @@ fn paint_pane(
             Align2::CENTER_CENTER,
             column_name(column),
             row_font.clone(),
-            MUTE,
+            colors.muted,
         );
         column_gutter.vline(x + CELL_WIDTH, pane.top()..=data_origin.y, line);
     }
@@ -248,30 +255,39 @@ fn paint_pane(
             Align2::RIGHT_CENTER,
             (u64::from(row) + 1).to_string(),
             row_font.clone(),
-            MUTE,
+            colors.muted,
         );
         row_gutter.hline(pane.left()..=data_origin.x, y + ROW_HEIGHT, line);
         for col in visible.columns.clone() {
             let x = origin.x + col as f32 * CELL_WIDTH;
             let rect = Rect::from_min_size(pos2(x, y), vec2(CELL_WIDTH, ROW_HEIGHT));
             let position = (row, col);
+            grid.hline(rect.x_range(), rect.bottom(), line);
+            grid.vline(rect.right(), rect.y_range(), line);
             if let Some(values) = sheet.cell(position) {
                 let (old, new) = values.sides();
                 let value = [old, new][side];
                 if let Some(value) = value {
-                    if values.is_changed() {
-                        grid.rect_filled(rect, 0.0, color.gamma_multiply(0.23));
-                    }
-                    paint_value(&grid, rect, value);
+                    let color = if values.is_changed() {
+                        grid.rect_filled(rect, 0.0, change.background);
+                        grid.rect_stroke(
+                            rect,
+                            0.0,
+                            Stroke::new(1.0_f32, change.border),
+                            egui::StrokeKind::Inside,
+                        );
+                        change.foreground
+                    } else {
+                        colors.text
+                    };
+                    paint_value(&grid, rect, value, color);
                 }
             }
-            grid.hline(rect.x_range(), rect.bottom(), line);
-            grid.vline(rect.right(), rect.y_range(), line);
             if focus == Some(position) {
                 grid.rect_stroke(
                     rect.shrink(0.5),
                     0.0,
-                    Stroke::new(1.0_f32, ACCENT),
+                    Stroke::new(1.0_f32, colors.accent),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -281,13 +297,13 @@ fn paint_pane(
     root.vline(data_origin.x, pane.y_range(), line);
 }
 
-fn paint_value(painter: &egui::Painter, rect: Rect, value: &str) {
+fn paint_value(painter: &egui::Painter, rect: Rect, value: &str, color: Color32) {
     let line = value.lines().next().unwrap_or_default();
     let text = fit_line(
         painter,
         line.to_owned(),
         FontId::proportional(12.0),
-        INK,
+        color,
         rect.width() - 12.0,
     );
     let y = rect.center().y - text.size().y * 0.5;

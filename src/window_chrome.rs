@@ -1,4 +1,5 @@
-use crate::ui::{BORDER, ToolbarRegions, WindowButtons};
+use crate::theme::ThemeId;
+use crate::ui::{ToolbarRegions, WindowButtons};
 use eframe::egui::{Color32, Context, Rect};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
@@ -32,7 +33,6 @@ use windows_sys::Win32::{
 };
 
 const SUBCLASS_ID: usize = 1;
-const ACTIVE_BORDER: Color32 = Color32::from_rgb(86, 82, 75);
 
 #[derive(Clone, Copy, Default)]
 struct HitRegions {
@@ -46,6 +46,7 @@ struct FrameState {
     regions: Cell<HitRegions>,
     maximize_hovered: Cell<bool>,
     maximize_pressed: Cell<bool>,
+    theme: Cell<ThemeId>,
     context: Context,
 }
 
@@ -74,7 +75,7 @@ pub(crate) struct WindowChrome {
 }
 
 impl WindowChrome {
-    pub(crate) fn install(creation: &eframe::CreationContext<'_>) -> Option<Self> {
+    pub(crate) fn install(creation: &eframe::CreationContext<'_>, theme: ThemeId) -> Option<Self> {
         let RawWindowHandle::Win32(handle) = creation.window_handle().ok()?.as_raw() else {
             return None;
         };
@@ -84,6 +85,7 @@ impl WindowChrome {
             regions: Cell::default(),
             maximize_hovered: Cell::new(false),
             maximize_pressed: Cell::new(false),
+            theme: Cell::new(theme),
             context: creation.egui_ctx.clone(),
         });
 
@@ -118,10 +120,21 @@ impl WindowChrome {
             {
                 return None;
             }
-            set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, 1);
-            set_border(hwnd, GetForegroundWindow() == hwnd);
+            chrome.apply_theme(theme);
             Some(chrome)
         }
+    }
+
+    pub(crate) fn apply_theme(&self, theme: ThemeId) {
+        self.state.theme.set(theme);
+        set_attribute(
+            self.hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            u32::from(theme.is_dark()),
+        );
+        set_border(self.hwnd, theme, unsafe {
+            GetForegroundWindow() == self.hwnd
+        });
     }
 
     pub(crate) fn buttons(&self) -> WindowButtons {
@@ -195,7 +208,7 @@ unsafe extern "system" fn window_proc(
                 min_size.y = (min_size.y - standard_top_inset(hwnd)).max(1);
                 return result;
             }
-            WM_NCACTIVATE => set_border(hwnd, wparam != 0),
+            WM_NCACTIVATE => set_border(hwnd, state.theme.get(), wparam != 0),
             WM_DPICHANGED | WM_SIZE => {
                 state.regions.set(HitRegions::default());
                 state.set_maximize_hovered(false);
@@ -340,8 +353,13 @@ fn standard_top_inset(hwnd: HWND) -> i32 {
     -frame.top
 }
 
-fn set_border(hwnd: HWND, active: bool) {
-    let color = if active { ACTIVE_BORDER } else { BORDER };
+fn set_border(hwnd: HWND, theme: ThemeId, active: bool) {
+    let palette = theme.palette();
+    let color = if active {
+        palette.window_active_border
+    } else {
+        palette.border
+    };
     set_attribute(hwnd, DWMWA_BORDER_COLOR as u32, color_ref(color));
 }
 

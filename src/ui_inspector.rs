@@ -1,8 +1,9 @@
 use crate::app::{Desk, Selection};
 use crate::git::{Area, Change, Operation};
+use crate::theme;
 use crate::ui::{
-    ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, ROW, SELECTION, SHADE, centered_baseline,
-    fit_line, heading, paint_baseline, panel_divider, save_icon_button, split_panel_height,
+    ROW, centered_baseline, fit_line, heading, paint_baseline, panel_divider, save_icon_button,
+    split_panel_height,
 };
 use eframe::egui::{self, Align, FontId, Layout, Rect, RichText, Sense, UiBuilder, Vec2};
 use std::collections::HashMap;
@@ -23,7 +24,8 @@ struct CopyShaToast {
 }
 
 fn copy_sha_button(ui: &mut egui::Ui, icon: &egui::TextureHandle, sha: &str, toast_id: egui::Id) {
-    let response = save_icon_button(ui, icon, COPY_SHA_LABEL, FAINT);
+    let colors = theme::palette(ui.ctx());
+    let response = save_icon_button(ui, icon, COPY_SHA_LABEL, colors.subtle);
     if response.clicked() {
         ui.ctx().copy_text(sha.to_owned());
         let toast = CopyShaToast {
@@ -40,6 +42,7 @@ fn copy_sha_button(ui: &mut egui::Ui, icon: &egui::TextureHandle, sha: &str, toa
 }
 
 fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
+    let colors = theme::palette(ctx);
     let Some(toast) = ctx.data(|data| data.get_temp::<CopyShaToast>(toast_id)) else {
         return;
     };
@@ -53,7 +56,7 @@ fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
     let opacity = fade_in * fade_out;
     let drift = 6.0 * (1.0 - (1.0 - (elapsed / 0.28).clamp(0.0, 1.0)).powi(3));
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, toast_id));
-    let text = painter.layout_no_wrap("已复制".into(), FontId::proportional(12.0), INK);
+    let text = painter.layout_no_wrap("已复制".into(), FontId::proportional(12.0), colors.text);
     let padding = Vec2::new(8.0, 4.0);
     let size = text.size() + padding * 2.0;
     let bounds = ctx.screen_rect().shrink(6.0);
@@ -99,9 +102,10 @@ fn file_directory(
     directory: &str,
     same_name_directories: &[&str],
     width: f32,
+    color: egui::Color32,
 ) -> std::sync::Arc<egui::Galley> {
     let font = FontId::proportional(12.0);
-    let full = fit_line(painter, directory.to_owned(), font.clone(), FAINT, width);
+    let full = fit_line(painter, directory.to_owned(), font.clone(), color, width);
     if !full.elided {
         return full;
     }
@@ -134,13 +138,14 @@ fn file_directory(
         painter,
         format!("{prefix}{distinguishing}{suffix}"),
         font,
-        FAINT,
+        color,
         width,
     )
 }
 
 impl Desk {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let toast_id = ui.id().with("copy-sha-toast");
         let worktree = matches!(self.selection, Selection::Worktree);
         let active = self.active.clone();
@@ -197,7 +202,9 @@ impl Desk {
                         ui.add_enabled(
                             active.is_some(),
                             egui::TextEdit::multiline(&mut self.editor)
-                                .hint_text("写下本次提交的说明…")
+                                .hint_text(
+                                    RichText::new("写下本次提交的说明…").color(colors.subtle),
+                                )
                                 .desired_rows(1)
                                 .desired_width(f32::INFINITY)
                                 .min_size(Vec2::new(0.0, editor_height)),
@@ -207,13 +214,15 @@ impl Desk {
                     ui.label(
                         RichText::new(format!("{staged} 项已暂存"))
                             .small()
-                            .color(MUTE),
+                            .color(colors.muted),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         commit = ui
                             .add_enabled(
                                 staged > 0 && !self.editor.trim().is_empty() && !busy,
-                                egui::Button::new(RichText::new("提交").color(ACCENT).strong()),
+                                egui::Button::new(
+                                    RichText::new("提交").color(colors.accent).strong(),
+                                ),
                             )
                             .clicked();
                     });
@@ -223,27 +232,35 @@ impl Desk {
                     .id_salt("commit-detail")
                     .max_height(ui.available_height().max(0.0))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&details.title).size(14.0).strong().color(INK));
+                        ui.label(
+                            RichText::new(&details.title)
+                                .size(14.0)
+                                .strong()
+                                .color(colors.text),
+                        );
                         ui.label(
                             RichText::new(format!("{} · {}", details.author, details.date))
                                 .size(11.0)
-                                .color(MUTE),
+                                .color(colors.muted),
                         );
                         let (summary, rest) = details
                             .message
                             .split_once('\n')
                             .unwrap_or((&details.message, ""));
                         if details.title != summary {
-                            ui.label(RichText::new(summary).small().color(MUTE));
+                            ui.label(RichText::new(summary).small().color(colors.muted));
                         }
                         if !rest.trim().is_empty() {
-                            ui.label(RichText::new(rest.trim()).size(12.0).color(MUTE));
+                            ui.label(RichText::new(rest.trim()).size(12.0).color(colors.muted));
                         }
                         if let Selection::Commit { right, .. } = &self.selection {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
                                 ui.label(
-                                    RichText::new(&right.short).monospace().small().color(FAINT),
+                                    RichText::new(&right.short)
+                                        .monospace()
+                                        .small()
+                                        .color(colors.subtle),
                                 )
                                 .on_hover_text(&right.id);
                                 copy_sha_button(ui, &self.save_icon, &right.id, toast_id);
@@ -254,7 +271,7 @@ impl Desk {
                 egui::ScrollArea::vertical()
                     .id_salt("commit-error")
                     .max_height(ui.available_height().max(0.0))
-                    .show(ui, |ui| ui.colored_label(RED, error));
+                    .show(ui, |ui| ui.colored_label(colors.removed.foreground, error));
             }
         }
         if commit && let Some(root) = active {
@@ -266,6 +283,7 @@ impl Desk {
     }
 
     fn files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let worktree = matches!(self.selection, Selection::Worktree);
         let state = self.state();
         let count = if worktree {
@@ -289,7 +307,7 @@ impl Desk {
             }
         });
         if worktree && let Some(error) = state.and_then(|state| state.status_error.as_ref()) {
-            ui.colored_label(RED, error);
+            ui.colored_label(colors.removed.foreground, error);
         }
         if count == 0 && !state.is_some_and(|state| state.status_busy) && !self.details_busy {
             ui.label(
@@ -298,7 +316,7 @@ impl Desk {
                 } else {
                     "该提交没有文件变更"
                 })
-                .color(MUTE)
+                .color(colors.muted)
                 .small(),
             );
         }
@@ -347,24 +365,30 @@ impl Desk {
                         let baseline = rect.center().y + baseline_offset;
                         let file = match entries[index] {
                             FileRow::Group(name, count) => {
-                                painter.rect_filled(rect, 4.0, SHADE);
+                                painter.rect_filled(rect, 4.0, colors.control);
                                 let title = painter.layout_no_wrap(
                                     name.to_owned(),
                                     FontId::proportional(11.0),
-                                    MUTE,
+                                    colors.muted,
                                 );
                                 let count = painter.layout_no_wrap(
                                     count.to_string(),
                                     code_font.clone(),
-                                    MUTE,
+                                    colors.muted,
                                 );
-                                paint_baseline(painter, rect.left() + 7.0, baseline, title, MUTE);
+                                paint_baseline(
+                                    painter,
+                                    rect.left() + 7.0,
+                                    baseline,
+                                    title,
+                                    colors.muted,
+                                );
                                 paint_baseline(
                                     painter,
                                     right - count.size().x,
                                     baseline,
                                     count,
-                                    MUTE,
+                                    colors.muted,
                                 );
                                 continue;
                             }
@@ -377,14 +401,18 @@ impl Desk {
                             ui.painter().rect_filled(
                                 rect,
                                 4.0,
-                                if is_selected { SELECTION } else { HOVER },
+                                if is_selected {
+                                    colors.selection
+                                } else {
+                                    colors.hover
+                                },
                             );
                         }
                         let color = match file.code {
-                            'A' | '?' => GREEN,
-                            'D' | 'U' => RED,
-                            'R' => ACCENT,
-                            _ => GOLD,
+                            'A' | '?' => colors.added.foreground,
+                            'D' | 'U' => colors.removed.foreground,
+                            'R' => colors.accent,
+                            _ => colors.warning,
                         };
                         let code =
                             painter.layout_no_wrap(file.code.to_string(), code_font.clone(), color);
@@ -400,7 +428,7 @@ impl Desk {
                         if !directory.is_empty() {
                             let text_width = (name_width - FILE_COLUMN_GAP).max(0.0);
                             let natural_name_width = painter
-                                .layout_no_wrap(label.clone(), name_font.clone(), INK)
+                                .layout_no_wrap(label.clone(), name_font.clone(), colors.text)
                                 .size()
                                 .x;
                             let directory_width =
@@ -410,6 +438,7 @@ impl Desk {
                                 directory,
                                 &directories_by_name[short],
                                 directory_width,
+                                colors.subtle,
                             );
                             let directory_size = directory_galley.size().x;
                             paint_baseline(
@@ -417,12 +446,13 @@ impl Desk {
                                 right - directory_size,
                                 baseline,
                                 directory_galley,
-                                FAINT,
+                                colors.subtle,
                             );
                             name_width = text_width - directory_size;
                         }
-                        let name = fit_line(painter, label, name_font.clone(), INK, name_width);
-                        paint_baseline(painter, name_x, baseline, name, INK);
+                        let name =
+                            fit_line(painter, label, name_font.clone(), colors.text, name_width);
+                        paint_baseline(painter, name_x, baseline, name, colors.text);
                         if response.clicked() {
                             chosen = Some(file.clone());
                         }

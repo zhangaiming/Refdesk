@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::{diff, git};
+use crate::{diff, git, theme::ThemeId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolMode {
@@ -71,6 +71,7 @@ pub struct Settings {
     pub changes_only: bool,
     pub prefetch_history: bool,
     pub branch_selection: BTreeMap<PathBuf, git::HistoryScope>,
+    pub theme: ThemeId,
 }
 
 impl Default for Settings {
@@ -82,6 +83,7 @@ impl Default for Settings {
             changes_only: false,
             prefetch_history: true,
             branch_selection: BTreeMap::new(),
+            theme: ThemeId::default(),
         }
     }
 }
@@ -425,6 +427,41 @@ pub fn start_external(root: &Path, invocation: &[String]) -> Result<std::process
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_and_unknown_theme_settings_keep_the_rest_of_the_session() {
+        let old = r#"{"repositories":["repo"], "active":"repo", "changes_only":true}"#;
+        let unknown = r#"{"repositories":["repo"], "active":"repo", "changes_only":true, "theme":"future-preset"}"#;
+        for config in [old, unknown] {
+            let settings: Settings = serde_json::from_str(config).unwrap();
+            assert_eq!(settings.theme, ThemeId::WarmDark);
+            assert_eq!(settings.repositories, [PathBuf::from("repo")]);
+            assert_eq!(settings.active, Some(PathBuf::from("repo")));
+            assert!(settings.changes_only);
+        }
+    }
+
+    #[test]
+    fn every_theme_round_trips_with_its_stable_id() {
+        for (theme, id) in [
+            (ThemeId::WarmDark, "warm-dark"),
+            (ThemeId::CoolDark, "cool-dark"),
+            (ThemeId::CoolLight, "cool-light"),
+            (ThemeId::WarmLight, "warm-light"),
+        ] {
+            let settings = Settings {
+                theme,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["theme"], id);
+            assert_eq!(
+                serde_json::from_value::<Settings>(json).unwrap().theme,
+                theme
+            );
+        }
+    }
+
     #[test]
     fn windows_arguments_preserve_paths_and_substitute_after_tokenization() {
         let args = tokenize(r#"-B "C:\My Tools\xlsx.py" "${leftFile}" ${rightFile}"#).unwrap();

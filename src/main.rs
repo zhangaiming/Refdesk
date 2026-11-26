@@ -9,6 +9,7 @@ mod git;
 mod graph;
 mod settings;
 mod tasks;
+mod theme;
 mod timing;
 mod ui;
 mod ui_branches;
@@ -63,7 +64,7 @@ fn main() -> eframe::Result<()> {
         "Refdesk · Git",
         options,
         Box::new(move |context| {
-            ui::install_theme(&context.egui_ctx);
+            ui::install_style(&context.egui_ctx);
             Ok(Box::new(app::Desk::new(context, paths, import, started)))
         }),
     ) {

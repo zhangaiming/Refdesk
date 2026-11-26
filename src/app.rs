@@ -205,9 +205,10 @@ impl Desk {
                 .is_some_and(|path| is_descendant(active, path))
         });
         let status_is_error = warning.is_some();
+        settings.theme.apply(ctx);
         let mut desk = Self {
             #[cfg(windows)]
-            window_chrome: crate::window_chrome::WindowChrome::install(creation),
+            window_chrome: crate::window_chrome::WindowChrome::install(creation, settings.theme),
             settings,
             active: None,
             repos: HashMap::new(),

@@ -1,10 +1,12 @@
 use crate::app::Desk;
 use crate::diff::{Content, Kind, is_workbook};
-use crate::ui::{BORDER, FAINT, GREEN, INK, MUTE, RED, SHADE, paint, small_button};
-use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
+use crate::theme::{self, ChangeColors, Palette};
+use crate::ui::{paint, small_button};
+use eframe::egui::{self, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
 impl Desk {
     pub(crate) fn diff_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let path = self.file.as_ref().map(|file| file.path.clone());
         let selected_tool = path
             .as_ref()
@@ -18,10 +20,12 @@ impl Desk {
             .as_ref()
             .is_some_and(|file| !file.is_gitlink() && is_workbook(&file.path));
         ui.horizontal(|ui| {
-            ui.label(RichText::new("差异").size(17.0).strong().color(INK));
+            ui.label(RichText::new("差异").size(17.0).strong().color(colors.text));
             if let Some(path) = &path {
-                ui.add(egui::Label::new(RichText::new(path).size(12.0).color(MUTE)).truncate())
-                    .on_hover_text(path);
+                ui.add(
+                    egui::Label::new(RichText::new(path).size(12.0).color(colors.muted)).truncate(),
+                )
+                .on_hover_text(path);
             }
             if self.diff_busy {
                 ui.spinner();
@@ -65,13 +69,13 @@ impl Desk {
         if self.file.is_none() {
             ui.add_space(8.0);
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("从右侧文件列表选择一项来比较").color(MUTE));
+                ui.label(RichText::new("从右侧文件列表选择一项来比较").color(colors.muted));
             });
             return;
         }
         if let Some(error) = &self.diff_error {
             ui.add_space(8.0);
-            ui.colored_label(RED, error);
+            ui.colored_label(colors.removed.foreground, error);
             return;
         }
         let Some(pair) = self.comparison.as_ref() else {
@@ -99,7 +103,7 @@ impl Desk {
                         })
                         .collect();
                     if *added + *removed == 0 {
-                        ui.label(RichText::new("文本内容相同").small().color(MUTE));
+                        ui.label(RichText::new("文本内容相同").small().color(colors.muted));
                     }
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -118,8 +122,11 @@ impl Desk {
                                         ui,
                                         left,
                                         line.old.as_ref(),
+                                        colors,
                                         match line.kind {
-                                            Kind::Remove | Kind::Replace => Some(RED),
+                                            Kind::Remove | Kind::Replace => {
+                                                Some((colors.removed, '−'))
+                                            }
                                             _ => None,
                                         },
                                     );
@@ -127,15 +134,16 @@ impl Desk {
                                         ui,
                                         right,
                                         line.new.as_ref(),
+                                        colors,
                                         match line.kind {
-                                            Kind::Add | Kind::Replace => Some(GREEN),
+                                            Kind::Add | Kind::Replace => Some((colors.added, '+')),
                                             _ => None,
                                         },
                                     );
                                     ui.painter().vline(
                                         right.left(),
                                         rect.y_range(),
-                                        Stroke::new(1.0_f32, BORDER),
+                                        Stroke::new(1.0_f32, colors.border),
                                     );
                                     if response.clicked()
                                         && let Some(pointer) = response.interact_pointer_pos()
@@ -166,11 +174,11 @@ impl Desk {
                         RichText::new(format!(
                             "二进制文件，旧版本 {left} 字节，新版本 {right} 字节。"
                         ))
-                        .color(MUTE),
+                        .color(colors.muted),
                     );
                 }
                 Content::Notice(message) => {
-                    ui.label(RichText::new(message).color(MUTE));
+                    ui.label(RichText::new(message).color(colors.muted));
                 }
             }
         }
@@ -189,9 +197,10 @@ fn halves(rect: Rect) -> (Rect, Rect) {
 }
 
 pub(crate) fn diff_header(ui: &mut egui::Ui, left: &str, right: &str) {
+    let colors = theme::palette(ui.ctx());
     ui.add_space(3.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 25.0), Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, SHADE);
+    ui.painter().rect_filled(rect, 3.0, colors.control);
     let (l, r) = halves(rect);
     paint(
         ui,
@@ -199,7 +208,7 @@ pub(crate) fn diff_header(ui: &mut egui::Ui, left: &str, right: &str) {
         l.left() + 10.0,
         left,
         FontId::proportional(12.0),
-        MUTE,
+        colors.muted,
     );
     paint(
         ui,
@@ -207,38 +216,44 @@ pub(crate) fn diff_header(ui: &mut egui::Ui, left: &str, right: &str) {
         r.left() + 10.0,
         right,
         FontId::proportional(12.0),
-        MUTE,
+        colors.muted,
     );
 }
 
-fn code(ui: &egui::Ui, rect: Rect, value: Option<&(usize, String)>, color: Option<Color32>) {
-    if let Some(color) = color {
-        ui.painter()
-            .rect_filled(rect, 0.0, color.gamma_multiply(0.13));
-    }
+fn code(
+    ui: &egui::Ui,
+    rect: Rect,
+    value: Option<&(usize, String)>,
+    colors: &Palette,
+    change: Option<(ChangeColors, char)>,
+) {
     let Some((number, text)) = value else { return };
     let gutter = Rect::from_min_max(rect.min, pos2(rect.left() + 49.0, rect.bottom()));
+    let (gutter_text, gutter_color) = if let Some((change, sign)) = change {
+        ui.painter().rect_filled(rect, 0.0, change.background);
+        ui.painter().vline(
+            rect.left() + 47.0,
+            rect.y_range(),
+            Stroke::new(2.0_f32, change.border),
+        );
+        (format!("{sign}{number}"), change.foreground)
+    } else {
+        (number.to_string(), colors.subtle)
+    };
     paint(
         ui,
         gutter,
         rect.left() + 8.0,
-        &number.to_string(),
+        &gutter_text,
         FontId::monospace(11.0),
-        FAINT,
+        gutter_color,
     );
-    if let Some(color) = color {
-        ui.painter().vline(
-            rect.left() + 47.0,
-            rect.y_range(),
-            Stroke::new(2.0_f32, color),
-        );
-    }
     paint(
         ui,
         rect,
         rect.left() + 54.0,
         text,
         FontId::monospace(12.0),
-        INK,
+        colors.text,
     );
 }

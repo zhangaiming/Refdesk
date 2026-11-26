@@ -1,25 +1,15 @@
 use crate::app::{Desk, Selection};
 use crate::git::{Commit, History, HistoryPage, HistoryScope, Reference};
 use crate::graph::{GraphRow, Span};
+use crate::theme;
 use crate::ui::{
-    ACCENT, BASE, CONTROL_HEIGHT, DETAIL_SIZE, DIVIDER, FAINT, HOVER, INK, MUTE, ROW, SELECTION,
-    SHADE, centered_baseline, filter_field, fit_line, paint_baseline, small_button,
+    CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, paint_baseline,
+    small_button,
 };
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
 const SUBJECT_SIZE: f32 = 14.0;
 const GRAPH_INSET: f32 = 9.0;
-
-const PALETTE: [Color32; 8] = [
-    ACCENT,
-    Color32::from_rgb(144, 178, 222),
-    Color32::from_rgb(226, 180, 131),
-    Color32::from_rgb(191, 148, 215),
-    Color32::from_rgb(245, 196, 91),
-    Color32::from_rgb(118, 201, 226),
-    Color32::from_rgb(236, 132, 152),
-    Color32::from_rgb(176, 203, 104),
-];
 
 enum Click {
     Worktree,
@@ -28,6 +18,7 @@ enum Click {
 
 impl Desk {
     pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let id = ui.make_persistent_id("find-commit");
         let shortcut =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
@@ -55,11 +46,16 @@ impl Desk {
         let mut next = false;
         let mut previous = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("提交图").color(INK).size(16.0).strong());
+            ui.label(
+                RichText::new("提交图")
+                    .color(colors.text)
+                    .size(16.0)
+                    .strong(),
+            );
             if let Some(tip) = &filter_tip {
                 clear_filter = small_button(ui, &filter_label).on_hover_text(tip).clicked();
             } else {
-                ui.label(RichText::new(&filter_label).small().color(MUTE));
+                ui.label(RichText::new(&filter_label).small().color(colors.muted));
             }
             if busy {
                 ui.spinner();
@@ -79,7 +75,11 @@ impl Desk {
                             .clamp(64.0, 176.0),
                             CONTROL_HEIGHT,
                         ],
-                        filter_field(&mut self.search, "筛选提交…").id(id),
+                        filter_field(
+                            &mut self.search,
+                            RichText::new("筛选提交…").color(colors.subtle),
+                        )
+                        .id(id),
                     )
                     .on_hover_text("筛选提交（Ctrl+F）");
                 if shortcut {
@@ -114,11 +114,11 @@ impl Desk {
         }
         ui.add_space(5.0);
         if let Some(error) = self.state().and_then(|state| state.history_error.as_ref()) {
-            ui.colored_label(crate::ui::RED, error);
+            ui.colored_label(colors.removed.foreground, error);
         }
         let Some(state) = self.state() else {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("添加一个 Git 仓库以打开提交图").color(MUTE));
+                ui.label(RichText::new("添加一个 Git 仓库以打开提交图").color(colors.muted));
             });
             return;
         };
@@ -204,16 +204,22 @@ impl Desk {
                         ui.painter().rect_filled(
                             Rect::from_center_size(dot, Vec2::splat(8.0)),
                             2.0,
-                            ACCENT,
+                            colors.accent,
                         );
                         let columns = HistoryColumns::new(rect, graph_width);
                         let baseline = rect.center().y + baseline_offset;
                         let label = ui.painter().layout_no_wrap(
                             "工作树 / 暂存区".into(),
                             FontId::proportional(SUBJECT_SIZE),
-                            INK,
+                            colors.text,
                         );
-                        paint_baseline(ui.painter(), columns.subject.left(), baseline, label, INK);
+                        paint_baseline(
+                            ui.painter(),
+                            columns.subject.left(),
+                            baseline,
+                            label,
+                            colors.text,
+                        );
                         let summary = if state.status_busy && state.status.is_none() {
                             "读取状态…".into()
                         } else if let Some(0) = working {
@@ -224,19 +230,19 @@ impl Desk {
                         let status = ui.painter().layout_no_wrap(
                             summary,
                             FontId::proportional(DETAIL_SIZE),
-                            MUTE,
+                            colors.muted,
                         );
                         paint_baseline(
                             ui.painter(),
                             rect.right() - HistoryColumns::END_INSET - status.size().x,
                             baseline,
                             status,
-                            MUTE,
+                            colors.muted,
                         );
                         ui.painter().hline(
                             rect.x_range(),
                             rect.bottom(),
-                            Stroke::new(1.0_f32, DIVIDER),
+                            Stroke::new(1.0_f32, colors.divider),
                         );
                         if response.clicked() {
                             click = Some(Click::Worktree);
@@ -285,7 +291,7 @@ impl Desk {
                         .graph
                         .rows
                         .get(index - 1)
-                        .map(|row| PALETTE[row.color % PALETTE.len()]);
+                        .map(|row| colors.lane(row.color));
                     draw_commit(
                         ui,
                         rect,
@@ -348,20 +354,20 @@ impl Desk {
                 } else {
                     format!("{} / {count} 条匹配", hits.len())
                 })
-                .color(MUTE)
+                .color(colors.muted)
                 .small(),
             );
             if let Some(history) = state.history.as_ref() {
                 ui.label(
                     RichText::new(format!("· {} ms", history.elapsed_ms))
-                        .color(FAINT)
+                        .color(colors.subtle)
                         .small(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match page {
                     HistoryPage::Truncated => {
-                        ui.label(RichText::new("已达显示上限").small().color(MUTE));
+                        ui.label(RichText::new("已达显示上限").small().color(colors.muted));
                     }
                     HistoryPage::More if !busy => {
                         more = small_button(ui, "加载更多").clicked();
@@ -369,7 +375,7 @@ impl Desk {
                     _ => {}
                 }
                 if let Selection::Commit { left: Some(_), .. } = self.selection {
-                    ui.label(RichText::new("两提交比较").small().color(ACCENT));
+                    ui.label(RichText::new("两提交比较").small().color(colors.accent));
                 }
             });
         });
@@ -431,19 +437,20 @@ impl HistoryColumns {
 }
 
 fn table_header(ui: &mut egui::Ui, width: f32, graph_width: f32) {
+    let colors = theme::palette(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW), Sense::hover());
     let columns = HistoryColumns::new(rect, graph_width);
     let painter = ui.painter();
     let font = FontId::proportional(DETAIL_SIZE);
     let baseline = rect.center().y + centered_baseline(painter, font.clone());
-    painter.rect_filled(rect, 3.0, SHADE);
+    painter.rect_filled(rect, 3.0, colors.control);
     let graph = Rect::from_min_max(pos2(rect.left() + GRAPH_INSET, rect.top()), rect.max);
     for (column, label, align, color) in [
-        (Some(graph), "图", Align::Min, MUTE),
-        (Some(columns.subject), "提交消息", Align::Min, INK),
-        (columns.author, "作者", Align::Min, MUTE),
-        (columns.date, "日期", Align::Max, MUTE),
-        (columns.sha, "SHA", Align::Max, MUTE),
+        (Some(graph), "图", Align::Min, colors.muted),
+        (Some(columns.subject), "提交消息", Align::Min, colors.text),
+        (columns.author, "作者", Align::Min, colors.muted),
+        (columns.date, "日期", Align::Max, colors.muted),
+        (columns.sha, "SHA", Align::Max, colors.muted),
     ] {
         if let Some(column) = column {
             let galley = painter.layout_no_wrap(label.into(), font.clone(), color);
@@ -456,26 +463,27 @@ fn table_header(ui: &mut egui::Ui, width: f32, graph_width: f32) {
 }
 
 fn row_fill(ui: &egui::Ui, rect: Rect, selected: bool, response: &egui::Response, matched: bool) {
+    let colors = theme::palette(ui.ctx());
     let painter = ui.painter();
     if selected || response.hovered() || matched {
         let fill = if selected {
-            SELECTION
+            colors.selection
         } else if response.hovered() {
-            HOVER
+            colors.hover
         } else {
-            SHADE
+            colors.control
         };
         painter.rect_filled(rect, 3.0, fill);
     }
     if selected {
         let y = (rect.top() + 3.0)..=(rect.bottom() - 3.0);
-        painter.vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, ACCENT));
+        painter.vline(rect.left() + 1.0, y, Stroke::new(2.0_f32, colors.accent));
     }
     if response.has_focus() {
         painter.rect_stroke(
             rect.shrink(0.5),
             3.0,
-            Stroke::new(1.0_f32, ACCENT),
+            Stroke::new(1.0_f32, colors.accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -490,7 +498,8 @@ fn lane_x(rect: Rect, width: f32, lanes: usize, lane: usize) -> f32 {
 }
 
 fn worktree_link(ui: &egui::Ui, a: egui::Pos2, b: egui::Pos2) {
-    let stroke = Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.45));
+    let colors = theme::palette(ui.ctx());
+    let stroke = Stroke::new(1.0_f32, colors.accent.gamma_multiply(0.45));
     if a.x == b.x {
         ui.painter()
             .extend(egui::Shape::dashed_line(&[a, b], stroke, 3.5, 3.0));
@@ -514,6 +523,7 @@ fn draw_rails(
     merge: bool,
     head: bool,
 ) {
+    let colors = theme::palette(ui.ctx());
     let gap = lane_gap(width, lanes);
     let x = |lane: usize| lane_x(rect, width, lanes, lane);
     let y = |span: Span| match span {
@@ -529,7 +539,7 @@ fn draw_rails(
     for rail in &graph.rails {
         let a = pos2(x(rail.from), y(rail.start));
         let b = pos2(x(rail.to), y(rail.end));
-        let color = PALETTE[rail.color % PALETTE.len()].gamma_multiply(0.94);
+        let color = colors.lane(rail.color).gamma_multiply(0.94);
         if rail.from == rail.to {
             painter.line_segment([a, b], Stroke::new(stroke_width, color));
         } else {
@@ -549,9 +559,9 @@ fn draw_rails(
     }
     let point = pos2(x(graph.lane), rect.center().y);
     let radius = (gap * 0.36).clamp(1.15, 3.25);
-    let color = PALETTE[graph.color % PALETTE.len()];
+    let color = colors.lane(graph.color);
     if head {
-        painter.circle_stroke(point, 6.0, Stroke::new(1.2_f32, ACCENT));
+        painter.circle_stroke(point, 6.0, Stroke::new(1.2_f32, colors.accent));
     }
     if merge {
         let t = radius + 1.0;
@@ -567,7 +577,7 @@ fn draw_rails(
         ));
     } else {
         let radius = if head { 3.6 } else { radius };
-        painter.circle_filled(point, radius, BASE);
+        painter.circle_filled(point, radius, colors.base);
         painter.circle_stroke(point, radius, Stroke::new(1.55_f32, color));
     }
 }
@@ -626,6 +636,7 @@ fn draw_commit(
     dim: bool,
     lane_color: Option<Color32>,
 ) {
+    let colors = theme::palette(ui.ctx());
     let columns = HistoryColumns::new(rect, graph_width);
     let painter = ui
         .painter()
@@ -633,7 +644,7 @@ fn draw_commit(
     let head = history.head.as_ref() == Some(&commit.id);
     let branches = graph_references_at(history, &commit.id);
     let badges = head
-        .then(|| ("HEAD".to_owned(), None, String::new(), ACCENT))
+        .then(|| ("HEAD".to_owned(), None, String::new(), colors.accent))
         .into_iter()
         .chain(branches.into_iter().take(3).map(|branch| {
             let (label, counts) = graph_label(branch);
@@ -644,9 +655,9 @@ fn draw_commit(
                 .zip(branch.label().rsplit_once('/'))
                 .map(|(remote, (_, leaf))| format!("{remote} · {leaf}"));
             let color = if branch.name.starts_with("refs/tags/") {
-                PALETTE[2]
+                colors.lane(2)
             } else {
-                lane_color.unwrap_or(MUTE)
+                lane_color.unwrap_or(colors.muted)
             };
             (label, compact, counts, color)
         }));
@@ -686,7 +697,7 @@ fn draw_commit(
         labels.push((label, suffix, badge_width, color));
     }
 
-    let subject_color = if dim { FAINT } else { INK };
+    let subject_color = if dim { colors.subtle } else { colors.text };
     let subject = fit_line(
         &painter,
         commit.subject.clone(),
@@ -727,10 +738,10 @@ fn draw_commit(
             ui.painter(),
             commit.author.clone(),
             FontId::proportional(DETAIL_SIZE),
-            MUTE,
+            colors.muted,
             author.width(),
         );
-        paint_baseline(ui.painter(), author.left(), baseline, name, MUTE);
+        paint_baseline(ui.painter(), author.left(), baseline, name, colors.muted);
     }
     for (column, value) in [
         (columns.date, commit.date.get(5..).unwrap_or(&commit.date)),
@@ -740,20 +751,21 @@ fn draw_commit(
             let painter = ui
                 .painter()
                 .with_clip_rect(column.intersect(ui.clip_rect()));
-            let value = painter.layout_no_wrap(value.into(), FontId::monospace(DETAIL_SIZE), FAINT);
+            let value =
+                painter.layout_no_wrap(value.into(), FontId::monospace(DETAIL_SIZE), colors.subtle);
             paint_baseline(
                 &painter,
                 column.right() - value.size().x,
                 baseline,
                 value,
-                FAINT,
+                colors.subtle,
             );
         }
     }
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
-        Stroke::new(0.75_f32, DIVIDER),
+        Stroke::new(0.75_f32, colors.divider),
     );
 }
 

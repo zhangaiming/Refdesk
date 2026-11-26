@@ -1,8 +1,9 @@
 use crate::app::{Desk, Dialog};
 use crate::git::{HistoryScope, Operation, Reference, TrackingState};
+use crate::theme::{self, Palette};
 use crate::ui::{
-    ACCENT, DETAIL_SIZE, FAINT, GOLD, GREEN, HOVER, INK, MUTE, SELECTION, centered_baseline,
-    compact_button, filter_field, fit_line, heading, paint_baseline, small_button,
+    DETAIL_SIZE, centered_baseline, compact_button, filter_field, fit_line, heading,
+    paint_baseline, small_button,
 };
 use eframe::egui::{
     self, Align, Color32, FontId, Galley, Layout, Painter, RichText, Sense, Stroke, Vec2,
@@ -184,6 +185,7 @@ impl BranchView<'_> {
     }
 
     fn leaf(&mut self, ui: &mut egui::Ui, reference: &Reference) {
+        let colors = theme::palette(ui.ctx());
         let label = reference.label();
         let short = label.rsplit('/').next().unwrap_or(label);
         let local = reference.name.starts_with("refs/heads/");
@@ -204,7 +206,7 @@ impl BranchView<'_> {
                     ui.painter().circle_filled(
                         pos2(marker_x, checkbox.rect.center().y),
                         2.4,
-                        ACCENT,
+                        colors.accent,
                     );
                 }
                 let response = branch_line(ui, reference, short, current);
@@ -241,11 +243,12 @@ fn branch_line(
     name: &str,
     current: bool,
 ) -> egui::Response {
+    let colors = theme::palette(ui.ctx());
     let width = ui.available_width();
     let height = ui.spacing().interact_size.y;
     let font = FontId::proportional(BRANCH_NAME_SIZE);
     let remote_font = FontId::proportional(DETAIL_SIZE);
-    let color = if current { ACCENT } else { INK };
+    let color = if current { colors.accent } else { colors.text };
     let name_width = ui
         .painter()
         .layout_no_wrap(name.into(), font.clone(), color)
@@ -259,9 +262,12 @@ fn branch_line(
     if let Some(upstream) = &reference.upstream {
         let status = match upstream.state {
             TrackingState::Counts { ahead, behind } if ahead > 0 && behind > 0 => {
-                vec![(format!("+{ahead}"), GREEN), (format!("−{behind}"), GOLD)]
+                vec![
+                    (format!("+{ahead}"), colors.added.foreground),
+                    (format!("−{behind}"), colors.warning),
+                ]
             }
-            state => vec![(state.caption(), tracking_color(state))],
+            state => vec![(state.caption(), tracking_color(state, colors))],
         };
         counts = status
             .into_iter()
@@ -278,7 +284,7 @@ fn branch_line(
         let label = same.unwrap_or_else(|| upstream.label());
         let label_width = ui
             .painter()
-            .layout_no_wrap(label.into(), remote_font.clone(), FAINT)
+            .layout_no_wrap(label.into(), remote_font.clone(), colors.subtle)
             .size()
             .x;
         // A short branch and its two counts remain readable even in the
@@ -298,14 +304,18 @@ fn branch_line(
         painter.rect_filled(
             rect,
             3.0,
-            if response.hovered() { HOVER } else { SELECTION },
+            if response.hovered() {
+                colors.hover
+            } else {
+                colors.selection
+            },
         );
     }
     if response.has_focus() {
         painter.rect_stroke(
             rect.shrink(0.5),
             3.0,
-            Stroke::new(1.0_f32, ACCENT),
+            Stroke::new(1.0_f32, colors.accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -315,7 +325,7 @@ fn branch_line(
     let mut right = rect.right() - BRANCH_INSET;
     for count in counts.into_iter().rev() {
         right -= count.size().x;
-        paint_baseline(&painter, right, baseline, count, FAINT);
+        paint_baseline(&painter, right, baseline, count, colors.subtle);
         right -= count_gap;
     }
     let available = text_width.max(0.0);
@@ -325,23 +335,35 @@ fn branch_line(
     paint_baseline(&painter, left, baseline, branch, color);
     if let Some(remote) = inline_remote {
         let start = left + branch_width + UPSTREAM_GAP;
-        let label = fit_upstream(&painter, remote, remote_font.clone(), right - start);
-        paint_baseline(&painter, start, baseline, label, FAINT);
+        let label = fit_upstream(
+            &painter,
+            remote,
+            remote_font.clone(),
+            right - start,
+            colors.subtle,
+        );
+        paint_baseline(&painter, start, baseline, label, colors.subtle);
     }
     if let Some(remote) = remote.filter(|_| remote_on_second_line) {
         let available = rect.right() - BRANCH_INSET - left;
-        let label = fit_upstream(&painter, remote, remote_font, available);
+        let label = fit_upstream(&painter, remote, remote_font, available, colors.subtle);
         painter.galley(
             pos2(left, rect.top() + height + (extra - label.size().y) / 2.0),
             label,
-            FAINT,
+            colors.subtle,
         );
     }
     response
 }
 
-fn fit_upstream(painter: &Painter, upstream: &str, font: FontId, width: f32) -> Arc<Galley> {
-    let full = fit_line(painter, upstream.into(), font.clone(), FAINT, width);
+fn fit_upstream(
+    painter: &Painter,
+    upstream: &str,
+    font: FontId,
+    width: f32,
+    color: Color32,
+) -> Arc<Galley> {
+    let full = fit_line(painter, upstream.into(), font.clone(), color, width);
     if !full.elided {
         return full;
     }
@@ -352,7 +374,7 @@ fn fit_upstream(painter: &Painter, upstream: &str, font: FontId, width: f32) -> 
             format!("{remote} · {leaf}"),
             format!("…/{leaf}"),
         ] {
-            let label = fit_line(painter, short, font.clone(), FAINT, width);
+            let label = fit_line(painter, short, font.clone(), color, width);
             if !label.elided {
                 return label;
             }
@@ -361,17 +383,18 @@ fn fit_upstream(painter: &Painter, upstream: &str, font: FontId, width: f32) -> 
     full
 }
 
-fn tracking_color(state: TrackingState) -> Color32 {
+fn tracking_color(state: TrackingState, colors: &Palette) -> Color32 {
     match state {
-        TrackingState::Counts { ahead, .. } if ahead > 0 => GREEN,
-        TrackingState::Counts { behind, .. } if behind > 0 => GOLD,
-        TrackingState::Gone => GOLD,
-        _ => FAINT,
+        TrackingState::Counts { ahead, .. } if ahead > 0 => colors.added.foreground,
+        TrackingState::Counts { behind, .. } if behind > 0 => colors.warning,
+        TrackingState::Gone => colors.warning,
+        _ => colors.subtle,
     }
 }
 
 impl Desk {
     pub(crate) fn branches(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let count = self
             .state()
             .and_then(|state| state.history.as_ref())
@@ -394,7 +417,11 @@ impl Desk {
             });
         });
         ui.add(
-            filter_field(&mut self.branch_query, "筛选分支和标签…").desired_width(f32::INFINITY),
+            filter_field(
+                &mut self.branch_query,
+                RichText::new("筛选分支和标签…").color(colors.subtle),
+            )
+            .desired_width(f32::INFINITY),
         );
 
         if let Some(state) = self.state()
@@ -436,7 +463,11 @@ impl Desk {
                         view.group(ui, key, label, group, *open);
                     }
                     if view.searching && groups.iter().all(|group| group.total == 0) {
-                        ui.label(RichText::new("没有匹配的分支或标签").small().color(MUTE));
+                        ui.label(
+                            RichText::new("没有匹配的分支或标签")
+                                .small()
+                                .color(colors.muted),
+                        );
                     }
                 });
             action = view.action;
@@ -446,7 +477,7 @@ impl Desk {
             } else {
                 "暂无分支"
             };
-            ui.label(RichText::new(reason).color(MUTE).small());
+            ui.label(RichText::new(reason).color(colors.muted).small());
         }
 
         match action {

@@ -1,11 +1,13 @@
 use crate::app::{Desk, Dialog};
 use crate::git::Operation;
 use crate::settings::{self, Tool, ToolMode};
-use crate::ui::{ACCENT, MUTE, small_button};
+use crate::theme;
+use crate::ui::small_button;
 use eframe::egui::{self, Align2, RichText, Vec2};
 
 impl Desk {
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         if let Some(mut dialog) = self.dialog.take() {
             let mut keep = true;
             match &mut dialog {
@@ -58,7 +60,7 @@ impl Desk {
                             ui.label(
                                 RichText::new(root.display().to_string())
                                     .small()
-                                    .color(MUTE),
+                                    .color(colors.muted),
                             );
                             ui.horizontal(|ui| {
                                 if ui.button("取消").clicked() {
@@ -123,6 +125,7 @@ impl Desk {
     }
 
     fn tools_dialog(&mut self, ctx: &egui::Context) {
+        let colors = theme::palette(ctx);
         let mut open = self.tools_open;
         let mut import = None;
         let mut remove = None;
@@ -150,11 +153,15 @@ impl Desk {
                 });
                 ui.label(
                     RichText::new("按从上到下的顺序匹配文件名。")
-                        .color(MUTE)
+                        .color(colors.muted)
                         .small(),
                 );
                 if !self.import_message.is_empty() {
-                    ui.label(RichText::new(&self.import_message).color(ACCENT).small());
+                    ui.label(
+                        RichText::new(&self.import_message)
+                            .color(colors.accent)
+                            .small(),
+                    );
                 }
                 egui::ScrollArea::vertical()
                     .max_height(440.0)
