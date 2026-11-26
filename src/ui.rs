@@ -95,7 +95,19 @@ pub(crate) fn fit_line(
     color: Color32,
     width: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    let mut job = LayoutJob::simple_singleline(text, font, color);
+    fit_line_job(
+        painter,
+        LayoutJob::simple_singleline(text, font, color),
+        width,
+    )
+}
+
+pub(crate) fn fit_line_job(
+    painter: &egui::Painter,
+    mut job: LayoutJob,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    job.break_on_newline = false;
     job.wrap.max_width = width.max(0.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;

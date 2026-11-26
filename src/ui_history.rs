@@ -1,12 +1,13 @@
 use crate::app::{Desk, Selection};
-use crate::git::{Commit, History, HistoryScope, PAGE, Reference};
+use crate::git::{Commit, History, HistoryScope, PAGE, Reference, TrackingState};
 use crate::graph::{GraphRow, Span};
 use crate::history::{SearchDirection, matches_search};
 use crate::theme;
 use crate::ui::{
-    CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, galley_baseline,
-    heading, paint_baseline, small_button,
+    CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, fit_line_job,
+    galley_baseline, heading, paint_baseline, small_button,
 };
+use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
 const SUBJECT_SIZE: f32 = 14.0;
@@ -575,17 +576,70 @@ fn draw_rails(
     }
 }
 
-fn graph_label(reference: &Reference) -> (String, String) {
+fn graph_label(reference: &Reference) -> (String, Option<&str>) {
     let label = reference.label();
     let Some(upstream) = &reference.upstream else {
-        return (label.into(), String::new());
+        return (label.into(), None);
     };
-    let relation = if let Some(remote) = upstream.same_branch_remote(reference) {
-        format!("{remote} · {label}")
+    let remote = upstream.same_branch_remote(reference);
+    let relation = remote.map_or_else(
+        || format!("{label} · {}", upstream.label()),
+        |remote| format!("{remote} · {label}"),
+    );
+    (relation, remote)
+}
+
+#[derive(Clone, Copy)]
+enum RefBadgeStyle {
+    Head,
+    Local,
+    Remote,
+    Tag,
+}
+
+fn ref_label_job(label: String, color: Color32, subtle: Color32, remote_first: bool) -> LayoutJob {
+    let font = FontId::proportional(DETAIL_SIZE);
+    let Some((first, second)) = label.split_once(" · ") else {
+        return LayoutJob::simple_singleline(label, font, color);
+    };
+    let mut job = LayoutJob::default();
+    let (first_color, second_color) = if remote_first {
+        (subtle, color)
     } else {
-        format!("{label} · {}", upstream.label())
+        (color, subtle)
     };
-    (relation, upstream.state.caption())
+    for (text, color) in [
+        (first, first_color),
+        (" · ", subtle),
+        (second, second_color),
+    ] {
+        job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+    }
+    job
+}
+
+fn ref_counts_job(state: TrackingState, colors: &theme::Palette) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let font = FontId::monospace(DETAIL_SIZE);
+    let mut append = |text: &str, color| {
+        job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+    };
+    match state {
+        TrackingState::Counts { ahead, behind } if ahead > 0 && behind > 0 => {
+            append(&format!("+{ahead} "), colors.added.foreground);
+            append(&format!("−{behind}"), colors.warning);
+        }
+        state => {
+            let color = match state {
+                TrackingState::Counts { ahead, .. } if ahead > 0 => colors.added.foreground,
+                TrackingState::Counts { behind, .. } if behind > 0 => colors.warning,
+                TrackingState::Gone => colors.warning,
+                _ => colors.muted,
+            };
+            append(&state.caption(), color);
+        }
+    }
+    job
 }
 
 fn graph_references_at<'a>(history: &'a History, target: &str) -> Vec<&'a Reference> {
@@ -637,24 +691,29 @@ fn draw_commit(
     let head = history.head.as_ref() == Some(&commit.id);
     let branches = graph_references_at(history, &commit.id);
     let badges = head
-        .then(|| ("HEAD".to_owned(), None, String::new(), colors.accent))
+        .then(|| ("HEAD".to_owned(), None, None, false, RefBadgeStyle::Head))
         .into_iter()
         .chain(branches.into_iter().take(3).map(|branch| {
-            let (label, counts) = graph_label(branch);
-            let compact = branch
-                .upstream
-                .as_ref()
-                .and_then(|upstream| upstream.same_branch_remote(branch))
+            let (label, same_branch_remote) = graph_label(branch);
+            let compact = same_branch_remote
                 .zip(branch.label().rsplit_once('/'))
                 .map(|(remote, (_, leaf))| format!("{remote} · {leaf}"));
-            let color = if branch.name.starts_with("refs/tags/") {
-                colors.lane(2)
+            let style = if branch.name.starts_with("refs/heads/") {
+                RefBadgeStyle::Local
+            } else if branch.name.starts_with("refs/remotes/") {
+                RefBadgeStyle::Remote
             } else {
-                lane_color.unwrap_or(colors.muted)
+                RefBadgeStyle::Tag
             };
-            (label, compact, counts, color)
+            let tracking = branch.upstream.as_ref().map(|upstream| upstream.state);
+            (
+                label,
+                compact,
+                tracking,
+                same_branch_remote.is_some(),
+                style,
+            )
         }));
-    let font = FontId::proportional(DETAIL_SIZE);
     // The subject starts at a fixed column on every row. Ref labels use only
     // the space they need at its trailing edge, leaving room for the message.
     let subject_width = columns.subject.width();
@@ -663,31 +722,51 @@ fn draw_commit(
     let badge_inset = 5.0;
     let badge_gap = 4.0;
     let suffix_gap = 5.0;
+    let icon_size = 14.0;
+    let icon_gap = 3.0;
     let mut used = 0.0;
     let mut labels = Vec::new();
-    for (label, compact, counts, color) in badges {
-        let suffix = (!counts.is_empty())
-            .then(|| painter.layout_no_wrap(counts, FontId::monospace(DETAIL_SIZE), color));
+    for (label, compact, tracking, remote_first, style) in badges {
+        let color = match style {
+            RefBadgeStyle::Head => colors.accent,
+            RefBadgeStyle::Local => colors.text,
+            RefBadgeStyle::Remote => lane_color.unwrap_or(colors.muted),
+            RefBadgeStyle::Tag => colors.lane(2),
+        };
+        let icon_width = if matches!(style, RefBadgeStyle::Remote) {
+            icon_size + icon_gap
+        } else {
+            0.0
+        };
+        let suffix = tracking.map(|state| painter.layout_job(ref_counts_job(state, &colors)));
         let suffix_width = suffix
             .as_ref()
             .map_or(0.0, |galley| galley.size().x + suffix_gap);
         let gap = if labels.is_empty() { 0.0 } else { badge_gap };
-        let width = (remaining - used - gap - 2.0 * badge_inset - suffix_width).min(210.0);
+        let width =
+            (remaining - used - gap - 2.0 * badge_inset - suffix_width - icon_width).min(210.0);
         if width < 22.0 {
             break;
         }
-        let mut label = fit_line(&painter, label, font.clone(), color, width);
+        let layout_label = |label| {
+            fit_line_job(
+                &painter,
+                ref_label_job(label, color, colors.muted, remote_first),
+                width,
+            )
+        };
+        let mut label = layout_label(label);
         if label.elided
             && let Some(compact) = compact
         {
-            let shorter = fit_line(&painter, compact, font.clone(), color, width);
+            let shorter = layout_label(compact);
             if !shorter.elided {
                 label = shorter;
             }
         }
-        let badge_width = label.size().x + suffix_width + 2.0 * badge_inset;
+        let badge_width = label.size().x + suffix_width + icon_width + 2.0 * badge_inset;
         used += gap + badge_width;
-        labels.push((label, suffix, badge_width, color));
+        labels.push((label, suffix, badge_width, color, style));
     }
 
     let subject_color = if dim { colors.subtle } else { colors.text };
@@ -711,23 +790,38 @@ fn draw_commit(
     let vertical_inset = 3.0;
     let mut badge_top = y - 8.5;
     let mut badge_bottom = y + 8.5;
-    for (label, suffix, _, _) in &labels {
+    for (label, suffix, _, _, _) in &labels {
         for galley in std::iter::once(label).chain(suffix.as_ref()) {
             let text_y = baseline - galley_baseline(galley);
             badge_top = badge_top.min(text_y + galley.mesh_bounds.top() - vertical_inset);
             badge_bottom = badge_bottom.max(text_y + galley.mesh_bounds.bottom() + vertical_inset);
         }
     }
-    for (label, suffix, width, color) in labels {
+    for (label, suffix, width, color, style) in labels {
         let badge = Rect::from_min_max(pos2(x, badge_top), pos2(x + width, badge_bottom));
-        painter.rect_filled(badge, 3.0, color.gamma_multiply(0.11));
-        painter.rect_stroke(
-            badge,
-            3.0,
-            Stroke::new(0.7_f32, color.gamma_multiply(0.42)),
-            egui::StrokeKind::Inside,
-        );
-        let label_x = x + badge_inset;
+        let (fill, stroke) = match style {
+            RefBadgeStyle::Local => (colors.accent.gamma_multiply(0.24), Stroke::NONE),
+            RefBadgeStyle::Remote => (
+                Color32::TRANSPARENT,
+                Stroke::new(0.7_f32, colors.border.lerp_to_gamma(color, 0.48)),
+            ),
+            RefBadgeStyle::Head | RefBadgeStyle::Tag => (
+                color.gamma_multiply(0.11),
+                Stroke::new(0.7_f32, color.gamma_multiply(0.42)),
+            ),
+        };
+        painter.rect(badge, 3.0, fill, stroke, egui::StrokeKind::Inside);
+        let mut label_x = x + badge_inset;
+        if matches!(style, RefBadgeStyle::Remote) {
+            let icon = Rect::from_center_size(
+                pos2(label_x + icon_size / 2.0, badge.center().y),
+                Vec2::splat(icon_size),
+            );
+            egui::Image::new(egui::include_image!("../assets/icons/remote-cloud.svg"))
+                .tint(color)
+                .paint_at(ui, icon);
+            label_x += icon_size + icon_gap;
+        }
         let suffix_x = label_x + label.size().x + suffix_gap;
         paint_baseline(&painter, label_x, baseline, label, color);
         if let Some(suffix) = suffix {
@@ -775,10 +869,11 @@ fn draw_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{TrackingState, Upstream};
+    use crate::git::Upstream;
 
     #[test]
     fn graph_combines_coincident_upstream_labels_and_keeps_disjoint_tips() {
+        let colors = theme::palette(&egui::Context::default());
         let tracked = |local: &str, remote: &str, target: &str, behind| Reference {
             name: format!("refs/heads/{local}"),
             target: target.into(),
@@ -808,17 +903,22 @@ mod tests {
         assert_eq!(same.len(), 1);
         assert_eq!(
             graph_label(same[0]),
-            ("origin · release/banshu".into(), "=".into())
+            ("origin · release/banshu".into(), Some("origin"))
+        );
+        assert_eq!(
+            ref_counts_job(same[0].upstream.as_ref().unwrap().state, &colors).text,
+            "="
         );
         let local = graph_references_at(&history, "local-only");
         assert_eq!(
             graph_label(local[0]),
-            ("origin · main".into(), "−12".into())
+            ("origin · main".into(), Some("origin"))
+        );
+        assert_eq!(
+            ref_counts_job(local[0].upstream.as_ref().unwrap().state, &colors).text,
+            "−12"
         );
         let remote = graph_references_at(&history, "remote-only");
-        assert_eq!(
-            graph_label(remote[0]),
-            ("origin/main".into(), String::new())
-        );
+        assert_eq!(graph_label(remote[0]), ("origin/main".into(), None));
     }
 }
