@@ -1,6 +1,16 @@
 # SmartGit 行为参考
 
-依据用户机器上正在运行的 SmartGit 24.1.5 更新缓存 JAR，用 JDK 的 javap -c -p 抽查字节码，并核对本地 preferences.yml。类名为当前构建的混淆符号。以下记录是针对当前构建观察到的行为。
+以下分析以本机 SmartGit 24.1.5（构建 21169）的更新 JAR 为准，依据 JDK `javap` 输出、实际会话文件和启动日志。类名是该构建的混淆符号。
+
+## 本地字节码资料
+
+项目根目录下的 `.local/reference/smartgit-24.1.5/` 保存从旧工作目录复制的 65 份字节码文本，以及从更新 JAR 补取的 `bUu`、`bJC`、`bJN` 三份输出。该目录由 Git 忽略。核对当前构建时，优先查阅 `sg-live-*` 和下文点名的 `refdesk-reference-*` 文件。旧资料也包含安装包 JAR 的对照输出，混淆类名可能不同。
+
+## 仓库登记和恢复
+
+- Windows 下，SmartGit 24.1 默认从 `%APPDATA%\syntevo\SmartGit\24.1` 读取用户设置，`smartgit.settings` 可指定目录。该属性也可在 `sg-live-small-bJN.txt` 核对。 [SmartGit 设置文件说明](https://docs.smartgit.dev/24.1/Manual/Installation/Installation-and-Files)
+- `repository-grouping.yml` 的 `structure` 保存已添加的仓库路径、名称和分组，`recentlyUsed` 保存最近用过的路径。`bUu` 会读写这些条目，运行日志也记录到配置在运行期间由定时线程写入。`repositories.yml` 保存已知仓库和子模块各自的设置。字节码见 `sg-live-small-bUu.txt`。 [SmartGit 设置文件说明](https://docs.smartgit.dev/24.1/Manual/Installation/Installation-and-Files)
+- `bJL` 读写窗口会话中的 `window`、`repositories` 和 `activeRepository`，分别表示窗口类型、打开的仓库路径和活动仓库。`bJC` 另行读写 `lastRepositoryPath`，该字段可在本机 `ui-state.yml` 找到。字节码见 `refdesk-reference-bJL.txt` 和 `sg-live-small-bJC.txt`。
 
 ## Refdesk 启动与迁移
 
@@ -13,7 +23,7 @@ Refdesk 将登记仓库 `repositories` 和上次活动仓库 `active` 保存在�
 ## 其他行为
 
 - Log 窗口布局以实际窗口为准。仓库和分支在左、历史图居中、提交和文件在右、差异在下。Refdesk 自行实现这些面板和提交图算法。
-- bKC 从有序仓库集合取列表，在超出指定值时从前面移除入口。bJL 读写 repositories 和 activeRepository。Refdesk 把登记仓库、当前仓库和后台预读分别管理，切换当前仓库时保留其他入口。
+- bKC 在向窗口中打开的仓库集合加入新入口之前，按配置的上限从集合前端移除旧入口。字节码见 `refdesk-reference-bKC.txt`。
 - bAN 的扫描分支对比之前模型与新结果里的两个布尔值，差异时记录 core.ignoreCase has changed, forcing a full scan 并重启扫描。该消息表示两份运行时状态不一致，不能独立证明磁盘上的 Git 配置被修改。Refdesk 不复制这条缓存判断，直接通过 Git 读取当前工作树状态，并把状态读取与提交历史分开。
 - axf 对应 preferences.yml 的 actions.compare.fileComparators。compareType 为 0 时选内置、1 时选外部比较程序、2 时选查看器。Refdesk 读 filePattern、externalFileCompare.command.absolute 或 command 以及 parameters，并保留规则顺序。
 - 本机实际规则是 *.xlsx 调用 pythonw.exe 和现有 xlsx_diff_tool.py，传入两个快照，后一条 * 使用内置比较。本机试运行成功。兼容域包括 Diff Tools 的文件比较规则，通用 Tools、Conflict Solvers 和 SmartGit 内置工具专用变量留在 SmartGit。
