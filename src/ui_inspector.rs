@@ -1,15 +1,73 @@
 use crate::app::{Desk, Selection};
-use crate::git::{Area, Operation};
+use crate::git::{Area, Change, Operation};
 use crate::ui::{
-    ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, SELECTION, SHADE, heading, paint,
-    panel_divider, split_panel_height,
+    ACCENT, FAINT, GOLD, GREEN, HOVER, INK, MUTE, RED, ROW, SELECTION, SHADE, centered_baseline,
+    fit_line, heading, paint_baseline, panel_divider, split_panel_height,
 };
 use eframe::egui::{self, Align, FontId, Layout, RichText, Sense, UiBuilder, Vec2};
-use std::path::Path;
+use std::collections::HashMap;
 
 const COMMIT_PANEL_MIN_HEIGHT: f32 = 144.0;
 const COMMIT_PANEL_MAX_HEIGHT: f32 = 320.0;
 const FILES_PANEL_MIN_HEIGHT: f32 = 132.0;
+const FILE_NAME_INSET: f32 = 24.0;
+const FILE_RIGHT_INSET: f32 = 7.0;
+const FILE_COLUMN_GAP: f32 = 8.0;
+
+enum FileRow<'a> {
+    Group(&'static str, usize),
+    File(&'a Change),
+}
+
+fn file_name_and_directory(path: &str) -> (&str, &str) {
+    path.rsplit_once('/')
+        .map_or((path, ""), |(directory, name)| (name, directory))
+}
+
+fn file_directory(
+    painter: &egui::Painter,
+    directory: &str,
+    same_name_directories: &[&str],
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font = FontId::proportional(12.0);
+    let full = fit_line(painter, directory.to_owned(), font.clone(), FAINT, width);
+    if !full.elided {
+        return full;
+    }
+
+    // A shared tail can hide the directory that distinguishes two files with the same name.
+    let shared_tail = same_name_directories
+        .iter()
+        .copied()
+        .filter(|other| *other != directory)
+        .map(|other| {
+            directory
+                .rsplit('/')
+                .zip(other.rsplit('/'))
+                .take_while(|(left, right)| left == right)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let mut components = directory.rsplit('/');
+    let Some(distinguishing) = components.nth(shared_tail) else {
+        return full;
+    };
+    let prefix = if components.next().is_some() {
+        "…/"
+    } else {
+        ""
+    };
+    let suffix = if shared_tail > 0 { "/…" } else { "" };
+    fit_line(
+        painter,
+        format!("{prefix}{distinguishing}{suffix}"),
+        font,
+        FAINT,
+        width,
+    )
+}
 
 impl Desk {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -174,47 +232,65 @@ impl Desk {
                 .map(|details| details.files.as_slice())
                 .unwrap_or_default()
         };
-        let entries: Vec<_> = if worktree {
-            [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)]
-                .into_iter()
-                .filter(|(_, area)| files.iter().any(|file| file.area == *area))
-                .flat_map(|(name, area)| {
-                    std::iter::once((Some(name), None)).chain(
-                        files
-                            .iter()
-                            .filter(move |file| file.area == area)
-                            .map(|file| (None, Some(file))),
-                    )
-                })
-                .collect()
+        let mut entries = Vec::with_capacity(files.len() + 2);
+        if worktree {
+            for (name, area) in [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)] {
+                let group = files.iter().filter(|file| file.area == area);
+                let count = group.clone().count();
+                if count > 0 {
+                    entries.push(FileRow::Group(name, count));
+                    entries.extend(group.map(FileRow::File));
+                }
+            }
         } else {
-            files.iter().map(|file| (None, Some(file))).collect()
-        };
+            entries.extend(files.iter().map(FileRow::File));
+        }
+        let mut directories_by_name: HashMap<&str, Vec<&str>> = HashMap::new();
+        for file in files {
+            let (name, directory) = file_name_and_directory(&file.path);
+            directories_by_name.entry(name).or_default().push(directory);
+        }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             egui::ScrollArea::vertical()
                 .id_salt(("file-list", self.details_busy))
                 .auto_shrink([false, false])
-                .show_rows(ui, 25.0, entries.len(), |ui, visible| {
+                .show_rows(ui, ROW, entries.len(), |ui, visible| {
+                    let name_font = FontId::proportional(13.0);
+                    let code_font = FontId::monospace(12.0);
+                    let baseline_offset = centered_baseline(ui.painter(), name_font.clone());
                     for index in visible {
-                        let (heading, file) = entries[index];
                         let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 25.0),
+                            Vec2::new(ui.available_width(), ROW),
                             Sense::click(),
                         );
-                        if let Some(heading) = heading {
-                            ui.painter().rect_filled(rect, 4.0, SHADE);
-                            paint(
-                                ui,
-                                rect,
-                                rect.left() + 7.0,
-                                heading,
-                                FontId::proportional(11.0),
-                                MUTE,
-                            );
-                        }
-                        let Some(file) = file else {
-                            continue;
+                        let painter = ui.painter();
+                        let right = rect.right() - FILE_RIGHT_INSET;
+                        let baseline = rect.center().y + baseline_offset;
+                        let file = match entries[index] {
+                            FileRow::Group(name, count) => {
+                                painter.rect_filled(rect, 4.0, SHADE);
+                                let title = painter.layout_no_wrap(
+                                    name.to_owned(),
+                                    FontId::proportional(11.0),
+                                    MUTE,
+                                );
+                                let count = painter.layout_no_wrap(
+                                    count.to_string(),
+                                    code_font.clone(),
+                                    MUTE,
+                                );
+                                paint_baseline(painter, rect.left() + 7.0, baseline, title, MUTE);
+                                paint_baseline(
+                                    painter,
+                                    right - count.size().x,
+                                    baseline,
+                                    count,
+                                    MUTE,
+                                );
+                                continue;
+                            }
+                            FileRow::File(file) => file,
                         };
                         let is_selected = self.file.as_ref().is_some_and(|current| {
                             current.path == file.path && current.area == file.area
@@ -232,31 +308,43 @@ impl Desk {
                             'R' => ACCENT,
                             _ => GOLD,
                         };
-                        paint(
-                            ui,
-                            rect,
-                            rect.left() + 6.0,
-                            &file.code.to_string(),
-                            FontId::monospace(12.0),
-                            color,
-                        );
-                        let short = Path::new(&file.path)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or(&file.path);
+                        let code =
+                            painter.layout_no_wrap(file.code.to_string(), code_font.clone(), color);
+                        paint_baseline(painter, rect.left() + 6.0, baseline, code, color);
+                        let (short, directory) = file_name_and_directory(&file.path);
                         let label = if file.is_gitlink() {
                             format!("{short} · Gitlink")
                         } else {
                             short.to_owned()
                         };
-                        paint(
-                            ui,
-                            rect,
-                            rect.left() + 24.0,
-                            &label,
-                            FontId::proportional(13.0),
-                            INK,
-                        );
+                        let name_x = rect.left() + FILE_NAME_INSET;
+                        let mut name_width = (right - name_x).max(0.0);
+                        if !directory.is_empty() {
+                            let text_width = (name_width - FILE_COLUMN_GAP).max(0.0);
+                            let natural_name_width = painter
+                                .layout_no_wrap(label.clone(), name_font.clone(), INK)
+                                .size()
+                                .x;
+                            let directory_width =
+                                text_width - natural_name_width.min(text_width * 0.60);
+                            let directory_galley = file_directory(
+                                painter,
+                                directory,
+                                &directories_by_name[short],
+                                directory_width,
+                            );
+                            let directory_size = directory_galley.size().x;
+                            paint_baseline(
+                                painter,
+                                right - directory_size,
+                                baseline,
+                                directory_galley,
+                                FAINT,
+                            );
+                            name_width = text_width - directory_size;
+                        }
+                        let name = fit_line(painter, label, name_font.clone(), INK, name_width);
+                        paint_baseline(painter, name_x, baseline, name, INK);
                         if response.clicked() {
                             chosen = Some(file.clone());
                         }
