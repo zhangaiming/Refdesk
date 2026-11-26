@@ -4,8 +4,8 @@ use crate::graph::{GraphRow, Span};
 use crate::history::{SearchDirection, matches_search};
 use crate::theme;
 use crate::ui::{
-    CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, paint_baseline,
-    small_button,
+    CONTROL_HEIGHT, DETAIL_SIZE, ROW, centered_baseline, filter_field, fit_line, galley_baseline,
+    paint_baseline, small_button,
 };
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
 
@@ -710,8 +710,18 @@ fn draw_commit(
         subject_color,
     );
     let mut x = columns.subject.right() - used;
+    let vertical_inset = 3.0;
+    let mut badge_top = y - 8.5;
+    let mut badge_bottom = y + 8.5;
+    for (label, suffix, _, _) in &labels {
+        for galley in std::iter::once(label).chain(suffix.as_ref()) {
+            let text_y = baseline - galley_baseline(galley);
+            badge_top = badge_top.min(text_y + galley.mesh_bounds.top() - vertical_inset);
+            badge_bottom = badge_bottom.max(text_y + galley.mesh_bounds.bottom() + vertical_inset);
+        }
+    }
     for (label, suffix, width, color) in labels {
-        let badge = Rect::from_min_size(pos2(x, y - 8.5), Vec2::new(width, 17.0));
+        let badge = Rect::from_min_max(pos2(x, badge_top), pos2(x + width, badge_bottom));
         painter.rect_filled(badge, 3.0, color.gamma_multiply(0.11));
         painter.rect_stroke(
             badge,

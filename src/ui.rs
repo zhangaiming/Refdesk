@@ -106,7 +106,7 @@ pub(crate) fn centered_baseline(painter: &Painter, font: FontId) -> f32 {
     galley_baseline(&sample) - sample.size().y / 2.0
 }
 
-fn galley_baseline(galley: &Galley) -> f32 {
+pub(crate) fn galley_baseline(galley: &Galley) -> f32 {
     galley
         .rows
         .first()
