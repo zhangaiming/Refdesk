@@ -1,5 +1,7 @@
 # Windows x64 打包流程
 
+推送与 Cargo 版本对应的 `v<version>` 标签后，Windows CI 会使用 MSVC 构建并测试静态链接 C 运行库的 EXE。校验通过后，Actions 运行中的 `refdesk-windows-x64` 产物会包含带版本号的 EXE 和 SHA-256 文件。核对下载的文件后，可将两者上传到对应的 GitHub Release。
+
 ## 准备环境
 
 在 Windows x64 上安装 Rust、Visual Studio 的 C++ x64 生成工具、Windows SDK 和 Git for Windows。Rust 最低版本以 [Cargo.toml](../Cargo.toml) 的 `rust-version` 为准。打包采用 `x86_64-pc-windows-msvc` 工具链，运行 Refdesk 时需要让 `git.exe` 能从 PATH 找到。[Rust 安装指南](https://doc.rust-lang.org/cargo/getting-started/installation.html) · [Windows MSVC 目标说明](https://doc.rust-lang.org/stable/rustc/platform-support/windows-msvc.html)
