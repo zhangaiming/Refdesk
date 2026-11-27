@@ -158,7 +158,7 @@ pub struct History {
     pub refs: Vec<Reference>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Area {
     Staged,
     Unstaged,
@@ -176,22 +176,29 @@ pub struct Change {
 }
 
 impl Change {
+    pub(crate) fn index_paths(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.path).chain(self.old_path.as_ref().filter(|_| self.code == 'R'))
+    }
+
     pub fn index_operation(&self) -> Option<Operation> {
-        let mut paths = vec![self.path.clone()];
-        if self.code == 'R'
-            && let Some(old_path) = &self.old_path
-        {
-            paths.push(old_path.clone());
-        }
         match self.area {
-            Area::Staged => Some(Operation::Unstage(paths)),
-            Area::Unstaged => Some(Operation::Stage(paths)),
+            Area::Staged => Some(Operation::Unstage(self.index_paths().cloned().collect())),
+            Area::Unstaged => Some(Operation::Stage(self.index_paths().cloned().collect())),
             Area::Commit => None,
         }
     }
 
     pub fn is_gitlink(&self) -> bool {
         self.left_gitlink || self.right_gitlink
+    }
+
+    fn affects_submodules(&self) -> bool {
+        self.is_gitlink()
+            || self.path.eq_ignore_ascii_case(".gitmodules")
+            || self
+                .old_path
+                .as_ref()
+                .is_some_and(|path| path.eq_ignore_ascii_case(".gitmodules"))
     }
 }
 
@@ -202,6 +209,25 @@ pub struct Status {
 }
 
 impl Status {
+    pub(crate) fn has_submodule_changes(&self) -> bool {
+        self.files.iter().any(Change::affects_submodules)
+    }
+
+    fn has_ordinary_index_paths(&self, paths: &[String]) -> bool {
+        !paths.is_empty()
+            && paths.iter().all(|path| {
+                let mut matching = self
+                    .files
+                    .iter()
+                    .filter(|file| file.path == *path || file.old_path.as_ref() == Some(path));
+                !path.ends_with('/')
+                    && matching
+                        .next()
+                        .is_some_and(|file| !file.affects_submodules())
+                    && matching.all(|file| !file.affects_submodules())
+            })
+    }
+
     pub(crate) fn index_paths_to_confirm(&self, operation: &Operation) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();
         let mut confirm = BTreeSet::new();
@@ -1340,32 +1366,42 @@ pub enum Operation {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RefreshScope {
     pub history: bool,
-    pub status: bool,
+    pub status: Option<StatusScope>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum StatusScope {
+    Files,
+    Full,
 }
 
 impl RefreshScope {
+    pub const FILES: Self = Self {
+        history: false,
+        status: Some(StatusScope::Files),
+    };
     pub const STATUS: Self = Self {
         history: false,
-        status: true,
+        status: Some(StatusScope::Full),
     };
     pub const HISTORY: Self = Self {
         history: true,
-        status: false,
+        status: None,
     };
     pub const BOTH: Self = Self {
         history: true,
-        status: true,
+        status: Some(StatusScope::Full),
     };
 
     pub fn union(self, other: Self) -> Self {
         Self {
             history: self.history || other.history,
-            status: self.status || other.status,
+            status: self.status.max(other.status),
         }
     }
 
     pub fn is_empty(self) -> bool {
-        !self.history && !self.status
+        !self.history && self.status.is_none()
     }
 }
 
@@ -1497,9 +1533,22 @@ impl Operation {
     pub(crate) fn after_success(&self, cached_status: Option<&Status>) -> AfterSuccess {
         const MAX_TARGETED_PATHS: usize = 32;
         if let Some(source) = self.index_source() {
-            let unconfirmed = cached_status
+            let refresh = match self {
+                Self::Stage(paths) | Self::Unstage(paths)
+                    if cached_status
+                        .is_some_and(|status| status.has_ordinary_index_paths(paths)) =>
+                {
+                    RefreshScope::FILES
+                }
+                _ => RefreshScope::STATUS,
+            };
+            let mut unconfirmed = cached_status
                 .map(|status| status.index_paths_to_confirm(self))
                 .unwrap_or_default();
+            if let Self::Unstage(paths) = self {
+                // A path-limited reset can succeed even when the path no longer matches.
+                unconfirmed.extend(paths.iter().cloned());
+            }
             let readback = (!unconfirmed.is_empty() && unconfirmed.len() <= MAX_TARGETED_PATHS)
                 .then(|| TargetedRead::Index {
                     source,
@@ -1511,7 +1560,7 @@ impl Operation {
                     unconfirmed,
                 },
                 readback,
-                refresh: RefreshScope::STATUS,
+                refresh,
             };
         }
         let (immediate, readback, refresh) = match self {
@@ -1623,23 +1672,38 @@ impl Operation {
         );
         let root = worktree;
         let parent_number;
+        let mut stage_input = None;
         let args = match self {
             Self::Stage(paths) | Self::Unstage(paths) => {
                 ensure!(!paths.is_empty(), "没有选中的文件");
                 for path in paths {
                     safe_relative(path)?;
+                    ensure!(!path.contains('\0'), "文件路径包含无效字符");
                 }
-                let mut args = if matches!(self, Self::Stage(_)) {
+                if matches!(self, Self::Stage(_)) && paths.len() > 1 {
+                    let mut input = tempfile::tempfile().context("无法创建暂存路径列表")?;
+                    for path in paths {
+                        input.write_all(path.as_bytes())?;
+                        input.write_all(b"\0")?;
+                    }
+                    input.rewind()?;
+                    stage_input = Some(input);
+                }
+                let mut args = if stage_input.is_some() {
+                    vec!["add", "--pathspec-from-file=-", "--pathspec-file-nul"]
+                } else if matches!(self, Self::Stage(_)) {
                     vec!["add", "--"]
                 } else if output(root, &["rev-parse", "--verify", "--quiet", "HEAD"], true)?
                     .status
                     .success()
                 {
-                    vec!["restore", "--staged", "--"]
+                    vec!["reset", "--quiet", "--no-refresh", "HEAD", "--"]
                 } else {
                     vec!["rm", "-f", "--cached", "--ignore-unmatch", "--"]
                 };
-                args.extend(paths.iter().map(String::as_str));
+                if stage_input.is_none() {
+                    args.extend(paths.iter().map(String::as_str));
+                }
                 args
             }
             Self::StageAll => vec!["add", "--all", "--", "."],
@@ -1696,7 +1760,15 @@ impl Operation {
             Self::Pull => vec!["pull", "--ff-only"],
             Self::Push => vec!["push"],
         };
-        let out = output(root, &args, false)?;
+        let out = if let Some(input) = stage_input {
+            command(Some(root), false)
+                .args(args)
+                .stdin(input)
+                .output()
+                .with_context(|| format!("无法执行 Git（{}）", root.display()))?
+        } else {
+            output(root, &args, false)?
+        };
         let stderr = trim(&out.stderr);
         let stdout = trim(&checked(out)?);
         Ok(if stdout.is_empty() { stderr } else { stdout })
@@ -1760,6 +1832,57 @@ pub fn git_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_operations_reuse_submodules_only_for_known_ordinary_paths() {
+        let file = |path: &str| Change {
+            path: path.into(),
+            old_path: None,
+            code: 'M',
+            area: Area::Unstaged,
+            left_gitlink: false,
+            right_gitlink: false,
+        };
+        let status = Status {
+            head: None,
+            files: vec![
+                file("普通.txt"),
+                file("nested/"),
+                Change {
+                    old_path: Some(".gitmodules".into()),
+                    ..file("renamed")
+                },
+                Change {
+                    left_gitlink: true,
+                    ..file("module")
+                },
+            ],
+        };
+        for path in ["missing", "nested/", ".gitmodules", "renamed", "module"] {
+            for operation in [
+                Operation::Stage(vec![path.into()]),
+                Operation::Unstage(vec![path.into()]),
+            ] {
+                assert_eq!(
+                    operation.after_success(Some(&status)).refresh,
+                    RefreshScope::STATUS
+                );
+            }
+        }
+        for operation in [
+            Operation::Stage(vec!["普通.txt".into()]),
+            Operation::Unstage(vec!["普通.txt".into()]),
+        ] {
+            assert_eq!(
+                operation.after_success(Some(&status)).refresh,
+                RefreshScope::FILES
+            );
+        }
+        assert_eq!(
+            Operation::StageAll.after_success(Some(&status)).refresh,
+            RefreshScope::STATUS
+        );
+    }
 
     #[test]
     fn operation_plans_cover_each_write_and_limit_expensive_readbacks() {
@@ -2141,6 +2264,114 @@ mod tests {
     fn rejects_paths_outside_the_worktree() {
         assert!(safe_relative("../outside").is_err());
         assert!(safe_relative("Assets/config.xlsx").is_ok());
+    }
+
+    #[test]
+    fn batch_stage_preserves_literal_long_lists_and_rejects_a_missing_path() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let worktree = sandbox.path();
+        checked(output(worktree, &["init", "--initial-branch=main"], false)?)?;
+        let first = "中文 [1].txt";
+        let sibling = "中文 1.txt";
+        for path in [first, sibling] {
+            std::fs::write(worktree.join(path), b"content\n")?;
+        }
+        let missing = Operation::Stage(vec![first.into(), "已消失.txt".into()]);
+        let error = missing.execute(worktree).unwrap_err();
+        assert_eq!(error_kind(&error), ("git_exit", Some(128)));
+        assert!(run(worktree, &["ls-files", "-z"])?.is_empty());
+
+        let mut paths = vec![first.to_owned()];
+        let dir = "sub".repeat(10);
+        std::fs::create_dir(worktree.join(&dir))?;
+        for row in 0..235 {
+            let path = format!("{dir}/{row:03} {}.txt", "a".repeat(112));
+            std::fs::write(worktree.join(&path), b"content\n")?;
+            paths.push(path);
+        }
+        assert!(paths.iter().map(|path| path.len() + 1).sum::<usize>() > 32_767);
+        Operation::Stage(paths.clone()).execute(worktree)?;
+        let files = run(worktree, &["ls-files", "-z"])?;
+        let staged: BTreeSet<_> = std::str::from_utf8(&files)?
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(staged, paths.into_iter().collect());
+        assert!(!staged.contains(sibling));
+        Ok(())
+    }
+
+    #[test]
+    fn unstage_confirms_missing_paths_and_keeps_index_hooks() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let worktree = sandbox.path();
+        let git = |args: &[&str]| checked(output(worktree, args, false)?);
+        git(&["init", "--initial-branch=main"])?;
+        git(&["config", "user.name", "Refdesk test"])?;
+        git(&["config", "user.email", "test@example.invalid"])?;
+        let path = "file [1].txt";
+        let sibling = "file 1.txt";
+        for file in [path, sibling] {
+            std::fs::write(worktree.join(file), b"base\n")?;
+        }
+        git(&["add", "--", path, sibling])?;
+        git(&["commit", "-m", "baseline"])?;
+        let head = run(worktree, &["rev-parse", "HEAD"])?;
+        for file in [path, sibling] {
+            std::fs::write(worktree.join(file), b"edited\n")?;
+        }
+        git(&["add", "--", path, sibling])?;
+        let hooks = worktree.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks)?;
+        std::fs::write(hooks.join("post-checkout"), b"#!/bin/sh\nexit 7\n")?;
+        std::fs::write(
+            hooks.join("post-index-change"),
+            b"#!/bin/sh\necho index >> .git/refdesk-index-hook\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for hook in ["post-checkout", "post-index-change"] {
+                std::fs::set_permissions(hooks.join(hook), std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        let operation = Operation::Unstage(vec![path.into()]);
+        let previous = run(worktree, &["diff", "--cached", "--name-only", "-z"])?;
+        let lock = worktree.join(".git/index.lock");
+        std::fs::write(&lock, b"occupied")?;
+        assert!(operation.execute(worktree).is_err());
+        std::fs::remove_file(lock)?;
+        assert_eq!(
+            run(worktree, &["diff", "--cached", "--name-only", "-z"])?,
+            previous
+        );
+        operation.execute(worktree)?;
+        assert!(worktree.join(".git/refdesk-index-hook").is_file());
+        assert_eq!(run(worktree, &["rev-parse", "HEAD"])?, head);
+        assert_eq!(std::fs::read(worktree.join(path))?, b"edited\n");
+        assert_eq!(
+            run(worktree, &["diff", "--cached", "--name-only"])?,
+            b"file 1.txt\n"
+        );
+
+        let missing = "missing.txt";
+        let operation = Operation::Unstage(vec![missing.into()]);
+        let plan = operation.after_success(Some(&status(worktree)?));
+        let Some(readback) = plan.readback else {
+            anyhow::bail!("unstage must confirm a missing path");
+        };
+        assert!(matches!(
+            plan.immediate,
+            ImmediateChange::Index { unconfirmed, .. } if unconfirmed.contains(missing)
+        ));
+        operation.execute(worktree)?;
+        assert!(matches!(
+            readback.read(worktree)?,
+            Some(ConfirmedChange::Index { paths, status, .. })
+                if paths.contains(missing) && status.files.is_empty()
+        ));
+        assert!(Operation::Unstage(vec![]).execute(worktree).is_err());
+        Ok(())
     }
 
     #[test]

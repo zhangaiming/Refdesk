@@ -1,8 +1,8 @@
 use crate::builtin_diff::{self, ActiveDiff};
 use crate::git::{
     self, AfterSuccess, Area, Change, Commit, Compare, ConfirmedChange, CurrentHead, Details,
-    History, HistoryScope, ImmediateChange, Operation, Reference, RefreshScope, Status, Submodule,
-    TargetedRead, TrackingState,
+    History, HistoryScope, ImmediateChange, Operation, Reference, RefreshScope, Status,
+    StatusScope, Submodule, TargetedRead, TrackingState,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
 use crate::logging::{self, Presentation, ReadLog};
@@ -13,7 +13,7 @@ use crate::timing::{FrameCapture, Timings};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use tempfile::TempDir;
 
 type Outcome<T> = std::result::Result<T, String>;
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(25);
+const INDEX_STATUS_COALESCE: Duration = Duration::from_millis(250);
 
 enum Work<'a> {
     Read,
@@ -34,7 +35,7 @@ enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
     History(PathBuf, u64, Result<Option<HistoryView>>),
     HistorySearch(u64, u64, Outcome<SearchResult>),
-    Status(PathBuf, u64, Result<Status>, Result<Vec<Submodule>>),
+    Status(PathBuf, u64, Result<Status>, Option<Result<Vec<Submodule>>>),
     Details(u64, u64, Selection, Outcome<Details>),
     CopyCommitMessage(PathBuf, u64, Outcome<String>),
     Operation(PathBuf, u64, Operation, Result<(String, AfterSuccess)>),
@@ -61,6 +62,7 @@ pub(crate) struct Repository {
     history_on_demand: bool,
     draft: String,
     status_request: u64,
+    status_read_scope: Option<StatusScope>,
     operation: OperationCompletion,
     status_checked: Option<Instant>,
     visible_history_request: Option<u64>,
@@ -83,7 +85,7 @@ enum Followup {
     #[default]
     Idle,
     Read(TargetedRead),
-    Refresh,
+    Refresh(Instant),
 }
 
 impl OperationCompletion {
@@ -97,13 +99,32 @@ impl OperationCompletion {
         self.pending.union(refresh)
     }
 
-    fn finish(&mut self, refresh: RefreshScope, readback: Option<TargetedRead>) {
+    fn finish(&mut self, refresh: RefreshScope, readback: Option<TargetedRead>, now: Instant) {
         self.pending = self.pending.union(refresh);
         self.after_frame = if self.pending.is_empty() {
             Followup::Idle
         } else {
-            readback.map_or(Followup::Refresh, Followup::Read)
+            readback.map_or_else(
+                || {
+                    let delay = if self.pending == RefreshScope::FILES {
+                        INDEX_STATUS_COALESCE
+                    } else {
+                        Duration::ZERO
+                    };
+                    Followup::Refresh(now + delay)
+                },
+                Followup::Read,
+            )
         };
+    }
+
+    fn ready_followup(&mut self, now: Instant) -> Result<Followup, Duration> {
+        if let Followup::Refresh(deadline) = self.after_frame
+            && deadline > now
+        {
+            return Err(deadline - now);
+        }
+        Ok(std::mem::take(&mut self.after_frame))
     }
 }
 
@@ -177,7 +198,7 @@ impl Repository {
     }
 
     fn invalidate_operation_reads(&mut self, request: u64, scope: RefreshScope) {
-        if scope.status {
+        if scope.status.is_some() {
             self.status_request = request;
             self.status_busy = true;
         }
@@ -198,6 +219,32 @@ impl Repository {
             })
         })
     }
+
+    fn cached_head_for_file_refresh(
+        &self,
+        scope: StatusScope,
+        now: Instant,
+    ) -> Option<Option<String>> {
+        self.status
+            .as_ref()
+            .filter(|_| {
+                scope == StatusScope::Files
+                    && self.submodules.is_some()
+                    && self.submodule_warning.is_none()
+                    && self.status_checked.is_some_and(|checked| {
+                        now.saturating_duration_since(checked) < STATUS_REFRESH_INTERVAL
+                    })
+            })
+            .map(|status| status.head.clone())
+    }
+}
+
+fn needs_submodule_refresh(cached_head: Option<&Option<String>>, result: &Result<Status>) -> bool {
+    cached_head.is_none_or(|head| {
+        result
+            .as_ref()
+            .is_ok_and(|status| &status.head != head || status.has_submodule_changes())
+    })
 }
 
 fn set_reference(history: &mut History, reference: Reference) {
@@ -280,6 +327,7 @@ pub(crate) struct Desk {
     pub details_busy: bool,
     pub save_icon: egui::TextureHandle,
     pub file: Option<Change>,
+    pub stage_selection: BTreeSet<String>,
     pub comparison: Option<Compare>,
     pub diff: Option<Box<dyn ActiveDiff>>,
     pub editor: String,
@@ -419,6 +467,7 @@ impl Desk {
             details_busy: false,
             save_icon: crate::ui::load_save_icon(ctx),
             file: None,
+            stage_selection: BTreeSet::new(),
             comparison: None,
             diff: None,
             editor: String::new(),
@@ -685,6 +734,7 @@ impl Desk {
         self.search.clear();
         self.branch_query.clear();
         self.file_query.clear();
+        self.stage_selection.clear();
         self.cancel_history_search();
         self.search_row = None;
         self.scroll_to = None;
@@ -706,7 +756,7 @@ impl Desk {
         } else if !state.history_busy {
             self.request_history(ctx, &path);
         }
-        self.request_status(ctx, &path, false);
+        self.request_status(ctx, &path, false, StatusScope::Full);
         self.save();
     }
 
@@ -738,6 +788,7 @@ impl Desk {
             self.restore_active = None;
             self.settings.active = None;
             self.selection = Selection::Worktree;
+            self.stage_selection.clear();
             self.details = None;
             self.details_busy = false;
             self.details_request = self.next();
@@ -878,13 +929,29 @@ impl Desk {
         );
     }
 
-    fn request_status(&mut self, ctx: &egui::Context, path: &Path, force: bool) {
+    fn request_status(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        force: bool,
+        scope: StatusScope,
+    ) {
         let request = self.next();
         let state = self.repos.entry(path.to_owned()).or_default();
-        if (state.operation.pending.status
-            && !matches!(state.operation.after_frame, Followup::Idle))
-            || (state.status_busy && !force)
+        let now = Instant::now();
+        if state.operation.pending.status.is_some()
+            && !matches!(state.operation.after_frame, Followup::Idle)
         {
+            if force && scope == StatusScope::Full {
+                state.operation.pending.status = Some(StatusScope::Full);
+                if let Followup::Refresh(deadline) = &mut state.operation.after_frame {
+                    *deadline = now;
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        if state.status_busy && !force {
             return;
         }
         if !force
@@ -897,7 +964,15 @@ impl Desk {
         state.status_request = request;
         state.status_busy = true;
         state.status_error = None;
-        state.refresh_on_focus = false;
+        let cached_head = state.cached_head_for_file_refresh(scope, now);
+        state.status_read_scope = Some(if cached_head.is_some() {
+            StatusScope::Files
+        } else {
+            StatusScope::Full
+        });
+        if cached_head.is_none() {
+            state.refresh_on_focus = false;
+        }
         let root = path.to_owned();
         let log = ReadLog::queue("status", path, request);
         self.submit(
@@ -906,8 +981,9 @@ impl Desk {
             move || {
                 let started = Instant::now();
                 let result = git::status(&root);
-                let submodules = git::submodules(&root);
-                let outcome = if result.is_ok() && submodules.is_ok() {
+                let submodules = needs_submodule_refresh(cached_head.as_ref(), &result)
+                    .then(|| git::submodules(&root));
+                let outcome = if result.is_ok() && submodules.as_ref().is_none_or(Result::is_ok) {
                     "ok"
                 } else {
                     "failed"
@@ -919,12 +995,19 @@ impl Desk {
     }
 
     pub(crate) fn request_operation_followups(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
         let pending: Vec<_> = self
             .repos
             .iter_mut()
             .filter(|(path, _)| !self.operations.contains(*path))
             .filter_map(|(path, state)| {
-                let step = std::mem::take(&mut state.operation.after_frame);
+                let step = match state.operation.ready_followup(now) {
+                    Ok(step) => step,
+                    Err(delay) => {
+                        ctx.request_repaint_after(delay);
+                        return None;
+                    }
+                };
                 (!matches!(step, Followup::Idle)).then(|| {
                     (
                         path.clone(),
@@ -951,12 +1034,12 @@ impl Desk {
                         },
                     );
                 }
-                Followup::Refresh => {
+                Followup::Refresh(_) => {
                     if scope.history {
                         self.request_history(ctx, &path);
                     }
-                    if scope.status {
-                        self.request_status(ctx, &path, true);
+                    if let Some(status) = scope.status {
+                        self.request_status(ctx, &path, true, status);
                     }
                 }
                 Followup::Idle => {}
@@ -967,7 +1050,7 @@ impl Desk {
     pub fn refresh(&mut self, ctx: &egui::Context) {
         if let Some(path) = self.active.clone() {
             self.request_history(ctx, &path);
-            self.request_status(ctx, &path, true);
+            self.request_status(ctx, &path, true, StatusScope::Full);
         }
     }
 
@@ -1192,6 +1275,7 @@ impl Desk {
             self.tasks.cancel(active, Some(ReadKind::Details));
         }
         self.selection = Selection::Worktree;
+        self.stage_selection.clear();
         self.details_request = self.next();
         self.details_busy = false;
         self.details_error = None;
@@ -1235,6 +1319,7 @@ impl Desk {
             left: current.as_ref().map(|(commit, _)| commit.clone()),
             right_position: Some((generation, row)),
         };
+        self.stage_selection.clear();
         self.details_request = self.next();
         let request = self.details_request;
         self.details = None;
@@ -1401,11 +1486,12 @@ impl Desk {
         let request = self.next();
         let state = self.repos.entry(root.clone()).or_default();
         let mut after = operation.after_success(state.status.as_ref());
-        if after.refresh.status
+        if after.refresh.status.is_some()
             && state.status_busy
             && state.status_request != state.operation.request
         {
-            state.operation.pending.status = true;
+            state.operation.pending.status =
+                state.operation.pending.status.max(state.status_read_scope);
         }
         if after.refresh.history && state.history_busy && state.history_pending_window.is_none() {
             state.operation.pending.history = true;
@@ -1510,7 +1596,9 @@ impl Desk {
                         }
                     }
                 }
-                state.operation.finish(after.refresh, after.readback);
+                state
+                    .operation
+                    .finish(after.refresh, after.readback, Instant::now());
                 state.invalidate_operation_reads(request, state.operation.pending);
                 if let Some(destination) = moved {
                     self.reconcile_worktree_file(ctx, Some(destination), false);
@@ -1531,9 +1619,14 @@ impl Desk {
                 }
                 state
                     .operation
-                    .finish(operation.refresh_after_failure(), None);
+                    .finish(operation.refresh_after_failure(), None, Instant::now());
                 state.invalidate_operation_reads(request, state.operation.pending);
-                self.tell_operation(path, format!("{error:#}"), true);
+                let message = if matches!(operation, Operation::Stage(_)) {
+                    format!("暂存失败 · {error:#}")
+                } else {
+                    format!("{error:#}")
+                };
+                self.tell_operation(path, message, true);
             }
         }
     }
@@ -1558,7 +1651,9 @@ impl Desk {
             );
             return;
         };
-        state.operation.finish(RefreshScope::default(), None);
+        state
+            .operation
+            .finish(RefreshScope::default(), None, Instant::now());
         let active = self.active.as_deref() == Some(path);
         let mut reconcile_file = false;
         let mut moved = None;
@@ -1800,8 +1895,12 @@ impl Desk {
                     };
                     logging::read_applied("status", &path, request);
                     state.status_busy = false;
-                    state.operation.pending.status = false;
-                    state.status_checked = Some(Instant::now());
+                    state.status_read_scope = None;
+                    state.operation.pending.status = None;
+                    if submodules.is_some() {
+                        state.status_checked = Some(Instant::now());
+                        state.refresh_on_focus = false;
+                    }
                     let status_updated = result.is_ok();
                     let mut head_changed = false;
                     match result {
@@ -1822,7 +1921,7 @@ impl Desk {
                         }
                     }
                     let updated = match submodules {
-                        Ok(mut modules) => {
+                        Some(Ok(mut modules)) => {
                             for module in &mut modules {
                                 if let Some(path) = self
                                     .settings
@@ -1837,7 +1936,7 @@ impl Desk {
                             state.submodule_warning = None;
                             true
                         }
-                        Err(error) => {
+                        Some(Err(error)) => {
                             if logging::warn_periodic(&mut state.submodule_warning) {
                                 logging::read_failed("submodules", &path, request, &error);
                             }
@@ -1847,6 +1946,7 @@ impl Desk {
                             );
                             false
                         }
+                        None => false,
                     };
                     if self.active.as_ref() == Some(&path) {
                         if status_updated {
@@ -2055,7 +2155,7 @@ impl Desk {
             state.refresh_on_focus |= refocused;
             if let Some(delay) = state.focus_refresh_delay(Instant::now()) {
                 if delay.is_zero() {
-                    self.request_status(ctx, &path, true);
+                    self.request_status(ctx, &path, true, StatusScope::Full);
                 } else {
                     ctx.request_repaint_after(delay);
                 }
@@ -2151,6 +2251,7 @@ mod tests {
 
     #[test]
     fn newer_operations_keep_unfinished_calibration_scoped_to_their_worktree() {
+        let now = Instant::now();
         let mut first = Repository::default();
         let mut second = Repository::default();
         let scope = first.operation.begin(1, RefreshScope::BOTH);
@@ -2158,12 +2259,13 @@ mod tests {
         first.operation.finish(
             RefreshScope::BOTH,
             Some(TargetedRead::Head(git::HeadUpdate::SwitchBranch)),
+            now,
         );
         assert!(matches!(first.operation.after_frame, Followup::Read(_)));
 
         let second_scope = second.operation.begin(2, RefreshScope::HISTORY);
         second.invalidate_operation_reads(2, second_scope);
-        second.operation.finish(RefreshScope::HISTORY, None);
+        second.operation.finish(RefreshScope::HISTORY, None, now);
         let new_scope = first.operation.begin(3, RefreshScope::STATUS);
         first.invalidate_operation_reads(3, new_scope);
         assert!(!first.operation.owns(1));
@@ -2171,10 +2273,106 @@ mod tests {
         assert_eq!((first.history_request, first.status_request), (3, 3));
         assert_eq!((second.history_request, second.status_request), (2, 0));
 
-        first.operation.finish(RefreshScope::default(), None);
+        first.operation.finish(RefreshScope::default(), None, now);
         assert_eq!(first.operation.pending, RefreshScope::BOTH);
-        assert!(matches!(first.operation.after_frame, Followup::Refresh));
+        assert!(matches!(first.operation.after_frame, Followup::Refresh(_)));
         assert_eq!(second.operation.pending, RefreshScope::HISTORY);
+    }
+
+    #[test]
+    fn ordinary_index_operations_coalesce_only_final_status_reads() {
+        let now = Instant::now();
+        let mut operation = OperationCompletion::default();
+        operation.begin(1, RefreshScope::FILES);
+        operation.finish(RefreshScope::FILES, None, now);
+        assert!(
+            matches!(operation.ready_followup(now), Err(delay) if delay == INDEX_STATUS_COALESCE)
+        );
+
+        let next = now + INDEX_STATUS_COALESCE / 2;
+        operation.begin(2, RefreshScope::FILES);
+        operation.finish(RefreshScope::FILES, None, next);
+        assert!(
+            operation
+                .ready_followup(now + INDEX_STATUS_COALESCE)
+                .is_err()
+        );
+        assert!(matches!(
+            operation.ready_followup(next + INDEX_STATUS_COALESCE),
+            Ok(Followup::Refresh(_))
+        ));
+        assert!(matches!(
+            operation.ready_followup(next + INDEX_STATUS_COALESCE),
+            Ok(Followup::Idle)
+        ));
+
+        operation.finish(
+            RefreshScope::FILES,
+            Some(TargetedRead::Index {
+                source: Area::Unstaged,
+                paths: ["a".into()].into(),
+            }),
+            now,
+        );
+        assert!(matches!(
+            operation.ready_followup(now),
+            Ok(Followup::Read(_))
+        ));
+        operation.finish(RefreshScope::STATUS, None, now);
+        assert_eq!(operation.pending, RefreshScope::STATUS);
+        assert!(matches!(
+            operation.ready_followup(now),
+            Ok(Followup::Refresh(_))
+        ));
+    }
+
+    #[test]
+    fn file_refresh_reuses_only_a_recent_submodule_read_for_the_same_head() {
+        let now = Instant::now();
+        let status = || Status {
+            head: Some("a".repeat(40)),
+            files: vec![],
+        };
+        let mut repository = Repository {
+            status: Some(status()),
+            submodules: Some(vec![]),
+            status_checked: Some(now),
+            ..Repository::default()
+        };
+        let cached_head = repository.cached_head_for_file_refresh(StatusScope::Files, now);
+        assert!(!needs_submodule_refresh(
+            cached_head.as_ref(),
+            &Ok(status())
+        ));
+        let mut changed = status();
+        changed.head = Some("b".repeat(40));
+        assert!(needs_submodule_refresh(cached_head.as_ref(), &Ok(changed)));
+        let mut changed = status();
+        changed.files.push(Change {
+            path: ".gitmodules".into(),
+            old_path: None,
+            code: 'M',
+            area: Area::Unstaged,
+            left_gitlink: false,
+            right_gitlink: false,
+        });
+        assert!(needs_submodule_refresh(cached_head.as_ref(), &Ok(changed)));
+        assert!(
+            repository
+                .cached_head_for_file_refresh(StatusScope::Full, now)
+                .is_none()
+        );
+        assert!(
+            repository
+                .cached_head_for_file_refresh(StatusScope::Files, now + STATUS_REFRESH_INTERVAL)
+                .is_none()
+        );
+        repository.submodules = None;
+        assert!(
+            repository
+                .cached_head_for_file_refresh(StatusScope::Files, now)
+                .is_none()
+        );
     }
 
     #[test]

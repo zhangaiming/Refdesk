@@ -6,7 +6,7 @@ use crate::ui::{
     save_icon_button, split_panel_height,
 };
 use eframe::egui::{self, Align, FontId, Layout, Rect, RichText, Sense, UiBuilder, Vec2};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 const COMMIT_PANEL_MIN_HEIGHT: f32 = 144.0;
 const COMMIT_PANEL_MAX_HEIGHT: f32 = 320.0;
@@ -133,6 +133,16 @@ fn file_rows<'a>(
         rows.extend(files.iter().filter(matches).map(FileRow::File));
     }
     rows
+}
+
+fn stage_selected_files(files: &[Change], selected: &BTreeSet<String>) -> Option<Operation> {
+    let paths: BTreeSet<_> = files
+        .iter()
+        .filter(|file| file.area == Area::Unstaged && selected.contains(&file.path))
+        .flat_map(Change::index_paths)
+        .cloned()
+        .collect();
+    (!paths.is_empty()).then(|| Operation::Stage(paths.into_iter().collect()))
 }
 
 fn file_name_and_directory(path: &str) -> (&str, &str) {
@@ -336,7 +346,7 @@ impl Desk {
     fn files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         let worktree = matches!(self.selection, Selection::Worktree);
-        let state = self.state();
+        let state = self.active.as_ref().and_then(|root| self.repos.get(root));
         let status_busy = state.is_some_and(|state| state.status_busy);
         let count = if worktree {
             state.map_or(0, |state| state.changes().len())
@@ -352,10 +362,34 @@ impl Desk {
         let mut chosen = None;
         let mut external = false;
         let mut staging = None;
+        let mut stage_selected = false;
+        let files = if worktree {
+            state.map(|state| state.changes()).unwrap_or_default()
+        } else {
+            self.details
+                .as_ref()
+                .map(|details| details.files.as_slice())
+                .unwrap_or_default()
+        };
+        let selected = &mut self.stage_selection;
+        if !selected.is_empty() {
+            let available: BTreeSet<_> = files
+                .iter()
+                .filter(|file| file.area == Area::Unstaged && selected.contains(&file.path))
+                .map(|file| file.path.as_str())
+                .collect();
+            selected.retain(|path| available.contains(path.as_str()));
+        }
+        let stage_label = |count| format!("暂存所选 ({count})");
         ui.horizontal(|ui| {
             heading(ui, "文件", Some(count));
             if worktree && status_busy {
                 ui.spinner();
+            }
+            if selected.len() > 1 {
+                stage_selected = ui
+                    .add_enabled(can_stage, egui::Button::new(stage_label(selected.len())))
+                    .clicked();
             }
         });
         let query_changed = ui
@@ -367,19 +401,14 @@ impl Desk {
                 .desired_width(f32::INFINITY),
             )
             .changed();
+        if query_changed {
+            selected.clear();
+            stage_selected = false;
+        }
         let reset_scroll = std::mem::take(&mut self.reset_file_scroll) || query_changed;
-        let state = self.state();
         if worktree && let Some(error) = state.and_then(|state| state.status_error.as_ref()) {
             ui.colored_label(colors.removed.foreground, error);
         }
-        let files = if worktree {
-            state.map(|state| state.changes()).unwrap_or_default()
-        } else {
-            self.details
-                .as_ref()
-                .map(|details| details.files.as_slice())
-                .unwrap_or_default()
-        };
         let collapsed_groups_id = ui.id().with("collapsed-file-groups");
         let collapsed_groups = ctx
             .data(|data| data.get_temp::<Vec<Area>>(collapsed_groups_id))
@@ -423,8 +452,7 @@ impl Desk {
                     let code_font = FontId::monospace(12.0);
                     let baseline_offset = centered_baseline(ui.painter(), name_font.clone());
                     for index in visible {
-                        let (row_id, rect) =
-                            ui.allocate_space(Vec2::new(ui.available_width(), ROW));
+                        let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), ROW));
                         let painter = ui.painter();
                         let right = rect.right() - FILE_RIGHT_INSET;
                         let baseline = rect.center().y + baseline_offset;
@@ -502,10 +530,16 @@ impl Desk {
                             }
                             FileRow::File(file) => file,
                         };
+                        let row_id = ui.id().with((&self.active, &file.path, file.area));
                         let response = ui.interact(rect, row_id, Sense::click());
-                        let is_selected = self.file.as_ref().is_some_and(|current| {
-                            current.path == file.path && current.area == file.area
-                        });
+                        let can_select = worktree && file.area == Area::Unstaged;
+                        let is_selected = if can_select {
+                            selected.contains(&file.path)
+                        } else {
+                            self.file.as_ref().is_some_and(|current| {
+                                current.path == file.path && current.area == file.area
+                            })
+                        };
                         if is_selected || response.hovered() {
                             ui.painter().rect_filled(
                                 rect,
@@ -562,10 +596,25 @@ impl Desk {
                         let name =
                             fit_line(painter, label, name_font.clone(), colors.text, name_width);
                         paint_baseline(painter, name_x, baseline, name, colors.text);
+                        let toggle_selection =
+                            can_select && ctx.input(|input| input.modifiers.command);
                         if response.clicked() {
-                            chosen = Some(file.clone());
+                            if toggle_selection {
+                                if !selected.remove(&file.path) {
+                                    selected.insert(file.path.clone());
+                                    chosen = Some(file.clone());
+                                }
+                            } else {
+                                selected.clear();
+                                if can_select {
+                                    selected.insert(file.path.clone());
+                                }
+                                chosen = Some(file.clone());
+                            }
+                            ctx.request_repaint();
                         }
                         if response.double_clicked()
+                            && !toggle_selection
                             && self.settings.matching_tool(&file.path).is_some()
                         {
                             chosen = Some(file.clone());
@@ -576,14 +625,26 @@ impl Desk {
                                 ui.ctx().copy_text(file.path.clone());
                                 ui.close_menu();
                             }
-                            if can_stage && file.area != Area::Commit {
-                                let label = if file.area == Area::Staged {
-                                    "取消暂存"
+                            if worktree && file.area != Area::Commit {
+                                let batch = can_select
+                                    && selected.len() > 1
+                                    && selected.contains(&file.path);
+                                let label = if batch {
+                                    stage_label(selected.len())
+                                } else if file.area == Area::Staged {
+                                    "取消暂存".to_owned()
                                 } else {
-                                    "暂存"
+                                    "暂存".to_owned()
                                 };
-                                if ui.button(label).clicked() {
-                                    staging = Some(file.clone());
+                                if ui
+                                    .add_enabled(can_stage, egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    if batch {
+                                        stage_selected = true;
+                                    } else {
+                                        staging = file.index_operation();
+                                    }
                                     ui.close_menu();
                                 }
                             }
@@ -595,14 +656,21 @@ impl Desk {
                                 ui.close_menu();
                             }
                         });
-                        response.on_hover_text(if let Some(old) = &file.old_path {
+                        let mut tooltip = if let Some(old) = &file.old_path {
                             format!("{old}  →  {}", file.path)
                         } else {
                             file.path.clone()
-                        });
+                        };
+                        if can_select {
+                            tooltip.push_str("\nCtrl+单击多选");
+                        }
+                        response.on_hover_text(tooltip);
                     }
                 });
         });
+        if stage_selected {
+            staging = stage_selected_files(files, selected);
+        }
         if let Some(file) = chosen {
             let tool = external
                 .then(|| self.settings.matching_tool(&file.path).cloned())
@@ -612,9 +680,7 @@ impl Desk {
                 self.external(ctx, tool);
             }
         }
-        if let (Some(file), Some(root)) = (staging, self.active.clone())
-            && let Some(operation) = file.index_operation()
-        {
+        if let (Some(operation), Some(root)) = (staging, self.active.clone()) {
             self.operate(ctx, root, operation);
         }
     }
@@ -633,6 +699,25 @@ mod tests {
             left_gitlink: false,
             right_gitlink: false,
         }
+    }
+
+    #[test]
+    fn stage_selection_excludes_other_rows_and_keeps_both_rename_paths() {
+        let files = [
+            Change {
+                code: 'R',
+                old_path: Some("from.txt".into()),
+                ..change("to.txt", Area::Unstaged)
+            },
+            change("also.txt", Area::Unstaged),
+            change("other.txt", Area::Unstaged),
+            change("staged.txt", Area::Staged),
+        ];
+        let selected = BTreeSet::from(["to.txt".into(), "also.txt".into(), "staged.txt".into()]);
+        let Some(Operation::Stage(paths)) = stage_selected_files(&files, &selected) else {
+            panic!("expected one stage operation");
+        };
+        assert_eq!(paths, ["also.txt", "from.txt", "to.txt"]);
     }
 
     #[test]
