@@ -1,5 +1,5 @@
-use crate::app::{Desk, Selection};
-use crate::git::{Commit, History, HistoryScope, PAGE, Reference, TrackingState};
+use crate::app::{Desk, Dialog, Selection};
+use crate::git::{Area, Commit, History, HistoryScope, Operation, PAGE, Reference, TrackingState};
 use crate::graph::{GraphRow, Span};
 use crate::history::{Row, SearchDirection, matches_search};
 use crate::theme;
@@ -10,6 +10,7 @@ use crate::ui::{
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2};
+use std::path::Path;
 use std::time::Duration;
 
 const FULL_COMMIT_TIME: &str = "%Y-%m-%d %H:%M";
@@ -20,7 +21,25 @@ const HISTORY_PREFETCH_DISTANCE: f32 = 12.0 * ROW;
 
 enum Click {
     Worktree,
+    CommitWorktree,
     Commit(usize, Commit, bool),
+    CopyId(String),
+    CopyMessage(String),
+    Dialog(Dialog),
+}
+
+fn confirm_operation(
+    root: &Path,
+    title: &'static str,
+    question: String,
+    operation: Operation,
+) -> Click {
+    Click::Dialog(Dialog::Operation {
+        root: root.to_path_buf(),
+        title,
+        question,
+        operation,
+    })
 }
 
 impl Desk {
@@ -128,16 +147,18 @@ impl Desk {
         if let Some(error) = self.state().and_then(|state| state.history_error.as_ref()) {
             ui.colored_label(colors.removed.foreground, error);
         }
-        let Some(state) = self.state() else {
+        let Some((root, state)) = self.active.as_deref().zip(self.state()) else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("添加一个 Git 仓库以打开提交图").color(colors.muted));
             });
             return;
         };
+        let writing = self.operations.contains(root);
         let history = state.history.as_ref();
+        let overview = state.history_info();
         let summary = history.map_or_else(Default::default, |history| history.summary);
         let lanes = summary.lanes;
-        let head_index = summary.head_row;
+        let head_index = state.head_row();
         let scroll_to = if head { head_index } else { self.scroll_to };
         let width = ui.available_width() - ui.spacing().scroll.allocated_width();
         let graph_width = graph_width(width, lanes);
@@ -161,8 +182,13 @@ impl Desk {
                 let mut missing_label = false;
                 for index in visible {
                     let cached = index.checked_sub(1).and_then(|row| history?.row(row));
-                    let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(width, ROW),
+                    let (id, rect) = ui.allocate_space(Vec2::new(width, ROW));
+                    let id = cached.map_or(id, |cached| {
+                        ui.make_persistent_id(("history-commit", &cached.commit.id))
+                    });
+                    let response = ui.interact(
+                        rect,
+                        id,
                         if index == 0 || cached.is_some() {
                             Sense::click()
                         } else {
@@ -222,9 +248,47 @@ impl Desk {
                         if response.clicked() {
                             click = Some(Click::Worktree);
                         }
+                        response.context_menu(|ui| {
+                            let changes = state.changes();
+                            let can_stage = changes.iter().any(|file| file.area == Area::Unstaged);
+                            let can_discard = changes.iter().any(|file| {
+                                file.area == Area::Unstaged && file.code != '?' && !file.is_gitlink()
+                            }) && changes.iter().all(|file| file.code != 'U');
+                            if ui.button("提交…").clicked() {
+                                click = Some(Click::CommitWorktree);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(!writing && can_stage, egui::Button::new("暂存全部…"))
+                                .clicked()
+                            {
+                                click = Some(confirm_operation(
+                                    root,
+                                    "暂存全部",
+                                    "暂存此工作树的所有改动，包括未被忽略的新文件？".into(),
+                                    Operation::StageAll,
+                                ));
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !writing && can_discard,
+                                    egui::Button::new("丢弃未暂存改动…"),
+                                )
+                                .clicked()
+                            {
+                                click = Some(confirm_operation(
+                                    root,
+                                    "丢弃未暂存改动",
+                                    "从暂存区恢复已跟踪的文件？此操作会丢弃这些文件的未暂存改动，保留暂存内容和未跟踪文件。".into(),
+                                    Operation::DiscardUnstaged,
+                                ));
+                                ui.close_menu();
+                            }
+                        });
                         continue;
                     }
-                    let Some((cached, history)) = cached.zip(history) else {
+                    let Some((cached, history)) = cached.zip(overview) else {
                         if !missing_label && rect.intersects(ui.clip_rect()) {
                             missing_rows = true;
                             let label = if state.history_error.is_some() && !state.history_busy {
@@ -243,7 +307,6 @@ impl Desk {
                         }
                         continue;
                     };
-                    let history = &history.cache.info;
                     let commit = &cached.commit;
                     let graph = &cached.graph;
                     let selected = match &self.selection {
@@ -295,10 +358,6 @@ impl Desk {
                         ));
                     }
                     response.context_menu(|ui| {
-                        if ui.button("复制完整 SHA").clicked() {
-                            ui.ctx().copy_text(commit.id.clone());
-                            ui.close_menu();
-                        }
                         if ui.button("打开提交详情").clicked() {
                             click = Some(Click::Commit(index - 1, commit.clone(), false));
                             ui.close_menu();
@@ -309,6 +368,68 @@ impl Desk {
                             click = Some(Click::Commit(index - 1, commit.clone(), true));
                             ui.close_menu();
                         }
+                        ui.separator();
+                        if ui.button("复制消息").clicked() {
+                            click = Some(Click::CopyMessage(commit.id.clone()));
+                            ui.close_menu();
+                        }
+                        if ui.button("复制 ID").on_hover_text("复制完整 SHA").clicked() {
+                            click = Some(Click::CopyId(commit.id.clone()));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(!writing, |ui| {
+                            if ui.button("检出提交…").clicked() {
+                                click = Some(confirm_operation(
+                                    root,
+                                    "检出提交",
+                                    format!("检出 {}？HEAD 将分离到该提交。", commit.short),
+                                    Operation::CheckoutCommit(commit.id.clone()),
+                                ));
+                                ui.close_menu();
+                            }
+                            if ui.button("合并提交…").clicked() {
+                                click = Some(confirm_operation(
+                                    root,
+                                    "合并提交",
+                                    format!("将 {} 合并到当前 HEAD？", commit.short),
+                                    Operation::MergeCommit(commit.id.clone()),
+                                ));
+                                ui.close_menu();
+                            }
+                            if ui.button("摘取提交…").clicked() {
+                                click = Some(if commit.parents.len() > 1 {
+                                    Click::Dialog(Dialog::CherryPickMerge {
+                                        root: root.to_path_buf(),
+                                        commit: Box::new(commit.clone()),
+                                        mainline: None,
+                                    })
+                                } else {
+                                    confirm_operation(
+                                        root,
+                                        "摘取提交",
+                                        format!("将 {} 的改动摘取到当前 HEAD？", commit.short),
+                                        Operation::CherryPick {
+                                            commit: commit.id.clone(),
+                                            mainline: None,
+                                        },
+                                    )
+                                });
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            for (label, tag) in [("创建分支…", false), ("创建标签…", true)] {
+                                if ui.button(label).clicked() {
+                                    click = Some(Click::Dialog(Dialog::NewCommitReference {
+                                        root: root.to_path_buf(),
+                                        commit: Box::new(commit.clone()),
+                                        name: String::new(),
+                                        tag,
+                                    }));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     });
                     response.on_hover_ui(|ui| {
                         ui.label(&commit.subject);
@@ -394,9 +515,13 @@ impl Desk {
         self.request_history_window(ctx, pages, remaining <= HISTORY_PREFETCH_DISTANCE);
         match click {
             Some(Click::Worktree) => self.choose_worktree(),
+            Some(Click::CommitWorktree) => self.focus_worktree_commit(ctx),
             Some(Click::Commit(row, commit, extend)) => {
                 self.choose_commit(ctx, row, commit, extend)
             }
+            Some(Click::CopyId(id)) => self.copy_commit_id(ctx, id),
+            Some(Click::CopyMessage(id)) => self.copy_commit_message(ctx, id),
+            Some(Click::Dialog(dialog)) => self.dialog = Some(dialog),
             None => {}
         }
     }

@@ -1,6 +1,8 @@
 use crate::builtin_diff::{self, ActiveDiff};
 use crate::git::{
-    self, Change, Commit, Compare, Details, HistoryScope, Operation, Status, Submodule,
+    self, AfterSuccess, Area, Change, Commit, Compare, ConfirmedChange, CurrentHead, Details,
+    History, HistoryScope, ImmediateChange, Operation, Reference, RefreshScope, Status, Submodule,
+    TargetedRead, TrackingState,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
 use crate::logging::{self, Presentation, ReadLog};
@@ -34,13 +36,16 @@ enum Event {
     HistorySearch(u64, u64, Outcome<SearchResult>),
     Status(PathBuf, u64, Result<Status>, Result<Vec<Submodule>>),
     Details(u64, u64, Selection, Outcome<Details>),
-    Operation(PathBuf, Option<String>, Outcome<String>),
+    CopyCommitMessage(PathBuf, u64, Outcome<String>),
+    Operation(PathBuf, u64, Operation, Result<(String, AfterSuccess)>),
+    OperationReadback(PathBuf, u64, Result<Option<ConfirmedChange>>),
     External(Outcome<TempDir>),
 }
 
 #[derive(Default)]
 pub(crate) struct Repository {
     pub history: Option<HistoryView>,
+    history_overlay: Option<History>,
     pub status: Option<Status>,
     submodules: Option<Vec<Submodule>>,
     pub history_busy: bool,
@@ -56,6 +61,7 @@ pub(crate) struct Repository {
     history_on_demand: bool,
     draft: String,
     status_request: u64,
+    operation: OperationCompletion,
     status_checked: Option<Instant>,
     visible_history_request: Option<u64>,
     visible_status_request: Option<u64>,
@@ -64,9 +70,125 @@ pub(crate) struct Repository {
     refresh_on_focus: bool,
 }
 
+#[derive(Default)]
+struct OperationCompletion {
+    request: u64,
+    pending: RefreshScope,
+    after_frame: Followup,
+    feedback: Option<(String, bool)>,
+}
+
+#[derive(Default)]
+enum Followup {
+    #[default]
+    Idle,
+    Read(TargetedRead),
+    Refresh,
+}
+
+impl OperationCompletion {
+    fn owns(&self, request: u64) -> bool {
+        self.request == request
+    }
+
+    fn begin(&mut self, request: u64, refresh: RefreshScope) -> RefreshScope {
+        self.request = request;
+        self.after_frame = Followup::Idle;
+        self.pending.union(refresh)
+    }
+
+    fn finish(&mut self, refresh: RefreshScope, readback: Option<TargetedRead>) {
+        self.pending = self.pending.union(refresh);
+        self.after_frame = if self.pending.is_empty() {
+            Followup::Idle
+        } else {
+            readback.map_or(Followup::Refresh, Followup::Read)
+        };
+    }
+}
+
 impl Repository {
     pub fn changes(&self) -> &[Change] {
         self.status.as_ref().map_or(&[], |status| &status.files)
+    }
+
+    pub fn history_info(&self) -> Option<&History> {
+        self.history_overlay
+            .as_ref()
+            .or_else(|| self.history.as_ref().map(|history| &history.cache.info))
+    }
+
+    pub fn head_row(&self) -> Option<usize> {
+        let history = self.history.as_ref()?;
+        let head = &self.history_info()?.head;
+        if head == &history.cache.info.head {
+            return history.summary.head_row;
+        }
+        let head = head.as_ref()?;
+        history
+            .cached_rows()
+            .find_map(|(index, row)| (head == &row.commit.id).then_some(index))
+    }
+
+    fn update_reference(&mut self, reference: Reference) {
+        if let Some(history) = self.history.as_ref() {
+            let overview = self
+                .history_overlay
+                .get_or_insert_with(|| history.cache.info.clone());
+            set_reference(overview, reference);
+        }
+    }
+
+    fn update_head(&mut self, head: CurrentHead, switch_branch: bool) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let located = history
+            .cached_rows()
+            .any(|(_, row)| row.commit.id == head.id && row.commit.parents == head.parents);
+        if !located && !switch_branch {
+            return;
+        }
+        let overview = self
+            .history_overlay
+            .get_or_insert_with(|| history.cache.info.clone());
+        overview.branch = head.branch().to_owned();
+        if let Some(name) = head.reference {
+            let mut reference = overview
+                .refs
+                .iter()
+                .find(|reference| reference.name == name)
+                .cloned()
+                .unwrap_or(Reference {
+                    name,
+                    target: head.id.clone(),
+                    upstream: None,
+                    symbolic: false,
+                });
+            if reference.target != head.id {
+                reference.target.clone_from(&head.id);
+                if let Some(upstream) = &mut reference.upstream {
+                    upstream.state = TrackingState::Unknown;
+                }
+            }
+            set_reference(overview, reference);
+        }
+        overview.head = located.then_some(head.id);
+    }
+
+    fn invalidate_operation_reads(&mut self, request: u64, scope: RefreshScope) {
+        if scope.status {
+            self.status_request = request;
+            self.status_busy = true;
+        }
+        if scope.history {
+            self.history_request = request;
+            self.history_busy = true;
+            self.history_pending_window = None;
+            if let Some(cancel) = self.history_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     fn focus_refresh_delay(&self, now: Instant) -> Option<Duration> {
@@ -75,6 +197,24 @@ impl Repository {
                 STATUS_REFRESH_INTERVAL.saturating_sub(now.saturating_duration_since(checked))
             })
         })
+    }
+}
+
+fn set_reference(history: &mut History, reference: Reference) {
+    match history
+        .refs
+        .binary_search_by(|entry| entry.name.cmp(&reference.name))
+    {
+        Ok(index) => history.refs[index] = reference,
+        Err(index) => history.refs.insert(index, reference),
+    }
+}
+
+fn index_destination(source: Area) -> Area {
+    if source == Area::Staged {
+        Area::Unstaged
+    } else {
+        Area::Staged
     }
 }
 
@@ -111,6 +251,17 @@ pub(crate) enum Dialog {
         question: String,
     },
     NewBranch(String),
+    NewCommitReference {
+        root: PathBuf,
+        commit: Box<Commit>,
+        name: String,
+        tag: bool,
+    },
+    CherryPickMerge {
+        root: PathBuf,
+        commit: Box<Commit>,
+        mainline: Option<usize>,
+    },
     Forget(PathBuf),
 }
 
@@ -144,6 +295,7 @@ pub(crate) struct Desk {
     pub import_message: String,
     pub status_message: String,
     pub status_is_error: bool,
+    status_from_operation: bool,
     pub operations: HashSet<PathBuf>,
     pub force_text: bool,
     pub show_full_line: Option<String>,
@@ -152,6 +304,7 @@ pub(crate) struct Desk {
     writes_enabled: bool,
     requests: u64,
     details_request: u64,
+    copy_message_request: u64,
     external_dirs: Vec<TempDir>,
     timings: Option<Timings>,
     presentation: Option<Presentation>,
@@ -281,6 +434,7 @@ impl Desk {
             import_message,
             status_message: warning.unwrap_or_default(),
             status_is_error,
+            status_from_operation: false,
             writes_enabled,
             operations: HashSet::new(),
             force_text: false,
@@ -288,6 +442,7 @@ impl Desk {
             graph_reset: 0,
             focused: true,
             requests: 0,
+            copy_message_request: 0,
             details_request: 0,
             external_dirs: Vec::new(),
             timings: Timings::open(started),
@@ -331,6 +486,18 @@ impl Desk {
     pub fn tell(&mut self, message: impl Into<String>, error: bool) {
         self.status_message = message.into();
         self.status_is_error = error;
+        self.status_from_operation = false;
+    }
+
+    fn tell_operation(&mut self, path: &Path, message: impl Into<String>, error: bool) {
+        let message = message.into();
+        if self.active.as_deref() == Some(path) {
+            self.tell(message.clone(), error);
+            self.status_from_operation = true;
+        }
+        if let Some(state) = self.repos.get_mut(path) {
+            state.operation.feedback = Some((message, error));
+        }
     }
 
     pub fn save(&mut self) {
@@ -503,6 +670,12 @@ impl Desk {
                     .unwrap_or_default(),
                 ..Repository::default()
             });
+        if let Some((message, error)) = self.repos[&path].operation.feedback.clone() {
+            self.tell(message, error);
+            self.status_from_operation = true;
+        } else if self.status_from_operation {
+            self.tell("", false);
+        }
         self.selection = Selection::Worktree;
         self.details_busy = false;
         self.details = None;
@@ -708,7 +881,10 @@ impl Desk {
     fn request_status(&mut self, ctx: &egui::Context, path: &Path, force: bool) {
         let request = self.next();
         let state = self.repos.entry(path.to_owned()).or_default();
-        if state.status_busy && !force {
+        if (state.operation.pending.status
+            && !matches!(state.operation.after_frame, Followup::Idle))
+            || (state.status_busy && !force)
+        {
             return;
         }
         if !force
@@ -740,6 +916,52 @@ impl Desk {
                 Event::Status(root, request, result, submodules)
             },
         );
+    }
+
+    pub(crate) fn request_operation_followups(&mut self, ctx: &egui::Context) {
+        let pending: Vec<_> = self
+            .repos
+            .iter_mut()
+            .filter(|(path, _)| !self.operations.contains(*path))
+            .filter_map(|(path, state)| {
+                let step = std::mem::take(&mut state.operation.after_frame);
+                (!matches!(step, Followup::Idle)).then(|| {
+                    (
+                        path.clone(),
+                        state.operation.request,
+                        state.operation.pending,
+                        step,
+                    )
+                })
+            })
+            .collect();
+        for (path, request, scope, step) in pending {
+            match step {
+                Followup::Read(probe) => {
+                    let root = path.clone();
+                    let log = ReadLog::queue("operation_readback", &path, request);
+                    self.submit(
+                        ctx,
+                        Work::Latest(ReadKind::OperationReadback, &path, request),
+                        move || {
+                            let started = Instant::now();
+                            let result = probe.read(&root);
+                            log.complete(started, if result.is_ok() { "ok" } else { "failed" });
+                            Event::OperationReadback(root, request, result)
+                        },
+                    );
+                }
+                Followup::Refresh => {
+                    if scope.history {
+                        self.request_history(ctx, &path);
+                    }
+                    if scope.status {
+                        self.request_status(ctx, &path, true);
+                    }
+                }
+                Followup::Idle => {}
+            }
+        }
     }
 
     pub fn refresh(&mut self, ctx: &egui::Context) {
@@ -1087,6 +1309,39 @@ impl Desk {
         self.request_diff(ctx);
     }
 
+    fn reconcile_worktree_file(
+        &mut self,
+        ctx: &egui::Context,
+        moved_to: Option<Area>,
+        head_changed: bool,
+    ) {
+        if !matches!(self.selection, Selection::Worktree) {
+            return;
+        }
+        let (Some(file), Some(state)) = (self.file.as_ref(), self.state()) else {
+            return;
+        };
+        let preferred = moved_to.unwrap_or(file.area);
+        let changes = state.changes();
+        let next = changes
+            .iter()
+            .find(|change| change.path == file.path && change.area == preferred)
+            .or_else(|| changes.iter().find(|change| change.path == file.path))
+            .or_else(|| {
+                changes.iter().find(|change| {
+                    change.old_path.as_deref() == Some(file.path.as_str())
+                        || file.old_path.as_deref() == Some(change.path.as_str())
+                })
+            });
+        match next {
+            Some(next) if moved_to.is_some() || head_changed || next != file => {
+                self.choose_file(ctx, next.clone());
+            }
+            None => self.clear_diff(),
+            Some(_) => {}
+        }
+    }
+
     pub fn request_diff(&mut self, ctx: &egui::Context) {
         let (Some(root), Some(pair)) = (self.active.clone(), self.comparison.clone()) else {
             return;
@@ -1122,24 +1377,54 @@ impl Desk {
         self.show_full_line = None;
     }
 
+    pub fn copy_commit_id(&mut self, ctx: &egui::Context, id: String) {
+        self.copy_message_request = self.next();
+        ctx.copy_text(id);
+    }
+
+    pub fn copy_commit_message(&mut self, ctx: &egui::Context, id: String) {
+        let Some(root) = self.active.clone() else {
+            return;
+        };
+        let request = self.next();
+        self.copy_message_request = request;
+        self.submit(ctx, Work::Read, move || {
+            let result = readable(git::commit_message(&root, &id));
+            Event::CopyCommitMessage(root, request, result)
+        });
+    }
+
     pub fn operate(&mut self, ctx: &egui::Context, root: PathBuf, operation: Operation) {
         if !self.operations.insert(root.clone()) {
             return;
         }
-        let committed_message = match &operation {
-            Operation::Commit(message) => Some(message.clone()),
-            _ => None,
-        };
         let request = self.next();
+        let state = self.repos.entry(root.clone()).or_default();
+        let mut after = operation.after_success(state.status.as_ref());
+        if after.refresh.status
+            && state.status_busy
+            && state.status_request != state.operation.request
+        {
+            state.operation.pending.status = true;
+        }
+        if after.refresh.history && state.history_busy && state.history_pending_window.is_none() {
+            state.operation.pending.history = true;
+        }
+        let invalidated = state.operation.begin(request, after.refresh);
+        state.invalidate_operation_reads(request, invalidated);
+        self.tasks.cancel(&root, Some(ReadKind::OperationReadback));
         let worktree = logging::worktree_id(&root);
         let kind = operation.kind();
         let queued = Instant::now();
         tracing::info!(kind, worktree, request, "git_operation_requested");
-        self.tell("正在运行 Git…", false);
+        self.tell_operation(&root, "正在运行 Git…", false);
         self.submit(ctx, Work::Write, move || {
             let started = Instant::now();
             let queue_ms = logging::millis(started.duration_since(queued));
             tracing::debug!(kind, worktree, request, queue_ms, "git_operation_started");
+            if let Some(probe) = &mut after.readback {
+                probe.prepare(&root);
+            }
             let result = operation.execute(&root);
             let run_ms = logging::millis(started.elapsed());
             match &result {
@@ -1166,8 +1451,165 @@ impl Desk {
                     );
                 }
             }
-            Event::Operation(root, committed_message, readable(result))
+            Event::Operation(
+                root,
+                request,
+                operation,
+                result.map(|message| (message, after)),
+            )
         });
+    }
+
+    fn finish_operation(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        request: u64,
+        operation: Operation,
+        result: Result<(String, AfterSuccess)>,
+    ) {
+        let Some(state) = self
+            .repos
+            .get_mut(path)
+            .filter(|state| state.operation.owns(request))
+        else {
+            return;
+        };
+        self.operations.remove(path);
+        let active = self.active.as_deref() == Some(path);
+        match result {
+            Ok((message, after)) => {
+                if let Operation::Commit(message) = &operation {
+                    let draft = if active {
+                        &mut self.editor
+                    } else {
+                        &mut state.draft
+                    };
+                    if draft.trim() == message {
+                        draft.clear();
+                    }
+                }
+                let mut moved = None;
+                match after.immediate {
+                    ImmediateChange::None => {}
+                    ImmediateChange::Reference(reference) => state.update_reference(reference),
+                    ImmediateChange::Index {
+                        source,
+                        unconfirmed,
+                    } => {
+                        if let Some(status) = &mut state.status {
+                            status.apply_index_operation(&operation, source, &unconfirmed);
+                        }
+                        if active
+                            && self.file.as_ref().is_some_and(|file| {
+                                operation.affects_index_path(&file.path)
+                                    && !unconfirmed.contains(&file.path)
+                            })
+                        {
+                            moved = Some(index_destination(source));
+                        }
+                    }
+                }
+                state.operation.finish(after.refresh, after.readback);
+                state.invalidate_operation_reads(request, state.operation.pending);
+                if let Some(destination) = moved {
+                    self.reconcile_worktree_file(ctx, Some(destination), false);
+                }
+                let message = if message.is_empty() {
+                    "Git 操作已完成".into()
+                } else {
+                    message
+                };
+                self.tell_operation(path, message, false);
+            }
+            Err(error) => {
+                if state.history_request == request {
+                    state.history_busy = false;
+                }
+                if state.status_request == request {
+                    state.status_busy = false;
+                }
+                state
+                    .operation
+                    .finish(operation.refresh_after_failure(), None);
+                state.invalidate_operation_reads(request, state.operation.pending);
+                self.tell_operation(path, format!("{error:#}"), true);
+            }
+        }
+    }
+
+    fn finish_operation_readback(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        request: u64,
+        result: Result<Option<ConfirmedChange>>,
+    ) {
+        let Some(state) = self
+            .repos
+            .get_mut(path)
+            .filter(|state| state.operation.owns(request))
+        else {
+            tracing::debug!(
+                kind = "operation_readback",
+                worktree = logging::worktree_id(path),
+                request,
+                "read_stale"
+            );
+            return;
+        };
+        state.operation.finish(RefreshScope::default(), None);
+        let active = self.active.as_deref() == Some(path);
+        let mut reconcile_file = false;
+        let mut moved = None;
+        match result {
+            Ok(Some(change)) => {
+                match change {
+                    ConfirmedChange::Head {
+                        head,
+                        switch_branch,
+                    } if state.history_request == request => {
+                        state.update_head(head, switch_branch);
+                    }
+                    ConfirmedChange::Index {
+                        source,
+                        paths,
+                        status,
+                    } if state.status_request == request => {
+                        if let Some(cached) = &mut state.status
+                            && cached.head == status.head
+                        {
+                            cached.replace_index_paths(&paths, status);
+                            if self
+                                .file
+                                .as_ref()
+                                .is_some_and(|file| paths.contains(&file.path))
+                            {
+                                moved = Some(index_destination(source));
+                            }
+                            reconcile_file = true;
+                        }
+                    }
+                    ConfirmedChange::Discard { paths, status }
+                        if state.status_request == request =>
+                    {
+                        if let Some(cached) = &mut state.status
+                            && cached.head == status.head
+                        {
+                            cached.remove_restored_files(paths, &status);
+                            reconcile_file = true;
+                        }
+                    }
+                    _ => {}
+                }
+                logging::read_applied("operation_readback", path, request);
+            }
+            Ok(None) => {}
+            Err(error) => logging::read_failed("operation_readback", path, request, &error),
+        }
+        if active && reconcile_file {
+            self.reconcile_worktree_file(ctx, moved, false);
+        }
     }
 
     pub fn external(&mut self, ctx: &egui::Context, tool: Tool) {
@@ -1286,8 +1728,14 @@ impl Desk {
                     state.history_busy = false;
                     state.history_cancel = None;
                     let pending = state.history_pending_window.take();
+                    if pending.is_none() {
+                        state.operation.pending.history = false;
+                    }
                     match result {
                         Ok(Some(mut history)) => {
+                            if history.generation == request {
+                                state.history_overlay = None;
+                            }
                             let active = self.active.as_ref() == Some(&path);
                             history.cache.set_active(active);
                             if active {
@@ -1352,9 +1800,16 @@ impl Desk {
                     };
                     logging::read_applied("status", &path, request);
                     state.status_busy = false;
+                    state.operation.pending.status = false;
                     state.status_checked = Some(Instant::now());
+                    let status_updated = result.is_ok();
+                    let mut head_changed = false;
                     match result {
                         Ok(status) => {
+                            head_changed = state
+                                .status
+                                .as_ref()
+                                .is_some_and(|previous| previous.head != status.head);
                             state.status = Some(status);
                             state.visible_status_request = Some(request);
                             state.status_warning = None;
@@ -1394,6 +1849,9 @@ impl Desk {
                         }
                     };
                     if self.active.as_ref() == Some(&path) {
+                        if status_updated {
+                            self.reconcile_worktree_file(ctx, None, head_changed);
+                        }
                         self.restore_repository(ctx, &path);
                     } else if updated
                         && self.active.as_ref().is_some_and(|active| {
@@ -1433,38 +1891,19 @@ impl Desk {
                         }
                     }
                 }
-                Event::Operation(path, committed_message, result) => {
-                    self.operations.remove(&path);
-                    if result.is_ok()
-                        && let Some(message) = committed_message
-                    {
-                        let draft = if self.active.as_ref() == Some(&path) {
-                            Some(&mut self.editor)
-                        } else {
-                            self.repos.get_mut(&path).map(|repo| &mut repo.draft)
-                        };
-                        if let Some(draft) = draft
-                            && draft.trim() == message
-                        {
-                            draft.clear();
+                Event::CopyCommitMessage(root, request, result) => {
+                    if self.copy_message_request == request && self.active.as_ref() == Some(&root) {
+                        match result {
+                            Ok(message) => ctx.copy_text(message),
+                            Err(error) => self.tell(error, true),
                         }
                     }
-                    match result {
-                        Ok(message) => self.tell(
-                            if message.is_empty() {
-                                "Git 操作已完成".into()
-                            } else {
-                                message
-                            },
-                            false,
-                        ),
-                        Err(error) => self.tell(error, true),
-                    }
-                    if self.active.as_ref() == Some(&path) {
-                        self.choose_worktree();
-                    }
-                    self.request_history(ctx, &path);
-                    self.request_status(ctx, &path, true);
+                }
+                Event::Operation(path, request, operation, result) => {
+                    self.finish_operation(ctx, &path, request, operation, result);
+                }
+                Event::OperationReadback(path, request, result) => {
+                    self.finish_operation_readback(ctx, &path, request, result);
                 }
                 Event::External(result) => match result {
                     Ok(dir) => {
@@ -1708,5 +2147,96 @@ mod tests {
         repository.status_busy = false;
         repository.refresh_on_focus = false;
         assert_eq!(repository.focus_refresh_delay(deadline), None);
+    }
+
+    #[test]
+    fn newer_operations_keep_unfinished_calibration_scoped_to_their_worktree() {
+        let mut first = Repository::default();
+        let mut second = Repository::default();
+        let scope = first.operation.begin(1, RefreshScope::BOTH);
+        first.invalidate_operation_reads(1, scope);
+        first.operation.finish(
+            RefreshScope::BOTH,
+            Some(TargetedRead::Head(git::HeadUpdate::SwitchBranch)),
+        );
+        assert!(matches!(first.operation.after_frame, Followup::Read(_)));
+
+        let second_scope = second.operation.begin(2, RefreshScope::HISTORY);
+        second.invalidate_operation_reads(2, second_scope);
+        second.operation.finish(RefreshScope::HISTORY, None);
+        let new_scope = first.operation.begin(3, RefreshScope::STATUS);
+        first.invalidate_operation_reads(3, new_scope);
+        assert!(!first.operation.owns(1));
+        assert!(!second.operation.owns(3));
+        assert_eq!((first.history_request, first.status_request), (3, 3));
+        assert_eq!((second.history_request, second.status_request), (2, 0));
+
+        first.operation.finish(RefreshScope::default(), None);
+        assert_eq!(first.operation.pending, RefreshScope::BOTH);
+        assert!(matches!(first.operation.after_frame, Followup::Refresh));
+        assert_eq!(second.operation.pending, RefreshScope::HISTORY);
+    }
+
+    #[test]
+    fn confirmed_head_updates_the_loaded_row_and_leaves_new_topology_to_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let git = |args: &[&str]| -> Result<()> {
+            let output = git::fixture_command(root).args(args).output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        git(&["init", "--initial-branch=main"])?;
+        git(&["config", "user.name", "Refdesk Test"])?;
+        git(&["config", "user.email", "test@example.invalid"])?;
+        git(&["commit", "--allow-empty", "-m", "base"])?;
+        git(&["branch", "previous"])?;
+        git(&["commit", "--allow-empty", "-m", "main"])?;
+        let cache = HistoryCache::open(root, &HistoryScope::All, true)?;
+        let summary = cache.load_through(1, &AtomicBool::new(false))?;
+        let pages = cache.window(0..1, summary, Default::default())?;
+        let mut repo = Repository {
+            history: Some(HistoryView {
+                cache,
+                summary,
+                pages,
+                generation: 1,
+            }),
+            ..Repository::default()
+        };
+        assert_eq!(repo.head_row(), Some(0));
+        Operation::Switch("previous".into()).execute(root)?;
+        let change = TargetedRead::Head(git::HeadUpdate::SwitchBranch).read(root)?;
+        let Some(ConfirmedChange::Head {
+            head,
+            switch_branch,
+        }) = change
+        else {
+            panic!("expected current HEAD");
+        };
+        let previous = head.id.clone();
+        repo.update_head(head, switch_branch);
+        assert_eq!(repo.history_info().unwrap().branch, "previous");
+        assert_eq!(repo.head_row(), Some(1));
+        assert_eq!(repo.history.as_ref().unwrap().cache.info.branch, "main");
+
+        git(&["commit", "--allow-empty", "-m", "new history"])?;
+        let change = TargetedRead::Head(git::HeadUpdate::LocateCommit).read(root)?;
+        let Some(ConfirmedChange::Head {
+            head,
+            switch_branch,
+        }) = change
+        else {
+            panic!("expected new HEAD");
+        };
+        assert_eq!(head.parents.as_slice(), std::slice::from_ref(&previous));
+        repo.update_head(head, switch_branch);
+        assert_eq!(repo.history_info().unwrap().head.as_ref(), Some(&previous));
+        assert_eq!(repo.history.as_ref().unwrap().summary.loaded, 2);
+        Ok(())
     }
 }

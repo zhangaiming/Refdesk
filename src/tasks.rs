@@ -10,6 +10,7 @@ pub enum ReadKind {
     History,
     HistorySearch,
     Status,
+    OperationReadback,
     Details,
     Diff,
 }
@@ -20,6 +21,7 @@ impl ReadKind {
             Self::History => "history",
             Self::HistorySearch => "history_search",
             Self::Status => "status",
+            Self::OperationReadback => "operation_readback",
             Self::Details => "details",
             Self::Diff => "diff",
         }

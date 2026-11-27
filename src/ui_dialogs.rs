@@ -155,6 +155,9 @@ impl Desk {
         if let Some(mut dialog) = self.dialog.take() {
             let title = match &dialog {
                 Dialog::NewBranch(_) => "新建分支",
+                Dialog::NewCommitReference { tag: true, .. } => "创建标签",
+                Dialog::NewCommitReference { .. } => "创建分支",
+                Dialog::CherryPickMerge { .. } => "摘取提交",
                 Dialog::Operation { title, .. } => *title,
                 Dialog::Forget(_) => "移除仓库入口",
             };
@@ -192,6 +195,83 @@ impl Desk {
                                 },
                             )
                         }
+                        Dialog::NewCommitReference {
+                            root,
+                            commit,
+                            name,
+                            tag,
+                        } => {
+                            ui.label(format!("起点提交  {}", commit.short))
+                                .on_hover_text(&commit.id);
+                            let label =
+                                ui.label(if *tag { "标签名称" } else { "分支名称" });
+                            let input = ui
+                                .add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY))
+                                .labelled_by(label.id);
+                            if opening {
+                                input.request_focus();
+                            }
+                            confirmation_buttons(
+                                ui,
+                                title,
+                                !name.trim().is_empty() && !self.operations.contains(root),
+                                false,
+                                false,
+                                || {
+                                    let name = name.trim().to_owned();
+                                    let commit = commit.id.clone();
+                                    let operation = if *tag {
+                                        Operation::TagAt { name, commit }
+                                    } else {
+                                        Operation::BranchAt { name, commit }
+                                    };
+                                    self.operate(ctx, root.clone(), operation);
+                                },
+                            )
+                        }
+                        Dialog::CherryPickMerge {
+                            root,
+                            commit,
+                            mainline,
+                        } => {
+                            ui.label(format!(
+                                "将合并提交 {} 的改动摘取到当前 HEAD？",
+                                commit.short
+                            ))
+                            .on_hover_text(&commit.id);
+                            ui.label("选择用于计算改动的主线父提交");
+                            for (index, parent) in commit.parents.iter().enumerate() {
+                                let short = parent.get(..12).unwrap_or(parent);
+                                ui.radio_value(
+                                    mainline,
+                                    Some(index + 1),
+                                    format!("父提交 {}  {short}", index + 1),
+                                )
+                                .on_hover_text(parent);
+                            }
+                            ui.label(
+                                RichText::new(root.display().to_string())
+                                    .small()
+                                    .color(colors.muted),
+                            );
+                            confirmation_buttons(
+                                ui,
+                                title,
+                                mainline.is_some() && !self.operations.contains(root),
+                                false,
+                                opening,
+                                || {
+                                    self.operate(
+                                        ctx,
+                                        root.clone(),
+                                        Operation::CherryPick {
+                                            commit: commit.id.clone(),
+                                            mainline: *mainline,
+                                        },
+                                    );
+                                },
+                            )
+                        }
                         Dialog::Operation {
                             root,
                             operation,
@@ -207,8 +287,8 @@ impl Desk {
                             confirmation_buttons(
                                 ui,
                                 title,
-                                true,
-                                matches!(operation, Operation::Push),
+                                !self.operations.contains(root),
+                                matches!(operation, Operation::Push | Operation::DiscardUnstaged),
                                 opening,
                                 || {
                                     self.operate(ctx, root.clone(), operation.clone());

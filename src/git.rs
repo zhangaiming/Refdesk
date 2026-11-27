@@ -165,7 +165,7 @@ pub enum Area {
     Commit,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub path: String,
     pub old_path: Option<String>,
@@ -199,6 +199,94 @@ impl Change {
 pub struct Status {
     pub head: Option<String>,
     pub files: Vec<Change>,
+}
+
+impl Status {
+    pub(crate) fn index_paths_to_confirm(&self, operation: &Operation) -> BTreeSet<String> {
+        let mut seen = BTreeSet::new();
+        let mut confirm = BTreeSet::new();
+        for file in self
+            .files
+            .iter()
+            .filter(|file| operation.affects_index_path(&file.path))
+        {
+            if !seen.insert(&file.path) || matches!(file.code, 'R' | 'C' | 'U') || file.is_gitlink()
+            {
+                confirm.insert(file.path.clone());
+                confirm.extend(file.old_path.iter().cloned());
+            }
+        }
+        confirm
+    }
+
+    pub(crate) fn apply_index_operation(
+        &mut self,
+        operation: &Operation,
+        source: Area,
+        paths_to_confirm: &BTreeSet<String>,
+    ) {
+        for file in self.files.iter_mut().filter(|file| {
+            file.area == source
+                && operation.affects_index_path(&file.path)
+                && !matches_status_paths(file, paths_to_confirm)
+        }) {
+            if source == Area::Unstaged {
+                file.area = Area::Staged;
+                if file.code == '?' {
+                    file.code = 'A';
+                }
+            } else {
+                file.area = Area::Unstaged;
+                if file.code == 'A' {
+                    file.code = '?';
+                }
+            }
+        }
+        self.sort_files();
+    }
+
+    pub(crate) fn replace_index_paths(&mut self, paths: &BTreeSet<String>, confirmed: Status) {
+        self.files.retain(|file| !matches_status_paths(file, paths));
+        self.files.extend(confirmed.files);
+        self.sort_files();
+    }
+
+    pub(crate) fn remove_restored_files(
+        &mut self,
+        mut paths: BTreeSet<String>,
+        confirmed: &Status,
+    ) {
+        for file in confirmed
+            .files
+            .iter()
+            .filter(|file| file.area == Area::Unstaged)
+        {
+            paths.remove(&file.path);
+            if let Some(old_path) = &file.old_path {
+                paths.remove(old_path);
+            }
+        }
+        self.files
+            .retain(|file| !discardable(file) || !paths.contains(&file.path));
+    }
+
+    fn sort_files(&mut self) {
+        self.files.sort_by(|first, second| {
+            (first.code == '?', &first.path).cmp(&(second.code == '?', &second.path))
+        });
+    }
+}
+
+fn matches_status_paths(file: &Change, paths: &BTreeSet<String>) -> bool {
+    paths.contains(&file.path)
+        || file
+            .old_path
+            .as_ref()
+            .is_some_and(|name| paths.contains(name))
+}
+
+fn discardable(file: &Change) -> bool {
+    file.area == Area::Unstaged && !matches!(file.code, '?' | 'U') && !file.is_gitlink()
 }
 
 #[derive(Debug)]
@@ -699,16 +787,22 @@ fn history(root: &Path, scope: &HistoryScope, limit: usize) -> Result<HistorySam
 }
 
 pub fn status(root: &Path) -> Result<Status> {
-    let bytes = run(
-        root,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-        ],
-    )?;
+    status_for_paths(root, &BTreeSet::new())
+}
+
+pub(crate) fn status_for_paths(root: &Path, paths: &BTreeSet<String>) -> Result<Status> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        "--untracked-files=all",
+    ];
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend(paths.iter().map(String::as_str));
+    }
+    let bytes = run(root, &args)?;
     let mut fields = bytes.split(|&byte| byte == 0);
     let mut head = None;
     let mut files = Vec::new();
@@ -801,6 +895,11 @@ fn raw_changes(bytes: &[u8]) -> Result<Vec<Change>> {
     Ok(files)
 }
 
+pub fn commit_message(root: &Path, id: &str) -> Result<String> {
+    ensure!(oid(id), "无效的提交标识");
+    Ok(trim(&run(root, &["show", "-s", "--format=%B", id, "--"])?))
+}
+
 pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<Details> {
     ensure!(oid(&item.id), "无效的提交标识");
     let from_id = previous.map(|commit| &commit.id).or(item.parents.first());
@@ -853,7 +952,7 @@ pub fn details(root: &Path, item: &Commit, previous: Option<&Commit>) -> Result<
     } else {
         from.clone()
     };
-    let message = trim(&run(root, &["show", "-s", "--format=%B", &item.id, "--"])?);
+    let message = commit_message(root, &item.id)?;
     let title = if let Some(previous) = previous {
         format!("{} → {}", previous.short, item.short)
     } else {
@@ -1214,22 +1313,303 @@ pub fn base_snapshot(root: &Path, pair: &Compare) -> Result<Vec<u8>> {
 pub enum Operation {
     Stage(Vec<String>),
     Unstage(Vec<String>),
+    StageAll,
+    DiscardUnstaged,
     Commit(String),
     Switch(String),
     Branch(String),
+    CheckoutCommit(String),
+    MergeCommit(String),
+    CherryPick {
+        commit: String,
+        mainline: Option<usize>,
+    },
+    BranchAt {
+        name: String,
+        commit: String,
+    },
+    TagAt {
+        name: String,
+        commit: String,
+    },
     Fetch,
     Pull,
     Push,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RefreshScope {
+    pub history: bool,
+    pub status: bool,
+}
+
+impl RefreshScope {
+    pub const STATUS: Self = Self {
+        history: false,
+        status: true,
+    };
+    pub const HISTORY: Self = Self {
+        history: true,
+        status: false,
+    };
+    pub const BOTH: Self = Self {
+        history: true,
+        status: true,
+    };
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            history: self.history || other.history,
+            status: self.status || other.status,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        !self.history && !self.status
+    }
+}
+
+pub(crate) struct AfterSuccess {
+    pub immediate: ImmediateChange,
+    pub readback: Option<TargetedRead>,
+    pub refresh: RefreshScope,
+}
+
+pub(crate) enum ImmediateChange {
+    None,
+    Index {
+        source: Area,
+        unconfirmed: BTreeSet<String>,
+    },
+    Reference(Reference),
+}
+
+pub(crate) enum HeadUpdate {
+    LocateCommit,
+    SwitchBranch,
+    IfMoved(Option<String>),
+}
+
+pub(crate) enum TargetedRead {
+    Index {
+        source: Area,
+        paths: BTreeSet<String>,
+    },
+    Discard(BTreeSet<String>),
+    Head(HeadUpdate),
+}
+
+pub(crate) enum ConfirmedChange {
+    Index {
+        source: Area,
+        paths: BTreeSet<String>,
+        status: Status,
+    },
+    Discard {
+        paths: BTreeSet<String>,
+        status: Status,
+    },
+    Head {
+        head: CurrentHead,
+        switch_branch: bool,
+    },
+}
+
+pub(crate) struct CurrentHead {
+    pub id: String,
+    pub parents: Vec<String>,
+    pub reference: Option<String>,
+}
+
+impl CurrentHead {
+    pub fn branch(&self) -> &str {
+        self.reference.as_deref().map_or("Detached HEAD", short_ref)
+    }
+}
+
+impl TargetedRead {
+    pub fn prepare(&mut self, root: &Path) {
+        if let Self::Head(HeadUpdate::IfMoved(before)) = self {
+            *before = run(root, &["rev-parse", "--verify", "HEAD"])
+                .ok()
+                .map(|bytes| trim(&bytes))
+                .filter(|id| oid(id));
+        }
+    }
+
+    pub fn read(self, root: &Path) -> Result<Option<ConfirmedChange>> {
+        let change = match self {
+            Self::Index { source, paths } => {
+                let status = status_for_paths(root, &paths)?;
+                ConfirmedChange::Index {
+                    source,
+                    paths,
+                    status,
+                }
+            }
+            Self::Discard(paths) => {
+                let status = status_for_paths(root, &paths)?;
+                ConfirmedChange::Discard { paths, status }
+            }
+            Self::Head(mode) => {
+                let head = current_head(root)?;
+                if let HeadUpdate::IfMoved(before) = &mode
+                    && before.as_ref().is_none_or(|id| id == &head.id)
+                {
+                    return Ok(None);
+                }
+                ConfirmedChange::Head {
+                    head,
+                    switch_branch: matches!(mode, HeadUpdate::SwitchBranch),
+                }
+            }
+        };
+        Ok(Some(change))
+    }
+}
+
+fn current_head(root: &Path) -> Result<CurrentHead> {
+    let reference = output(root, &["symbolic-ref", "--quiet", "HEAD"], true)?;
+    let reference = if reference.status.code() == Some(1) {
+        None
+    } else {
+        Some(trim(&checked(reference)?))
+    };
+    let revision = trim(&run(root, &["show", "-s", "--format=%H %P", "HEAD", "--"])?);
+    let mut ids = revision.split_ascii_whitespace();
+    let id = ids
+        .next()
+        .filter(|id| oid(id))
+        .context("无法识别当前 HEAD")?;
+    let parents = ids.map(str::to_owned).collect::<Vec<_>>();
+    ensure!(
+        parents.iter().all(|parent| oid(parent)),
+        "无法识别 HEAD 的父提交"
+    );
+    Ok(CurrentHead {
+        id: id.to_owned(),
+        parents,
+        reference,
+    })
+}
+
 impl Operation {
+    pub(crate) fn after_success(&self, cached_status: Option<&Status>) -> AfterSuccess {
+        const MAX_TARGETED_PATHS: usize = 32;
+        if let Some(source) = self.index_source() {
+            let unconfirmed = cached_status
+                .map(|status| status.index_paths_to_confirm(self))
+                .unwrap_or_default();
+            let readback = (!unconfirmed.is_empty() && unconfirmed.len() <= MAX_TARGETED_PATHS)
+                .then(|| TargetedRead::Index {
+                    source,
+                    paths: unconfirmed.clone(),
+                });
+            return AfterSuccess {
+                immediate: ImmediateChange::Index {
+                    source,
+                    unconfirmed,
+                },
+                readback,
+                refresh: RefreshScope::STATUS,
+            };
+        }
+        let (immediate, readback, refresh) = match self {
+            Self::DiscardUnstaged => {
+                let paths = cached_status
+                    .into_iter()
+                    .flat_map(|status| &status.files)
+                    .filter(|file| discardable(file))
+                    .take(MAX_TARGETED_PATHS + 1)
+                    .map(|file| file.path.clone())
+                    .collect::<BTreeSet<_>>();
+                let readback = (!paths.is_empty() && paths.len() <= MAX_TARGETED_PATHS)
+                    .then_some(TargetedRead::Discard(paths));
+                (ImmediateChange::None, readback, RefreshScope::STATUS)
+            }
+            Self::BranchAt { name, commit } | Self::TagAt { name, commit } => {
+                let namespace = if matches!(self, Self::TagAt { .. }) {
+                    "tags"
+                } else {
+                    "heads"
+                };
+                let reference = Reference {
+                    name: format!("refs/{namespace}/{name}"),
+                    target: commit.clone(),
+                    upstream: None,
+                    symbolic: false,
+                };
+                (
+                    ImmediateChange::Reference(reference),
+                    None,
+                    RefreshScope::HISTORY,
+                )
+            }
+            Self::Fetch | Self::Push => (ImmediateChange::None, None, RefreshScope::HISTORY),
+            Self::Commit(_) | Self::CherryPick { .. } => (
+                ImmediateChange::None,
+                Some(TargetedRead::Head(HeadUpdate::LocateCommit)),
+                RefreshScope::BOTH,
+            ),
+            Self::Switch(_) | Self::Branch(_) | Self::CheckoutCommit(_) => (
+                ImmediateChange::None,
+                Some(TargetedRead::Head(HeadUpdate::SwitchBranch)),
+                RefreshScope::BOTH,
+            ),
+            Self::MergeCommit(_) | Self::Pull => (
+                ImmediateChange::None,
+                Some(TargetedRead::Head(HeadUpdate::IfMoved(None))),
+                RefreshScope::BOTH,
+            ),
+            Self::Stage(_) | Self::Unstage(_) | Self::StageAll => unreachable!("index plan"),
+        };
+        AfterSuccess {
+            immediate,
+            readback,
+            refresh,
+        }
+    }
+
+    pub(crate) fn refresh_after_failure(&self) -> RefreshScope {
+        if matches!(
+            self,
+            Self::Commit(_) | Self::MergeCommit(_) | Self::CherryPick { .. } | Self::Pull
+        ) {
+            RefreshScope::STATUS
+        } else {
+            RefreshScope::default()
+        }
+    }
+
+    pub(crate) fn index_source(&self) -> Option<Area> {
+        match self {
+            Self::Stage(_) | Self::StageAll => Some(Area::Unstaged),
+            Self::Unstage(_) => Some(Area::Staged),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn affects_index_path(&self, path: &str) -> bool {
+        match self {
+            Self::Stage(paths) | Self::Unstage(paths) => paths.iter().any(|entry| entry == path),
+            Self::StageAll => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Stage(_) => "stage",
             Self::Unstage(_) => "unstage",
+            Self::StageAll => "stage_all",
+            Self::DiscardUnstaged => "discard_unstaged",
             Self::Commit(_) => "commit",
             Self::Switch(_) => "switch",
-            Self::Branch(_) => "branch_create",
+            Self::Branch(_) | Self::BranchAt { .. } => "branch_create",
+            Self::CheckoutCommit(_) => "checkout_commit",
+            Self::MergeCommit(_) => "merge_commit",
+            Self::CherryPick { .. } => "cherry_pick",
+            Self::TagAt { .. } => "tag_create",
             Self::Fetch => "fetch",
             Self::Pull => "pull",
             Self::Push => "push",
@@ -1242,6 +1622,7 @@ impl Operation {
             "Git 操作需要工作树根目录"
         );
         let root = worktree;
+        let parent_number;
         let args = match self {
             Self::Stage(paths) | Self::Unstage(paths) => {
                 ensure!(!paths.is_empty(), "没有选中的文件");
@@ -1261,6 +1642,17 @@ impl Operation {
                 args.extend(paths.iter().map(String::as_str));
                 args
             }
+            Self::StageAll => vec!["add", "--all", "--", "."],
+            Self::DiscardUnstaged => {
+                validate_worktree_restore(root)?;
+                vec![
+                    "restore",
+                    "--worktree",
+                    "--no-recurse-submodules",
+                    "--",
+                    ".",
+                ]
+            }
             Self::Commit(message) => {
                 ensure!(!message.trim().is_empty(), "请输入提交说明");
                 vec!["commit", "-m", message]
@@ -1273,6 +1665,33 @@ impl Operation {
                 validate_branch(root, branch)?;
                 vec!["switch", "-c", branch]
             }
+            Self::CheckoutCommit(commit) => {
+                ensure!(oid(commit), "无效的提交标识");
+                vec!["switch", "--detach", "--", commit]
+            }
+            Self::MergeCommit(commit) => {
+                ensure!(oid(commit), "无效的提交标识");
+                vec!["merge", "--no-edit", "--", commit]
+            }
+            Self::CherryPick { commit, mainline } => {
+                ensure!(oid(commit), "无效的提交标识");
+                if let Some(parent) = mainline {
+                    parent_number = parent.to_string();
+                    vec!["cherry-pick", "--mainline", &parent_number, "--", commit]
+                } else {
+                    vec!["cherry-pick", "--", commit]
+                }
+            }
+            Self::BranchAt { name, commit } => {
+                ensure!(oid(commit), "无效的提交标识");
+                validate_branch(root, name)?;
+                vec!["branch", "--", name, commit]
+            }
+            Self::TagAt { name, commit } => {
+                ensure!(oid(commit), "无效的提交标识");
+                run(root, &["check-ref-format", &format!("refs/tags/{name}")])?;
+                vec!["tag", "--no-sign", "--", name, commit]
+            }
             Self::Fetch => vec!["fetch", "--all"],
             Self::Pull => vec!["pull", "--ff-only"],
             Self::Push => vec!["push"],
@@ -1282,6 +1701,40 @@ impl Operation {
         let stdout = trim(&checked(out)?);
         Ok(if stdout.is_empty() { stderr } else { stdout })
     }
+}
+
+fn validate_worktree_restore(root: &Path) -> Result<()> {
+    let changes = status(root)?.files;
+    ensure!(
+        changes.iter().all(|file| file.code != 'U'),
+        "请先解决工作树中的冲突"
+    );
+    for file in changes.iter().filter(|file| {
+        file.area == Area::Unstaged && matches!(file.code, 'D' | 'T') && !file.is_gitlink()
+    }) {
+        let path = safe_relative(&file.path)?;
+        let mut current = root.to_path_buf();
+        let mut parts = path.components().peekable();
+        while let Some(part) = parts.next() {
+            current.push(part);
+            let kind = match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata.file_type(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error).context("无法检查待恢复路径"),
+            };
+            let matches_path = if parts.peek().is_some() {
+                kind.is_dir()
+            } else {
+                !kind.is_dir()
+            };
+            ensure!(
+                matches_path,
+                "恢复 {} 可能覆盖工作树中的其他文件",
+                file.path
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_branch(root: &Path, branch: &str) -> Result<()> {
@@ -1307,6 +1760,372 @@ pub fn git_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_plans_cover_each_write_and_limit_expensive_readbacks() {
+        let commit = "a".repeat(40);
+        let cases = [
+            (Operation::Stage(vec!["file".into()]), RefreshScope::STATUS),
+            (
+                Operation::Unstage(vec!["file".into()]),
+                RefreshScope::STATUS,
+            ),
+            (Operation::StageAll, RefreshScope::STATUS),
+            (Operation::DiscardUnstaged, RefreshScope::STATUS),
+            (Operation::Commit("message".into()), RefreshScope::BOTH),
+            (Operation::Switch("topic".into()), RefreshScope::BOTH),
+            (Operation::Branch("topic".into()), RefreshScope::BOTH),
+            (
+                Operation::CheckoutCommit(commit.clone()),
+                RefreshScope::BOTH,
+            ),
+            (Operation::MergeCommit(commit.clone()), RefreshScope::BOTH),
+            (
+                Operation::CherryPick {
+                    commit: commit.clone(),
+                    mainline: None,
+                },
+                RefreshScope::BOTH,
+            ),
+            (
+                Operation::BranchAt {
+                    name: "topic".into(),
+                    commit: commit.clone(),
+                },
+                RefreshScope::HISTORY,
+            ),
+            (
+                Operation::TagAt {
+                    name: "v1".into(),
+                    commit: commit.clone(),
+                },
+                RefreshScope::HISTORY,
+            ),
+            (Operation::Fetch, RefreshScope::HISTORY),
+            (Operation::Pull, RefreshScope::BOTH),
+            (Operation::Push, RefreshScope::HISTORY),
+        ];
+        for (operation, refresh) in cases {
+            let plan = operation.after_success(None);
+            assert_eq!(plan.refresh, refresh, "{operation:?}");
+            assert_eq!(
+                matches!(plan.readback, Some(TargetedRead::Head(_))),
+                refresh == RefreshScope::BOTH
+            );
+            if matches!(
+                operation,
+                Operation::BranchAt { .. } | Operation::TagAt { .. }
+            ) {
+                assert!(
+                    matches!(plan.immediate, ImmediateChange::Reference(reference) if reference.target == commit)
+                );
+            }
+        }
+        let mut cached = Status {
+            head: Some(commit),
+            files: (0..40)
+                .map(|index| Change {
+                    path: format!("file-{index}"),
+                    old_path: None,
+                    code: 'M',
+                    area: Area::Unstaged,
+                    left_gitlink: false,
+                    right_gitlink: false,
+                })
+                .collect(),
+        };
+        assert!(
+            Operation::DiscardUnstaged
+                .after_success(Some(&cached))
+                .readback
+                .is_none()
+        );
+        cached.files.truncate(1);
+        assert!(matches!(
+            Operation::DiscardUnstaged.after_success(Some(&cached)).readback,
+            Some(TargetedRead::Discard(paths)) if paths == BTreeSet::from(["file-0".into()])
+        ));
+        assert!(
+            TargetedRead::Discard(BTreeSet::from(["file".into()]))
+                .read(Path::new("absent-worktree-for-test"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn index_preview_handles_rapid_reversal_and_leaves_complex_paths_for_confirmation() {
+        let row = |path: &str, area, code| Change {
+            path: path.into(),
+            old_path: None,
+            code,
+            area,
+            left_gitlink: false,
+            right_gitlink: false,
+        };
+        let mut rename = row("renamed.txt", Area::Staged, 'R');
+        rename.old_path = Some("before.txt".into());
+        let mut state = Status {
+            head: None,
+            files: vec![
+                row("edited.txt", Area::Unstaged, 'M'),
+                row("added.txt", Area::Staged, 'A'),
+                row("added.txt", Area::Unstaged, 'M'),
+                row("new.txt", Area::Unstaged, '?'),
+                rename.clone(),
+                row("renamed.txt", Area::Unstaged, 'M'),
+            ],
+        };
+        let stage = Operation::Stage(vec!["edited.txt".into()]);
+        state.apply_index_operation(&stage, Area::Unstaged, &BTreeSet::new());
+        assert!(state.files.contains(&row("edited.txt", Area::Staged, 'M')));
+        assert!(
+            !state
+                .files
+                .contains(&row("edited.txt", Area::Unstaged, 'M'))
+        );
+
+        let unstage = Operation::Unstage(vec!["edited.txt".into()]);
+        state.apply_index_operation(&unstage, Area::Staged, &BTreeSet::new());
+        assert!(
+            state
+                .files
+                .contains(&row("edited.txt", Area::Unstaged, 'M'))
+        );
+        assert!(!state.files.contains(&row("edited.txt", Area::Staged, 'M')));
+
+        let paths = state.index_paths_to_confirm(&Operation::StageAll);
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "added.txt".into(),
+                "before.txt".into(),
+                "renamed.txt".into()
+            ])
+        );
+        state.apply_index_operation(&Operation::StageAll, Area::Unstaged, &paths);
+        assert!(state.files.contains(&rename));
+        assert!(state.files.contains(&row("added.txt", Area::Unstaged, 'M')));
+        assert!(state.files.contains(&row("new.txt", Area::Staged, 'A')));
+
+        let unstage = Operation::Unstage(vec!["new.txt".into()]);
+        state.apply_index_operation(&unstage, Area::Staged, &BTreeSet::new());
+        assert!(state.files.contains(&row("new.txt", Area::Unstaged, '?')));
+    }
+
+    #[test]
+    fn index_preview_confirms_when_staging_cancels_a_partially_staged_change() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path();
+        log_fixture(root)?;
+        let name = "target with spaces.txt";
+        let file = root.join(name);
+        let stage = Operation::Stage(vec![name.into()]);
+        std::fs::write(&file, "baseline\n")?;
+        stage.execute(root)?;
+        Operation::Commit("baseline".into()).execute(root)?;
+        std::fs::write(&file, "staged change\n")?;
+        stage.execute(root)?;
+        std::fs::write(&file, "baseline\n")?;
+        std::fs::write(root.join("unrelated.txt"), "untracked\n")?;
+
+        let mut preview = status(root)?;
+        let paths = preview.index_paths_to_confirm(&stage);
+        assert_eq!(paths, BTreeSet::from([name.into()]));
+        stage.execute(root)?;
+        let confirmed = status_for_paths(root, &paths)?;
+        assert!(confirmed.files.is_empty());
+        preview.apply_index_operation(&stage, Area::Unstaged, &paths);
+        preview.replace_index_paths(&paths, confirmed);
+        assert_eq!(preview.files, status(root)?.files);
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].path, "unrelated.txt");
+        Ok(())
+    }
+
+    fn log_fixture(root: &Path) -> Result<()> {
+        let git = |args: &[&str]| checked(output(root, args, false)?);
+        git(&["init", "--initial-branch=main"])?;
+        git(&["config", "user.name", "Refdesk test"])?;
+        git(&["config", "user.email", "test@example.invalid"])?;
+        git(&["config", "core.autocrlf", "false"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn log_commit_actions_use_the_target_and_cherry_pick_selected_merge_parent() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path().join("提交 菜单");
+        std::fs::create_dir(&root)?;
+        log_fixture(&root)?;
+        let git = |args: &[&str]| checked(output(&root, args, false)?);
+        let rev = |reference: &str| -> Result<String> {
+            Ok(trim(&run(&root, &["rev-parse", reference])?))
+        };
+        git(&["commit", "--allow-empty", "-m", "base"])?;
+        let base = rev("HEAD")?;
+        git(&["switch", "-c", "topic"])?;
+        std::fs::write(root.join("topic.txt"), "topic\n")?;
+        Operation::StageAll.execute(&root)?;
+        Operation::Commit("topic summary\n\ntopic body".into()).execute(&root)?;
+        let topic = rev("HEAD")?;
+        assert_eq!(
+            commit_message(&root, &topic)?,
+            "topic summary\n\ntopic body"
+        );
+
+        Operation::Switch("main".into()).execute(&root)?;
+        std::fs::write(root.join("main.txt"), "main\n")?;
+        Operation::StageAll.execute(&root)?;
+        Operation::Commit("main change".into()).execute(&root)?;
+        let main = rev("HEAD")?;
+        Operation::BranchAt {
+            name: "from-log".into(),
+            commit: topic.clone(),
+        }
+        .execute(&root)?;
+        git(&["config", "tag.gpgSign", "true"])?;
+        Operation::TagAt {
+            name: "from-log-tag".into(),
+            commit: topic.clone(),
+        }
+        .execute(&root)?;
+        assert_eq!(rev("refs/heads/from-log")?, topic);
+        assert_eq!(rev("refs/tags/from-log-tag")?, topic);
+        assert_eq!(rev("HEAD")?, main);
+
+        Operation::CheckoutCommit(topic.clone()).execute(&root)?;
+        assert_eq!(rev("HEAD")?, topic);
+        assert!(run(&root, &["symbolic-ref", "--quiet", "HEAD"]).is_err());
+        assert!(current_head(&root)?.reference.is_none());
+        Operation::Switch("main".into()).execute(&root)?;
+        let merge_operation = Operation::MergeCommit(topic.clone());
+        let mut moved = TargetedRead::Head(HeadUpdate::IfMoved(None));
+        moved.prepare(&root);
+        merge_operation.execute(&root)?;
+        let merge = rev("HEAD")?;
+        assert_eq!(rev("HEAD^1")?, main);
+        assert_eq!(rev("HEAD^2")?, topic);
+        assert!(matches!(
+            moved.read(&root)?,
+            Some(ConfirmedChange::Head { head, .. }) if head.id == merge && head.parents == [main, topic.clone()]
+        ));
+        let mut unchanged = TargetedRead::Head(HeadUpdate::IfMoved(None));
+        unchanged.prepare(&root);
+        merge_operation.execute(&root)?;
+        assert!(unchanged.read(&root)?.is_none());
+
+        git(&["switch", "-c", "review-topic", &base])?;
+        git(&["commit", "--allow-empty", "-m", "review anchor"])?;
+        let review = rev("HEAD")?;
+        Operation::CherryPick {
+            commit: topic.clone(),
+            mainline: None,
+        }
+        .execute(&root)?;
+        assert_ne!(rev("HEAD")?, topic);
+        assert_eq!(rev("HEAD^")?, review);
+        assert_eq!(std::fs::read_to_string(root.join("topic.txt"))?, "topic\n");
+
+        git(&["switch", "-c", "review-merge", &base])?;
+        Operation::CherryPick {
+            commit: merge,
+            mainline: Some(2),
+        }
+        .execute(&root)?;
+        assert_eq!(std::fs::read_to_string(root.join("main.txt"))?, "main\n");
+        assert!(!root.join("topic.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn log_cherry_pick_retains_conflicts_for_git_recovery() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path();
+        log_fixture(root)?;
+        let git = |args: &[&str]| checked(output(root, args, false)?);
+        let path = root.join("tracked.txt");
+        for (content, message) in [("base", "base"), ("topic", "topic")] {
+            std::fs::write(&path, format!("{content}\n"))?;
+            Operation::StageAll.execute(root)?;
+            Operation::Commit(message.into()).execute(root)?;
+        }
+        let topic = trim(&run(root, &["rev-parse", "HEAD"])?);
+        git(&["switch", "-c", "review", "HEAD^"])?;
+        std::fs::write(&path, "review\n")?;
+        Operation::StageAll.execute(root)?;
+        Operation::Commit("review".into()).execute(root)?;
+        let review = trim(&run(root, &["rev-parse", "HEAD"])?);
+
+        let error = Operation::CherryPick {
+            commit: topic.clone(),
+            mainline: None,
+        }
+        .execute(root)
+        .unwrap_err();
+        assert_eq!(error_kind(&error).0, "git_exit");
+        let state = status(root)?;
+        assert_eq!(state.head.as_deref(), Some(review.as_str()));
+        assert!(state.files.iter().any(|file| file.code == 'U'));
+        assert_eq!(trim(&run(root, &["rev-parse", "CHERRY_PICK_HEAD"])?), topic);
+        let conflict = std::fs::read(&path)?;
+        assert!(Operation::DiscardUnstaged.execute(root).is_err());
+        assert_eq!(std::fs::read(&path)?, conflict);
+        git(&["cherry-pick", "--abort"])?;
+        assert_eq!(std::fs::read_to_string(&path)?, "review\n");
+        Ok(())
+    }
+
+    #[test]
+    fn log_worktree_discard_restores_the_index_and_preserves_new_files() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = sandbox.path();
+        log_fixture(root)?;
+        let tracked = root.join("tracked file.txt");
+        let new_file = root.join("新文件.txt");
+        std::fs::write(&tracked, "baseline\n")?;
+        Operation::StageAll.execute(root)?;
+        Operation::Commit("baseline".into()).execute(root)?;
+        std::fs::write(&tracked, "staged\n")?;
+        Operation::StageAll.execute(root)?;
+        std::fs::write(&tracked, "unstaged\n")?;
+        std::fs::write(&new_file, "untracked\n")?;
+
+        let mut cached = status(root)?;
+        let readback = Operation::DiscardUnstaged
+            .after_success(Some(&cached))
+            .readback
+            .unwrap();
+        Operation::DiscardUnstaged.execute(root)?;
+        let Some(ConfirmedChange::Discard {
+            paths,
+            status: confirmed,
+        }) = readback.read(root)?
+        else {
+            panic!("expected confirmed restore paths");
+        };
+        cached.remove_restored_files(paths, &confirmed);
+        assert_eq!(cached.files, status(root)?.files);
+        assert_eq!(std::fs::read_to_string(&tracked)?, "staged\n");
+        assert_eq!(std::fs::read_to_string(&new_file)?, "untracked\n");
+        assert_eq!(run(root, &["show", ":tracked file.txt"])?, b"staged\n");
+        assert_eq!(
+            run(root, &["show", "HEAD:tracked file.txt"])?,
+            b"baseline\n"
+        );
+        Operation::StageAll.execute(root)?;
+        let state = status(root)?;
+        assert_eq!(state.files.len(), 2);
+        assert!(state.files.iter().all(|file| file.area == Area::Staged));
+
+        std::fs::remove_file(&tracked)?;
+        std::fs::create_dir(&tracked)?;
+        let replacement = tracked.join("untracked.txt");
+        std::fs::write(&replacement, "keep me\n")?;
+        assert!(Operation::DiscardUnstaged.execute(root).is_err());
+        assert_eq!(std::fs::read_to_string(&replacement)?, "keep me\n");
+        Ok(())
+    }
+
     #[test]
     fn parses_nul_rename_paths_without_splitting_spaces() {
         let files = raw_changes(
@@ -1708,10 +2527,17 @@ mod tests {
         git(&receiver, &["config", "pull.rebase", "false"])?;
 
         git(&sender, &["commit", "--allow-empty", "-m", "remote update"])?;
-        git(&sender, &["push", "origin", "main"])?;
+        Operation::Push.execute(&sender)?;
+        Operation::Fetch.execute(&receiver)?;
+        let mut moved = TargetedRead::Head(HeadUpdate::IfMoved(None));
+        moved.prepare(&receiver);
         Operation::Pull.execute(&receiver)?;
         let head = |worktree: &Path| run(worktree, &["rev-parse", "HEAD"]);
         assert_eq!(head(&receiver)?, head(&sender)?);
+        assert!(matches!(
+            moved.read(&receiver)?,
+            Some(ConfirmedChange::Head { head, .. }) if head.branch() == "main"
+        ));
 
         git(
             &receiver,

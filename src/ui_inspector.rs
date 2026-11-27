@@ -16,6 +16,7 @@ const FILE_RIGHT_INSET: f32 = 7.0;
 const FILE_COLUMN_GAP: f32 = 8.0;
 const FILE_GROUP_VERTICAL_INSET: f32 = 3.0;
 const COPY_SHA_LABEL: &str = "复制 SHA";
+const COMMIT_MESSAGE_ID: &str = "worktree-commit-message";
 const COPY_TOAST_DURATION: f32 = 1.1;
 
 #[derive(Clone, Copy)]
@@ -186,6 +187,13 @@ fn file_directory(
 }
 
 impl Desk {
+    pub(crate) fn focus_worktree_commit(&mut self, ctx: &egui::Context) {
+        if !matches!(self.selection, Selection::Worktree) {
+            self.choose_worktree();
+        }
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(COMMIT_MESSAGE_ID)));
+    }
+
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         let toast_id = ui.id().with("copy-sha-toast");
@@ -244,6 +252,7 @@ impl Desk {
                         ui.add_enabled(
                             active.is_some(),
                             egui::TextEdit::multiline(&mut self.editor)
+                                .id(egui::Id::new(COMMIT_MESSAGE_ID))
                                 .hint_text(
                                     RichText::new("写下本次提交的说明…").color(colors.subtle),
                                 )

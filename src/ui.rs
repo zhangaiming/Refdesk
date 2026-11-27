@@ -692,6 +692,7 @@ impl eframe::App for Desk {
             .add(separators);
         self.dialogs(ctx);
         self.report_frame(ctx);
+        self.request_operation_followups(ctx);
         match next_theme {
             Some(AppearanceAction::Select(index)) => {
                 self.active_theme = index;
@@ -1020,8 +1021,8 @@ impl Desk {
                     let detail = if available {
                         self.repos
                             .get(path)
-                            .and_then(|repo| repo.history.as_ref())
-                            .map(|history| history.cache.info.branch.as_str())
+                            .and_then(|repo| repo.history_info())
+                            .map(|history| history.branch.as_str())
                             .unwrap_or(if active {
                                 "分支未读取"
                             } else if row.submodule.is_some() {

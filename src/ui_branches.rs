@@ -412,8 +412,8 @@ impl Desk {
         let colors = theme::palette(ctx);
         let count = self
             .state()
-            .and_then(|state| state.history.as_ref())
-            .map(|history| history.cache.info.refs.len());
+            .and_then(|state| state.history_info())
+            .map(|history| history.refs.len());
         let mut new = false;
         let mut action = None;
         ui.horizontal(|ui| {
@@ -440,9 +440,8 @@ impl Desk {
         );
 
         if let Some(state) = self.state()
-            && let Some(history) = &state.history
+            && let Some(history) = state.history_info()
         {
-            let history = &history.cache.info;
             let needle = self.branch_query.trim().to_lowercase();
             let selection = state.filter.checks();
             let groups = build_groups(&history.refs, &history.branch, &needle, &selection);
