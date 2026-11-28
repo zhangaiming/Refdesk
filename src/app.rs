@@ -44,6 +44,7 @@ enum Event {
     },
     Details(u64, u64, Selection, Outcome<Details>),
     CopyCommitMessage(PathBuf, u64, Outcome<String>),
+    TrackingOptions(PathBuf, u64, Outcome<Option<git::TrackingOptions>>),
     Operation(PathBuf, u64, Operation, Result<(String, AfterSuccess)>),
     OperationReadback(PathBuf, u64, Result<Option<ConfirmedChange>>),
     RebaseMessage(PathBuf, u64, git::RebaseMessageRequest),
@@ -309,6 +310,16 @@ struct HistorySearch {
     result: Option<Outcome<usize>>,
 }
 
+pub(crate) struct TrackingDialog {
+    pub root: PathBuf,
+    request: u64,
+    pub from_push: bool,
+    pub options: Option<Outcome<git::TrackingOptions>>,
+    pub selected_upstream: Option<usize>,
+    pub selected_remote: Option<usize>,
+    pub publish: bool,
+}
+
 pub(crate) enum Dialog {
     Operation {
         root: PathBuf,
@@ -316,6 +327,7 @@ pub(crate) enum Dialog {
         title: &'static str,
         question: String,
     },
+    Tracking(TrackingDialog),
     NewBranch(String),
     NewCommitReference {
         root: PathBuf,
@@ -724,6 +736,9 @@ impl Desk {
     fn activate_path(&mut self, ctx: &egui::Context, path: PathBuf) {
         if self.active.as_ref() == Some(&path) {
             return;
+        }
+        if matches!(self.dialog, Some(Dialog::Tracking(_))) {
+            self.dialog = None;
         }
         if let Some(previous) = self.active.clone() {
             self.deactivate_history(&previous);
@@ -1532,6 +1547,64 @@ impl Desk {
         });
     }
 
+    pub(crate) fn choose_tracking_branch(
+        &mut self,
+        ctx: &egui::Context,
+        root: PathBuf,
+        branch: Option<String>,
+    ) {
+        let request = self.next();
+        self.dialog = Some(Dialog::Tracking(TrackingDialog {
+            root: root.clone(),
+            request,
+            from_push: branch.is_none(),
+            options: None,
+            selected_upstream: None,
+            selected_remote: None,
+            publish: false,
+        }));
+        self.submit(ctx, Work::Read, move || {
+            let result = git::tracking_options(&root, branch.as_deref())
+                .map_err(|error| format!("{error:#}"));
+            Event::TrackingOptions(root, request, result)
+        });
+    }
+
+    fn finish_tracking_options(
+        &mut self,
+        path: PathBuf,
+        request: u64,
+        result: Outcome<Option<git::TrackingOptions>>,
+    ) {
+        let Some(Dialog::Tracking(dialog)) = &mut self.dialog else {
+            return;
+        };
+        if path != dialog.root || request != dialog.request || self.active.as_ref() != Some(&path) {
+            return;
+        }
+        match result {
+            Ok(None) => {
+                self.dialog = Some(Dialog::Operation {
+                    root: path,
+                    operation: Operation::Push,
+                    title: "推送",
+                    question: "使用当前仓库的 Git 推送配置发送提交。".into(),
+                });
+            }
+            Ok(Some(choices)) => {
+                dialog.selected_upstream = choices.upstream.as_ref().and_then(|current| {
+                    choices
+                        .remote_branches
+                        .iter()
+                        .position(|name| name == current)
+                });
+                dialog.selected_remote = (choices.remotes.len() == 1).then_some(0);
+                dialog.options = Some(Ok(choices));
+            }
+            Err(error) => dialog.options = Some(Err(error)),
+        }
+    }
+
     pub fn operate(&mut self, ctx: &egui::Context, root: PathBuf, operation: Operation) {
         let allowed = self.repos.get(&root).is_some_and(|state| match &operation {
             Operation::Recover { expected, action } => {
@@ -2155,6 +2228,9 @@ impl Desk {
                             Err(error) => self.tell(error, true),
                         }
                     }
+                }
+                Event::TrackingOptions(root, request, result) => {
+                    self.finish_tracking_options(root, request, result);
                 }
                 Event::RebaseMessage(path, request, edit) => {
                     let id = self.next();

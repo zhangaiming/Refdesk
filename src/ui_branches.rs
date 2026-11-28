@@ -89,6 +89,7 @@ fn build_groups<'a>(
 enum BranchAction {
     Filter(HistoryScope),
     Switch(String),
+    SetUpstream(String),
 }
 
 struct BranchView<'a> {
@@ -245,6 +246,14 @@ impl BranchView<'_> {
                             .clicked()
                     {
                         self.action = Some(BranchAction::Switch(label.to_owned()));
+                        ui.close_menu();
+                    }
+                    if local
+                        && ui
+                            .add_enabled(self.can_switch, egui::Button::new("设置跟踪分支…"))
+                            .clicked()
+                    {
+                        self.action = Some(BranchAction::SetUpstream(reference.name.clone()));
                         ui.close_menu();
                     }
                     if ui.button("复制分支或标签名").clicked() {
@@ -517,6 +526,11 @@ impl Desk {
                         operation: Operation::Switch(branch),
                         title: "切换分支",
                     });
+                }
+            }
+            Some(BranchAction::SetUpstream(branch)) => {
+                if let Some(root) = self.active.clone() {
+                    self.choose_tracking_branch(ctx, root, Some(branch));
                 }
             }
             None => {}

@@ -870,14 +870,7 @@ impl Desk {
                         question: "获取远程变更并仅允许快进更新当前分支。".into(),
                     })
                 }
-                Operation::Push => {
-                    self.dialog = Some(Dialog::Operation {
-                        root,
-                        operation,
-                        title,
-                        question: "使用当前仓库的 Git 推送配置发送提交。".into(),
-                    })
-                }
+                Operation::Push => self.choose_tracking_branch(ctx, root, None),
                 _ => {}
             }
         }

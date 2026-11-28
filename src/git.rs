@@ -166,6 +166,13 @@ pub struct History {
     pub refs: Vec<Reference>,
 }
 
+pub(crate) struct TrackingOptions {
+    pub branch: String,
+    pub upstream: Option<String>,
+    pub remote_branches: Vec<String>,
+    pub remotes: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Area {
     Staged,
@@ -604,6 +611,83 @@ pub fn submodules(root: &Path) -> Result<Vec<Submodule>> {
 
 fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn symbolic_head(root: &Path) -> Result<Option<String>> {
+    let result = output(root, &["symbolic-ref", "--quiet", "HEAD"], true)?;
+    if result.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Ok(Some(trim(&checked(result)?)))
+}
+
+fn branch_upstream(root: &Path, reference: &str) -> Result<Option<String>> {
+    let refs = run(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(upstream)",
+            "--",
+            reference,
+        ],
+    )?;
+    let refs = trim(&refs);
+    let upstream = refs
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .find_map(|(name, upstream)| (name == reference).then_some(upstream))
+        .with_context(|| format!("本地分支 {} 不存在或尚无提交", short_ref(reference)))?;
+    Ok((!upstream.is_empty()).then(|| upstream.to_owned()))
+}
+
+pub(crate) fn tracking_options(
+    root: &Path,
+    selected: Option<&str>,
+) -> Result<Option<TrackingOptions>> {
+    let reference = if let Some(reference) = selected {
+        reference.to_owned()
+    } else if let Some(reference) = symbolic_head(root)? {
+        reference
+    } else {
+        return Ok(None);
+    };
+    let branch = reference
+        .strip_prefix("refs/heads/")
+        .context("无法识别本地分支")?;
+    let upstream = branch_upstream(root, &reference)?;
+    if selected.is_none() && upstream.is_some() {
+        return Ok(None);
+    }
+
+    let refs = run(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%00%(symref)",
+            "refs/remotes",
+        ],
+    )?;
+    let remote_branches = trim(&refs)
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .filter(|(_, symref)| symref.is_empty())
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let remotes = if selected.is_none() {
+        trim(&run(root, &["remote"])?)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Some(TrackingOptions {
+        branch: branch.to_owned(),
+        upstream,
+        remote_branches,
+        remotes,
+    }))
 }
 
 pub fn history_snapshot(root: &Path, scope: &HistoryScope) -> Result<(History, HistoryStart)> {
@@ -1389,6 +1473,14 @@ pub enum Operation {
     Fetch,
     Pull,
     Push,
+    SetUpstream {
+        branch: String,
+        upstream: String,
+    },
+    PushNewUpstream {
+        branch: String,
+        remote: String,
+    },
     Recover {
         expected: Box<RecoveryState>,
         action: RecoveryAction,
@@ -1537,12 +1629,7 @@ impl TargetedRead {
 }
 
 fn current_head(root: &Path) -> Result<CurrentHead> {
-    let reference = output(root, &["symbolic-ref", "--quiet", "HEAD"], true)?;
-    let reference = if reference.status.code() == Some(1) {
-        None
-    } else {
-        Some(trim(&checked(reference)?))
-    };
+    let reference = symbolic_head(root)?;
     let revision = trim(&run(root, &["show", "-s", "--format=%H %P", "HEAD", "--"])?);
     let mut ids = revision.split_ascii_whitespace();
     let id = ids
@@ -1573,6 +1660,8 @@ impl Operation {
                 | Self::CherryPick { .. }
                 | Self::Pull
                 | Self::Push
+                | Self::SetUpstream { .. }
+                | Self::PushNewUpstream { .. }
         )
     }
 
@@ -1640,7 +1729,9 @@ impl Operation {
                     RefreshScope::HISTORY,
                 )
             }
-            Self::Fetch | Self::Push => (ImmediateChange::None, None, RefreshScope::HISTORY),
+            Self::Fetch | Self::Push | Self::SetUpstream { .. } | Self::PushNewUpstream { .. } => {
+                (ImmediateChange::None, None, RefreshScope::HISTORY)
+            }
             Self::Commit(_) | Self::CherryPick { .. } => (
                 ImmediateChange::None,
                 Some(TargetedRead::Head(HeadUpdate::LocateCommit)),
@@ -1706,7 +1797,8 @@ impl Operation {
             Self::TagAt { .. } => "tag_create",
             Self::Fetch => "fetch",
             Self::Pull => "pull",
-            Self::Push => "push",
+            Self::Push | Self::PushNewUpstream { .. } => "push",
+            Self::SetUpstream { .. } => "set_upstream",
             Self::Recover {
                 action: RecoveryAction::Continue,
                 ..
@@ -1744,6 +1836,8 @@ impl Operation {
             );
         }
         let parent_number;
+        let upstream_option;
+        let push_refspec;
         let mut stage_input = None;
         let args = match self {
             Self::Stage(paths) | Self::Unstage(paths) => {
@@ -1831,6 +1925,22 @@ impl Operation {
             Self::Fetch => vec!["fetch", "--all"],
             Self::Pull => vec!["pull", "--ff-only"],
             Self::Push => vec!["push"],
+            Self::SetUpstream { branch, upstream } => {
+                ensure!(upstream.starts_with("refs/remotes/"), "请选择远端分支");
+                upstream_option = format!("--set-upstream-to={upstream}");
+                vec!["branch", &upstream_option, "--", branch]
+            }
+            Self::PushNewUpstream { branch, remote } => {
+                let reference = format!("refs/heads/{branch}");
+                ensure!(
+                    symbolic_head(root)?.as_deref() == Some(reference.as_str())
+                        && branch_upstream(root, &reference)?.is_none(),
+                    "当前分支或跟踪关系已变化，请重新确认推送"
+                );
+                run(root, &["remote", "get-url", "--push", "--", remote])?;
+                push_refspec = format!("{reference}:{reference}");
+                vec!["push", "--set-upstream", "--", remote, &push_refspec]
+            }
             Self::Recover { expected, action } => {
                 return recovery::recover(root, expected, *action, editor);
             }
@@ -2002,6 +2112,20 @@ mod tests {
             (Operation::Fetch, RefreshScope::HISTORY),
             (Operation::Pull, RefreshScope::BOTH),
             (Operation::Push, RefreshScope::HISTORY),
+            (
+                Operation::SetUpstream {
+                    branch: "topic".into(),
+                    upstream: "refs/remotes/origin/topic".into(),
+                },
+                RefreshScope::HISTORY,
+            ),
+            (
+                Operation::PushNewUpstream {
+                    branch: "topic".into(),
+                    remote: "origin".into(),
+                },
+                RefreshScope::HISTORY,
+            ),
         ];
         for (operation, refresh) in cases {
             let plan = operation.after_success(None);
@@ -2806,6 +2930,117 @@ mod tests {
         assert_history(select(&["refs/heads/gone"]), &["base"])?;
         git(&["switch", "--detach", "review"])?;
         assert_history(HistoryScope::Head, &["base", "side"])?;
+        Ok(())
+    }
+
+    fn tracking_fixture(sandbox: &Path) -> Result<std::path::PathBuf> {
+        let root = sandbox.join("本地 workspace");
+        let git = |args: &[&str]| checked(output(&root, args, false)?);
+        std::fs::create_dir(&root)?;
+        checked(output(
+            sandbox,
+            &["init", "--bare", "--initial-branch=main", "bare remote.git"],
+            false,
+        )?)?;
+        git(&["init", "--initial-branch=main"])?;
+        git(&["config", "user.name", "Refdesk test"])?;
+        git(&["config", "user.email", "test@example.invalid"])?;
+        git(&["remote", "add", "origin", "../bare remote.git"])?;
+        git(&["commit", "--allow-empty", "-m", "base"])?;
+        git(&["push", "origin", "main"])?;
+        Ok(root)
+    }
+
+    #[test]
+    fn tracking_sets_and_changes_the_selected_local_branch() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = tracking_fixture(sandbox.path())?;
+        let git = |args: &[&str]| checked(output(&root, args, false)?);
+        let local = "refs/heads/feature/本地";
+        let main = "refs/remotes/origin/main";
+        let review = "refs/remotes/origin/review";
+        git(&["branch", "feature/本地"])?;
+        git(&["push", "origin", "main:refs/heads/review"])?;
+        git(&["symbolic-ref", "refs/remotes/origin/HEAD", main])?;
+        let options = tracking_options(&root, Some(local))?.unwrap();
+        assert_eq!(options.branch, "feature/本地");
+        assert_eq!(options.remote_branches, [main, review]);
+        assert_eq!(options.upstream, None);
+
+        let set = |upstream: &str| {
+            Operation::SetUpstream {
+                branch: options.branch.clone(),
+                upstream: upstream.into(),
+            }
+            .execute(&root)
+        };
+        set(main)?;
+        assert_eq!(branch_upstream(&root, local)?.as_deref(), Some(main));
+        set(review)?;
+        assert!(set("refs/remotes/origin/missing").is_err());
+        assert_eq!(branch_upstream(&root, local)?.as_deref(), Some(review));
+        assert_eq!(git(&["symbolic-ref", "HEAD"])?, b"refs/heads/main\n");
+        assert_eq!(branch_upstream(&root, "refs/heads/main")?, None);
+
+        git(&["update-ref", "-d", review])?;
+        git(&["switch", "feature/本地"])?;
+        assert!(tracking_options(&root, None)?.is_none());
+        git(&["switch", "main"])?;
+        git(&["remote", "remove", "origin"])?;
+        let options = tracking_options(&root, None)?.unwrap();
+        assert!(options.remote_branches.is_empty());
+        assert!(options.remotes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tracking_push_publishes_only_the_confirmed_branch_to_the_chosen_remote() -> Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let root = tracking_fixture(sandbox.path())?;
+        let git = |args: &[&str]| checked(output(&root, args, false)?);
+        let branch = "feature/新分支";
+        let reference = format!("refs/heads/{branch}");
+        git(&["branch", branch])?;
+        git(&["commit", "--allow-empty", "-m", "advance main"])?;
+        git(&["push", "origin", &format!("refs/heads/main:{reference}")])?;
+        let original = sandbox.path().join("bare remote.git");
+        let remote_head = |remote: &Path| run(remote, &["rev-parse", "--verify", &reference]);
+        let before = remote_head(&original)?;
+        let chosen = sandbox.path().join("chosen remote.git");
+        std::fs::create_dir(&chosen)?;
+        checked(output(&chosen, &["init", "--bare"], false)?)?;
+        git(&["remote", "add", "chosen", "../chosen remote.git"])?;
+        git(&["config", "push.autoSetupRemote", "true"])?;
+        let push = |remote: &str| {
+            Operation::PushNewUpstream {
+                branch: branch.into(),
+                remote: remote.into(),
+            }
+            .execute(&root)
+        };
+
+        assert!(push("chosen").is_err());
+        assert!(remote_head(&chosen).is_err());
+        git(&["switch", branch])?;
+        let options = tracking_options(&root, None)?.unwrap();
+        assert_eq!(options.branch, branch);
+        assert_eq!(options.remotes, ["chosen", "origin"]);
+        assert!(push("../chosen remote.git").is_err());
+        assert!(remote_head(&chosen).is_err());
+        assert!(push("origin").is_err());
+        assert_eq!(branch_upstream(&root, &reference)?, None);
+        assert_eq!(remote_head(&original)?, before);
+
+        push("chosen")?;
+        let upstream = format!("refs/remotes/chosen/{branch}");
+        assert_eq!(
+            branch_upstream(&root, &reference)?.as_deref(),
+            Some(upstream.as_str())
+        );
+        assert_eq!(remote_head(&chosen)?, git(&["rev-parse", "HEAD"])?);
+        assert_eq!(remote_head(&original)?, before);
+        assert!(tracking_options(&root, None)?.is_none());
+        assert!(push("origin").is_err());
         Ok(())
     }
 

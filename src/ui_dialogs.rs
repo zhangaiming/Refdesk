@@ -1,9 +1,10 @@
-use crate::app::{Desk, Dialog};
+use crate::app::{Desk, Dialog, TrackingDialog};
 use crate::git::Operation;
 use crate::settings::{self, Tool, ToolMode};
 use crate::theme;
 use crate::ui::{
-    TITLE_HEIGHT, WINDOW_BUTTON_WIDTH, compact_button, paint, small_button, window_close_button,
+    Checkbox, TITLE_HEIGHT, WINDOW_BUTTON_WIDTH, compact_button, paint, small_button,
+    window_close_button,
 };
 use eframe::egui::{
     self, Align, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, Vec2,
@@ -149,6 +150,96 @@ fn confirmation_buttons(
     }
 }
 
+fn tracking_picker<'a>(
+    ui: &mut egui::Ui,
+    title: &str,
+    choices: &'a [String],
+    selection: &mut Option<usize>,
+    prefix: &str,
+) -> Option<&'a str> {
+    let label = ui.label(title);
+    let display = |name: &'a str| name.strip_prefix(prefix).unwrap_or(name);
+    egui::ComboBox::from_id_salt(title)
+        .width(ui.available_width())
+        .height(220.0)
+        .truncate()
+        .selected_text(selection.map_or("请选择", |index| display(&choices[index])))
+        .show_ui(ui, |ui| {
+            for (index, name) in choices.iter().enumerate() {
+                let name = display(name);
+                ui.selectable_value(selection, Some(index), name)
+                    .on_hover_text(name);
+            }
+        })
+        .response
+        .labelled_by(label.id);
+    selection.map(|index| choices[index].as_str())
+}
+
+fn tracking_controls(ui: &mut egui::Ui, dialog: &mut TrackingDialog) -> Option<Operation> {
+    let colors = theme::palette(ui.ctx());
+    let choices = match &dialog.options {
+        None => {
+            ui.label("正在读取跟踪分支和远端…");
+            return None;
+        }
+        Some(Err(error)) => {
+            ui.colored_label(colors.removed.foreground, error);
+            return None;
+        }
+        Some(Ok(choices)) => choices,
+    };
+    let branch = &choices.branch;
+    ui.label(if dialog.from_push {
+        format!("本地分支 {branch} 尚未设置跟踪分支。")
+    } else {
+        format!("本地分支 · {branch}")
+    });
+    if dialog.from_push {
+        ui.add_enabled(
+            !choices.remotes.is_empty(),
+            Checkbox::new(&mut dialog.publish, "本次推送并自动建立跟踪分支"),
+        );
+        if choices.remotes.is_empty() {
+            ui.label(RichText::new("此仓库尚未配置远端，请先添加远端。").color(colors.muted));
+            return None;
+        }
+    }
+    ui.add_space(6.0);
+    if dialog.publish {
+        let remote = tracking_picker(
+            ui,
+            "推送到远端",
+            &choices.remotes,
+            &mut dialog.selected_remote,
+            "",
+        )?;
+        ui.label(RichText::new(format!("目标分支 · {remote}/{branch}")).color(colors.muted));
+        return Some(Operation::PushNewUpstream {
+            branch: branch.clone(),
+            remote: remote.to_owned(),
+        });
+    }
+    if choices.remote_branches.is_empty() {
+        ui.label(RichText::new("暂无可选的远端分支。可通过「获取」同步。").color(colors.muted));
+        return None;
+    }
+    let upstream = tracking_picker(
+        ui,
+        "跟踪的远端分支",
+        &choices.remote_branches,
+        &mut dialog.selected_upstream,
+        "refs/remotes/",
+    );
+    if dialog.from_push {
+        ui.label(RichText::new("保存跟踪关系后，可再次点击「推送」。").color(colors.muted));
+    }
+    upstream.map(|upstream| Operation::SetUpstream {
+        branch: branch.clone(),
+        upstream: upstream.to_owned(),
+    })
+}
+
 impl Desk {
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
@@ -159,10 +250,20 @@ impl Desk {
                 Dialog::NewCommitReference { .. } => "创建分支",
                 Dialog::CherryPickMerge { .. } => "摘取提交",
                 Dialog::Operation { title, .. } => *title,
+                Dialog::Tracking(dialog) if dialog.from_push => "推送",
+                Dialog::Tracking(_) => "设置跟踪分支",
                 Dialog::Forget(_) => "移除仓库入口",
                 Dialog::AbortRebaseMessage { .. } => "中止变基",
             };
-            let modal = egui::Modal::new(egui::Id::new(title)).frame(dialog_frame(ctx));
+            let modal_id = if matches!(
+                &dialog,
+                Dialog::Tracking(TrackingDialog { options: None, .. })
+            ) {
+                egui::Id::new((title, "tracking_loading"))
+            } else {
+                egui::Id::new(title)
+            };
+            let modal = egui::Modal::new(modal_id).frame(dialog_frame(ctx));
             let opening = ctx.memory(|memory| memory.top_modal_layer() != Some(modal.area.layer()));
             let modal = modal.show(ctx, |ui| {
                 ui.set_width(420.0_f32.min(ctx.screen_rect().width()));
@@ -303,6 +404,33 @@ impl Desk {
                                 opening,
                                 || {
                                     self.operate(ctx, root.clone(), operation.clone());
+                                },
+                            )
+                        }
+                        Dialog::Tracking(dialog) => {
+                            let operation = tracking_controls(ui, dialog);
+                            let can_write = self.active.as_ref() == Some(&dialog.root)
+                                && !self.operations.contains(&dialog.root)
+                                && self
+                                    .state()
+                                    .is_some_and(|state| state.normal_writes_available());
+                            let action = if dialog.publish {
+                                "推送并设置跟踪"
+                            } else if dialog.from_push && !matches!(dialog.options, Some(Ok(_))) {
+                                "推送"
+                            } else {
+                                "保存跟踪分支"
+                            };
+                            confirmation_buttons(
+                                ui,
+                                action,
+                                can_write && operation.is_some(),
+                                dialog.publish,
+                                opening,
+                                || {
+                                    if let Some(operation) = operation {
+                                        self.operate(ctx, dialog.root.clone(), operation);
+                                    }
                                 },
                             )
                         }
