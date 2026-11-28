@@ -7,6 +7,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+mod recovery;
+pub(crate) use recovery::{
+    REBASE_EDITOR_ARGUMENT, RebaseMessageReply, RebaseMessageRequest, run_rebase_editor,
+};
+pub(crate) use recovery::{
+    RecoveryAction, RecoveryKind, RecoveryState, WorktreeGitDir, recovery_state, worktree_git_dir,
+};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryScope {
     #[default]
@@ -209,6 +217,10 @@ pub struct Status {
 }
 
 impl Status {
+    pub(crate) fn conflict_count(&self) -> usize {
+        self.files.iter().filter(|file| file.code == 'U').count()
+    }
+
     pub(crate) fn has_submodule_changes(&self) -> bool {
         self.files.iter().any(Change::affects_submodules)
     }
@@ -326,6 +338,8 @@ pub enum Version {
     Empty,
     Index,
     Worktree,
+    ConflictOurs,
+    ConflictWorktree,
     Head(String),
     Commit(String),
 }
@@ -335,7 +349,8 @@ impl Version {
         match self {
             Self::Empty => "∅",
             Self::Index => "暂存区",
-            Self::Worktree => "工作树",
+            Self::Worktree | Self::ConflictWorktree => "工作树",
+            Self::ConflictOurs => "索引第 2 阶段",
             Self::Head(_) => "HEAD",
             Self::Commit(id) => id.get(..8).unwrap_or(id),
         }
@@ -854,7 +869,7 @@ pub(crate) fn status_for_paths(root: &Path, paths: &BTreeSet<String>) -> Result<
                 old_path: None,
                 code: 'U',
                 area: Area::Unstaged,
-                left_gitlink: false,
+                left_gitlink: parts[4] == b"160000",
                 right_gitlink: parts[6] == b"160000",
             });
         } else if record.starts_with(b"1 ") || record.starts_with(b"2 ") {
@@ -1010,9 +1025,14 @@ pub fn compare(file: &Change, details: Option<&Details>, head: Option<&str>) -> 
             let from = head.map_or(Version::Empty, |id| Version::Head(id.to_owned()));
             (from.clone(), Version::Index, from)
         }
+        Area::Unstaged if file.code == 'U' => (
+            Version::ConflictOurs,
+            Version::ConflictWorktree,
+            Version::ConflictOurs,
+        ),
         Area::Unstaged => (Version::Index, Version::Worktree, Version::Index),
     };
-    if matches!(file.code, 'A' | '?' | 'U') {
+    if matches!(file.code, 'A' | '?') {
         left = Version::Empty;
     }
     if file.code == 'D' {
@@ -1057,10 +1077,13 @@ fn snapshot_with(
     let relative = safe_relative(path)?;
     match version {
         Version::Empty => Ok(Vec::new()),
-        Version::Worktree => {
+        Version::Worktree | Version::ConflictWorktree => {
             let file = root.join(relative);
             let metadata = match std::fs::symlink_metadata(&file) {
-                Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+                    if (missing_ok || matches!(version, Version::ConflictWorktree))
+                        && error.kind() == std::io::ErrorKind::NotFound =>
+                {
                     return Ok(Vec::new());
                 }
                 result => result?,
@@ -1084,16 +1107,17 @@ fn snapshot_with(
             ensure!(bytes.len() as u64 <= MAX_SNAPSHOT, SnapshotLimit);
             Ok(bytes)
         }
-        Version::Index | Version::Head(_) | Version::Commit(_) => {
+        Version::Index | Version::ConflictOurs | Version::Head(_) | Version::Commit(_) => {
             let spec = match version {
                 Version::Head(id) | Version::Commit(id) => {
                     ensure!(oid(id), "无效的提交标识");
                     format!("{id}:{path}")
                 }
+                Version::ConflictOurs => format!(":2:{path}"),
                 _ => format!(":{path}"),
             };
             let size = read(root, &["cat-file", "-s", &spec])?;
-            if missing_ok && !size.status.success() {
+            if (missing_ok || matches!(version, Version::ConflictOurs)) && !size.status.success() {
                 return Ok(Vec::new());
             }
             let size: u64 = trim(&checked(size)?).parse().context("无法读取文件大小")?;
@@ -1163,10 +1187,14 @@ fn diff_snapshot_with(
     let run = |root: &Path, args: &[&str]| checked(read(root, args)?);
     let relative = safe_relative(path)?;
     let id = match version {
-        Version::Index => trim(&run(
-            worktree,
-            &["rev-parse", "--verify", &format!(":{path}")],
-        )?),
+        Version::Index | Version::ConflictOurs => {
+            let key = if matches!(version, Version::ConflictOurs) {
+                format!(":2:{path}")
+            } else {
+                format!(":{path}")
+            };
+            trim(&run(worktree, &["rev-parse", "--verify", &key])?)
+        }
         Version::Head(id) | Version::Commit(id) => {
             ensure!(oid(id), "无效的提交标识");
             trim(&run(
@@ -1174,7 +1202,7 @@ fn diff_snapshot_with(
                 &["rev-parse", "--verify", &format!("{id}:{path}")],
             )?)
         }
-        Version::Worktree => {
+        Version::Worktree | Version::ConflictWorktree => {
             let module = worktree.join(relative);
             ensure!(module.join(".git").exists(), "子模块未检出");
             let top = run(&module, &["rev-parse", "--show-toplevel"])?;
@@ -1325,7 +1353,7 @@ pub fn base_snapshot(root: &Path, pair: &Compare) -> Result<Vec<u8>> {
         Version::Head(id) | Version::Commit(id) if pair.left_gitlink || pair.right_gitlink => {
             run(root, &["ls-tree", "-z", id, "--", path])?.starts_with(b"160000 ")
         }
-        Version::Index => pair.left_gitlink,
+        Version::Index | Version::ConflictOurs => pair.left_gitlink,
         _ => false,
     };
     if gitlink {
@@ -1361,6 +1389,10 @@ pub enum Operation {
     Fetch,
     Pull,
     Push,
+    Recover {
+        expected: Box<RecoveryState>,
+        action: RecoveryAction,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1530,6 +1562,20 @@ fn current_head(root: &Path) -> Result<CurrentHead> {
 }
 
 impl Operation {
+    pub(crate) fn requires_idle_worktree(&self) -> bool {
+        matches!(
+            self,
+            Self::Commit(_)
+                | Self::Switch(_)
+                | Self::Branch(_)
+                | Self::CheckoutCommit(_)
+                | Self::MergeCommit(_)
+                | Self::CherryPick { .. }
+                | Self::Pull
+                | Self::Push
+        )
+    }
+
     pub(crate) fn after_success(&self, cached_status: Option<&Status>) -> AfterSuccess {
         const MAX_TARGETED_PATHS: usize = 32;
         if let Some(source) = self.index_source() {
@@ -1600,7 +1646,7 @@ impl Operation {
                 Some(TargetedRead::Head(HeadUpdate::LocateCommit)),
                 RefreshScope::BOTH,
             ),
-            Self::Switch(_) | Self::Branch(_) | Self::CheckoutCommit(_) => (
+            Self::Switch(_) | Self::Branch(_) | Self::CheckoutCommit(_) | Self::Recover { .. } => (
                 ImmediateChange::None,
                 Some(TargetedRead::Head(HeadUpdate::SwitchBranch)),
                 RefreshScope::BOTH,
@@ -1620,10 +1666,9 @@ impl Operation {
     }
 
     pub(crate) fn refresh_after_failure(&self) -> RefreshScope {
-        if matches!(
-            self,
-            Self::Commit(_) | Self::MergeCommit(_) | Self::CherryPick { .. } | Self::Pull
-        ) {
+        if matches!(self, Self::Recover { .. }) {
+            RefreshScope::BOTH
+        } else if self.requires_idle_worktree() {
             RefreshScope::STATUS
         } else {
             RefreshScope::default()
@@ -1662,15 +1707,42 @@ impl Operation {
             Self::Fetch => "fetch",
             Self::Pull => "pull",
             Self::Push => "push",
+            Self::Recover {
+                action: RecoveryAction::Continue,
+                ..
+            } => "operation_continue",
+            Self::Recover {
+                action: RecoveryAction::Skip,
+                ..
+            } => "operation_skip",
+            Self::Recover {
+                action: RecoveryAction::Abort,
+                ..
+            } => "operation_abort",
         }
     }
 
     pub fn execute(&self, worktree: &Path) -> Result<String> {
+        self.execute_with_editor(worktree, None)
+    }
+
+    pub(crate) fn execute_with_editor(
+        &self,
+        worktree: &Path,
+        editor: Option<&mut (dyn FnMut(RebaseMessageRequest) + Send)>,
+    ) -> Result<String> {
         ensure!(
             root(worktree)?.canonicalize()? == worktree.canonicalize()?,
             "Git 操作需要工作树根目录"
         );
         let root = worktree;
+        if self.requires_idle_worktree() {
+            let dir = worktree_git_dir(root)?;
+            ensure!(
+                recovery_state(root, &dir, None)?.is_none(),
+                "请先处理进行中的 Git 操作"
+            );
+        }
         let parent_number;
         let mut stage_input = None;
         let args = match self {
@@ -1759,6 +1831,9 @@ impl Operation {
             Self::Fetch => vec!["fetch", "--all"],
             Self::Pull => vec!["pull", "--ff-only"],
             Self::Push => vec!["push"],
+            Self::Recover { expected, action } => {
+                return recovery::recover(root, expected, *action, editor);
+            }
         };
         let out = if let Some(input) = stage_input {
             command(Some(root), false)

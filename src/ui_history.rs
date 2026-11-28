@@ -64,7 +64,9 @@ impl Desk {
             }
             _ => None,
         };
-        let busy = self.state().is_some_and(|state| state.history_busy);
+        let busy = self
+            .state()
+            .is_some_and(|state| state.history_busy && state.rebase_message.is_none());
         let mut clear_filter = false;
         let mut head = false;
         let mut next = false;
@@ -154,6 +156,7 @@ impl Desk {
             return;
         };
         let writing = self.operations.contains(root);
+        let normal_write = !writing && state.normal_writes_available();
         let history = state.history.as_ref();
         let overview = state.history_info();
         let summary = history.map_or_else(Default::default, |history| history.summary);
@@ -254,7 +257,7 @@ impl Desk {
                             let can_discard = changes.iter().any(|file| {
                                 file.area == Area::Unstaged && file.code != '?' && !file.is_gitlink()
                             }) && changes.iter().all(|file| file.code != 'U');
-                            if ui.button("提交…").clicked() {
+                            if ui.add_enabled(normal_write, egui::Button::new("提交…")).clicked() {
                                 click = Some(Click::CommitWorktree);
                                 ui.close_menu();
                             }
@@ -291,7 +294,9 @@ impl Desk {
                     let Some((cached, history)) = cached.zip(overview) else {
                         if !missing_label && rect.intersects(ui.clip_rect()) {
                             missing_rows = true;
-                            let label = if state.history_error.is_some() && !state.history_busy {
+                            let label = if state.rebase_message.is_some() {
+                                "变基继续后刷新历史"
+                            } else if state.history_error.is_some() && !state.history_busy {
                                 "历史页不可用"
                             } else {
                                 "读取历史…"
@@ -378,7 +383,7 @@ impl Desk {
                             ui.close_menu();
                         }
                         ui.separator();
-                        ui.add_enabled_ui(!writing, |ui| {
+                        ui.add_enabled_ui(normal_write, |ui| {
                             if ui.button("检出提交…").clicked() {
                                 click = Some(confirm_operation(
                                     root,
@@ -417,7 +422,9 @@ impl Desk {
                                 });
                                 ui.close_menu();
                             }
-                            ui.separator();
+                        });
+                        ui.separator();
+                        ui.add_enabled_ui(!writing, |ui| {
                             for (label, tag) in [("创建分支…", false), ("创建标签…", true)] {
                                 if ui.button(label).clicked() {
                                     click = Some(Click::Dialog(Dialog::NewCommitReference {

@@ -92,6 +92,7 @@ enum BranchAction {
 }
 
 struct BranchView<'a> {
+    can_switch: bool,
     selection: &'a BTreeSet<String>,
     current: &'a str,
     searching: bool,
@@ -237,7 +238,12 @@ impl BranchView<'_> {
                         self.only(reference);
                         ui.close_menu();
                     }
-                    if local && !current && ui.button("切换到此分支…").clicked() {
+                    if local
+                        && !current
+                        && ui
+                            .add_enabled(self.can_switch, egui::Button::new("切换到此分支…"))
+                            .clicked()
+                    {
                         self.action = Some(BranchAction::Switch(label.to_owned()));
                         ui.close_menu();
                     }
@@ -414,13 +420,20 @@ impl Desk {
             .state()
             .and_then(|state| state.history_info())
             .map(|history| history.refs.len());
+        let can_switch = self
+            .state()
+            .is_some_and(|state| state.normal_writes_available())
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|root| !self.operations.contains(root));
         let mut new = false;
         let mut action = None;
         ui.horizontal(|ui| {
             heading(ui, "分支", count);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 new = ui
-                    .add_enabled(count.is_some(), compact_button("＋"))
+                    .add_enabled(count.is_some() && can_switch, compact_button("＋"))
                     .on_hover_text("新建并切换分支")
                     .clicked();
                 if small_button(ui, "全部")
@@ -446,6 +459,7 @@ impl Desk {
             let selection = state.filter.checks();
             let groups = build_groups(&history.refs, &history.branch, &needle, &selection);
             let mut view = BranchView {
+                can_switch,
                 selection: &selection,
                 current: &history.branch,
                 searching: !needle.is_empty(),

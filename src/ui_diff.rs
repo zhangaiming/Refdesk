@@ -14,6 +14,8 @@ impl Desk {
             .cloned();
         let format = self.comparison.as_ref().map(builtin_diff::registered);
         let mut invoke = false;
+        #[cfg(windows)]
+        let mut open = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("差异").size(17.0).strong().color(colors.text));
             if let Some(path) = path {
@@ -23,6 +25,16 @@ impl Desk {
                 .on_hover_text(path);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                #[cfg(windows)]
+                if self
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.code == 'U' && !file.is_gitlink())
+                {
+                    open = small_button(ui, "打开文件")
+                        .on_hover_text("在记事本打开工作树文件")
+                        .clicked();
+                }
                 if let Some(tool) = &tool {
                     let label = format
                         .and_then(|format| format.external_label)
@@ -33,6 +45,10 @@ impl Desk {
                 }
             });
         });
+        #[cfg(windows)]
+        if open && let Some(path) = path.map(str::to_owned) {
+            self.open_conflict_file(&path);
+        }
         if invoke && let Some(tool) = tool {
             self.external(ctx, tool);
         }

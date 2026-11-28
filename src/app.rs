@@ -1,8 +1,8 @@
 use crate::builtin_diff::{self, ActiveDiff};
 use crate::git::{
     self, AfterSuccess, Area, Change, Commit, Compare, ConfirmedChange, CurrentHead, Details,
-    History, HistoryScope, ImmediateChange, Operation, Reference, RefreshScope, Status,
-    StatusScope, Submodule, TargetedRead, TrackingState,
+    History, HistoryScope, ImmediateChange, Operation, RecoveryState, Reference, RefreshScope,
+    Status, StatusScope, Submodule, TargetedRead, TrackingState,
 };
 use crate::history::{HistoryCache, HistoryView, SearchDirection, SearchResult};
 use crate::logging::{self, Presentation, ReadLog};
@@ -35,11 +35,18 @@ enum Event {
     Added(Outcome<Vec<PathBuf>>, bool),
     History(PathBuf, u64, Result<Option<HistoryView>>),
     HistorySearch(u64, u64, Outcome<SearchResult>),
-    Status(PathBuf, u64, Result<Status>, Option<Result<Vec<Submodule>>>),
+    Status {
+        path: PathBuf,
+        request: u64,
+        files: Result<Status>,
+        submodules: Option<Result<Vec<Submodule>>>,
+        recovery: Option<Result<(git::WorktreeGitDir, Option<RecoveryState>)>>,
+    },
     Details(u64, u64, Selection, Outcome<Details>),
     CopyCommitMessage(PathBuf, u64, Outcome<String>),
     Operation(PathBuf, u64, Operation, Result<(String, AfterSuccess)>),
     OperationReadback(PathBuf, u64, Result<Option<ConfirmedChange>>),
+    RebaseMessage(PathBuf, u64, git::RebaseMessageRequest),
     External(Outcome<TempDir>),
 }
 
@@ -48,6 +55,10 @@ pub(crate) struct Repository {
     pub history: Option<HistoryView>,
     history_overlay: Option<History>,
     pub status: Option<Status>,
+    git_directory: Option<git::WorktreeGitDir>,
+    pub recovery: Option<RecoveryState>,
+    pub recovery_verified: bool,
+    pub rebase_message: Option<RebaseMessageEdit>,
     submodules: Option<Vec<Submodule>>,
     pub history_busy: bool,
     pub status_busy: bool,
@@ -129,6 +140,14 @@ impl OperationCompletion {
 }
 
 impl Repository {
+    pub(crate) fn normal_writes_available(&self) -> bool {
+        self.recovery_verified && self.recovery.is_none()
+    }
+
+    pub(crate) fn conflicts(&self) -> usize {
+        self.status.as_ref().map_or(0, Status::conflict_count)
+    }
+
     pub fn changes(&self) -> &[Change] {
         self.status.as_ref().map_or(&[], |status| &status.files)
     }
@@ -309,7 +328,21 @@ pub(crate) enum Dialog {
         commit: Box<Commit>,
         mainline: Option<usize>,
     },
+    AbortRebaseMessage {
+        root: PathBuf,
+        editor: u64,
+    },
     Forget(PathBuf),
+}
+
+pub(crate) struct RebaseMessageEdit {
+    pub id: u64,
+    pub commit: Option<String>,
+    pub draft: String,
+    pub visible: bool,
+    pub focus: bool,
+    original: String,
+    reply: Sender<git::RebaseMessageReply>,
 }
 
 pub(crate) struct Desk {
@@ -335,6 +368,7 @@ pub(crate) struct Desk {
     pub branch_query: String,
     pub file_query: String,
     pub reset_file_scroll: bool,
+    pub reveal_conflict: bool,
     pub search_row: Option<usize>,
     history_search: Option<HistorySearch>,
     pub scroll_to: Option<usize>,
@@ -475,6 +509,7 @@ impl Desk {
             branch_query: String::new(),
             file_query: String::new(),
             reset_file_scroll: false,
+            reveal_conflict: false,
             search_row: None,
             history_search: None,
             scroll_to: None,
@@ -751,12 +786,15 @@ impl Desk {
             state.status.is_some(),
         ));
         state.history_viewport = 0..2;
+        if let Some(edit) = &mut state.rebase_message {
+            edit.focus = true;
+        }
         if let Some(history) = &state.history {
             history.cache.set_active(true);
         } else if !state.history_busy {
             self.request_history(ctx, &path);
         }
-        self.request_status(ctx, &path, false, StatusScope::Full);
+        self.request_status(ctx, &path, true, StatusScope::Files);
         self.save();
     }
 
@@ -965,6 +1003,7 @@ impl Desk {
         state.status_busy = true;
         state.status_error = None;
         let cached_head = state.cached_head_for_file_refresh(scope, now);
+        let cached_git_dir = state.git_directory.clone();
         state.status_read_scope = Some(if cached_head.is_some() {
             StatusScope::Files
         } else {
@@ -989,7 +1028,21 @@ impl Desk {
                     "failed"
                 };
                 log.complete(started, outcome);
-                Event::Status(root, request, result, submodules)
+                let recovery = result.as_ref().ok().map(|status| {
+                    let dir = match cached_git_dir.filter(|dir| dir.path.is_dir()) {
+                        Some(dir) => dir,
+                        None => git::worktree_git_dir(&root)?,
+                    };
+                    let recovery = git::recovery_state(&root, &dir, status.head.as_deref())?;
+                    Ok((dir, recovery))
+                });
+                Event::Status {
+                    path: root,
+                    request,
+                    files: result,
+                    submodules,
+                    recovery,
+                }
             },
         );
     }
@@ -1480,6 +1533,21 @@ impl Desk {
     }
 
     pub fn operate(&mut self, ctx: &egui::Context, root: PathBuf, operation: Operation) {
+        let allowed = self.repos.get(&root).is_some_and(|state| match &operation {
+            Operation::Recover { expected, action } => {
+                self.active.as_ref() == Some(&root)
+                    && state.recovery_verified
+                    && !state.status_busy
+                    && state.recovery.as_ref() == Some(expected.as_ref())
+                    && expected.allows(*action, state.conflicts())
+            }
+            _ => !operation.requires_idle_worktree() || state.normal_writes_available(),
+        });
+        if !allowed {
+            self.tell_operation(&root, "Git 操作状态待确认，请查看刷新后的工作树", true);
+            self.request_status(ctx, &root, true, StatusScope::Full);
+            return;
+        }
         if !self.operations.insert(root.clone()) {
             return;
         }
@@ -1504,6 +1572,8 @@ impl Desk {
         let queued = Instant::now();
         tracing::info!(kind, worktree, request, "git_operation_requested");
         self.tell_operation(&root, "正在运行 Git…", false);
+        let events = self.events.clone();
+        let repaint = ctx.clone();
         self.submit(ctx, Work::Write, move || {
             let started = Instant::now();
             let queue_ms = logging::millis(started.duration_since(queued));
@@ -1511,7 +1581,14 @@ impl Desk {
             if let Some(probe) = &mut after.readback {
                 probe.prepare(&root);
             }
-            let result = operation.execute(&root);
+            let result = if matches!(&operation, Operation::Recover { expected, action } if expected.kind == git::RecoveryKind::Rebase && *action != git::RecoveryAction::Abort) {
+                operation.execute_with_editor(&root, Some(&mut |edit| {
+                    let _ = events.send(Event::RebaseMessage(root.clone(), request, edit));
+                    repaint.request_repaint();
+                }))
+            } else {
+                operation.execute(&root)
+            };
             let run_ms = logging::millis(started.elapsed());
             match &result {
                 Ok(_) => tracing::info!(
@@ -1561,6 +1638,7 @@ impl Desk {
         else {
             return;
         };
+        state.rebase_message = None;
         self.operations.remove(path);
         let active = self.active.as_deref() == Some(path);
         match result {
@@ -1628,6 +1706,62 @@ impl Desk {
                 };
                 self.tell_operation(path, message, true);
             }
+        }
+    }
+
+    pub(crate) fn show_rebase_message(&mut self) {
+        if let Some(edit) = self
+            .active
+            .as_ref()
+            .and_then(|root| self.repos.get_mut(root))
+            .and_then(|state| state.rebase_message.as_mut())
+        {
+            edit.visible = true;
+            edit.focus = true;
+        }
+    }
+
+    pub(crate) fn respond_to_rebase_message(&mut self, save: bool) {
+        let Some(root) = self.active.clone() else {
+            return;
+        };
+        let Some(state) = self.repos.get_mut(&root) else {
+            return;
+        };
+        if save {
+            if let Some(edit) = state.rebase_message.take() {
+                if edit
+                    .reply
+                    .send(git::RebaseMessageReply::Save(edit.draft))
+                    .is_ok()
+                {
+                    self.tell_operation(&root, "正在运行 Git…", false);
+                } else {
+                    self.tell_operation(&root, "Git 已结束这次编辑请求", true);
+                }
+            }
+        } else if let Some(edit) = &mut state.rebase_message {
+            edit.draft.clone_from(&edit.original);
+            edit.visible = false;
+        }
+    }
+
+    pub(crate) fn abort_rebase_message(&mut self, root: &Path, id: u64) {
+        let edit = self.repos.get_mut(root).and_then(|state| {
+            if state
+                .rebase_message
+                .as_ref()
+                .is_some_and(|edit| edit.id == id)
+            {
+                state.rebase_message.take()
+            } else {
+                None
+            }
+        });
+        if edit.is_some_and(|edit| edit.reply.send(git::RebaseMessageReply::Abort).is_ok()) {
+            self.tell_operation(root, "正在中止变基…", false);
+        } else {
+            self.tell_operation(root, "Git 已结束这次编辑请求", true);
         }
     }
 
@@ -1879,7 +2013,13 @@ impl Desk {
                         tracing::debug!(kind = "history_search", worktree, request, "read_stale");
                     }
                 }
-                Event::Status(path, request, result, submodules) => {
+                Event::Status {
+                    path,
+                    request,
+                    files: result,
+                    submodules,
+                    recovery,
+                } => {
                     let Some(state) = self
                         .repos
                         .get_mut(&path)
@@ -1901,6 +2041,19 @@ impl Desk {
                         state.status_checked = Some(Instant::now());
                         state.refresh_on_focus = false;
                     }
+                    state.recovery_verified = false;
+                    match recovery {
+                        Some(Ok((dir, recovery))) => {
+                            state.git_directory = Some(dir);
+                            state.recovery = recovery;
+                            state.recovery_verified = true;
+                        }
+                        Some(Err(error)) => {
+                            state.git_directory = None;
+                            state.status_error = Some(format!("无法确认 Git 操作状态：{error:#}"));
+                        }
+                        None => {}
+                    }
                     let status_updated = result.is_ok();
                     let mut head_changed = false;
                     match result {
@@ -1920,6 +2073,7 @@ impl Desk {
                             state.status_error = Some(format!("{error:#}"));
                         }
                     }
+                    let refresh_history = head_changed && !state.operation.pending.history;
                     let updated = match submodules {
                         Some(Ok(mut modules)) => {
                             for module in &mut modules {
@@ -1948,6 +2102,9 @@ impl Desk {
                         }
                         None => false,
                     };
+                    if refresh_history {
+                        self.request_history(ctx, &path);
+                    }
                     if self.active.as_ref() == Some(&path) {
                         if status_updated {
                             self.reconcile_worktree_file(ctx, None, head_changed);
@@ -1997,6 +2154,26 @@ impl Desk {
                             Ok(message) => ctx.copy_text(message),
                             Err(error) => self.tell(error, true),
                         }
+                    }
+                }
+                Event::RebaseMessage(path, request, edit) => {
+                    let id = self.next();
+                    if let Some(state) = self
+                        .repos
+                        .get_mut(&path)
+                        .filter(|state| state.operation.owns(request))
+                        && self.operations.contains(&path)
+                    {
+                        state.rebase_message = Some(RebaseMessageEdit {
+                            id,
+                            commit: edit.commit,
+                            draft: edit.message.clone(),
+                            original: edit.message,
+                            visible: true,
+                            focus: true,
+                            reply: edit.reply,
+                        });
+                        self.tell_operation(&path, "Git 正在等待提交说明", false);
                     }
                 }
                 Event::Operation(path, request, operation, result) => {

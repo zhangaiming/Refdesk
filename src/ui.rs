@@ -622,6 +622,16 @@ impl eframe::App for Desk {
                         ui.set_style(content_style.clone());
                         self.navigation(ui, ctx);
                     });
+                if self.state().is_some_and(|state| state.recovery.is_some()) {
+                    egui::TopBottomPanel::top("git-recovery")
+                        .show_separator_line(false)
+                        .exact_height(56.0)
+                        .frame(panel(colors.chrome, 13, 5))
+                        .show_inside(ui, |ui| {
+                            ui.set_style(content_style.clone());
+                            self.recovery_bar(ui, ctx);
+                        });
+                }
                 let diff = egui::TopBottomPanel::bottom(diff_id)
                     .resizable(true)
                     .show_separator_line(false)
@@ -826,7 +836,12 @@ impl Desk {
                 spacing.button_padding.y = 2.0;
                 spacing.item_spacing.x = gap;
                 for (title, operation) in operations {
-                    if ui.add_enabled(can_run, title_button(title)).clicked() {
+                    let enabled = can_run
+                        && (!operation.requires_idle_worktree()
+                            || self
+                                .state()
+                                .is_some_and(|state| state.normal_writes_available()));
+                    if ui.add_enabled(enabled, title_button(title)).clicked() {
                         action = Some((title, operation));
                     }
                 }

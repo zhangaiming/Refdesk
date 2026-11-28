@@ -23,6 +23,7 @@ mod ui_diff;
 mod ui_history;
 mod ui_image;
 mod ui_inspector;
+mod ui_recovery;
 mod ui_text;
 mod ui_workbook;
 #[cfg(windows)]
@@ -32,6 +33,7 @@ mod window_job;
 #[cfg(windows)]
 mod workbook_worker;
 
+use anyhow::Context;
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -40,6 +42,19 @@ fn main() -> eframe::Result<()> {
     let mut paths = Vec::new();
     let mut import = false;
     let mut arguments = std::env::args_os().skip(1).peekable();
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == git::REBASE_EDITOR_ARGUMENT)
+    {
+        let result = arguments
+            .nth(1)
+            .context("缺少 Git 提交说明文件")
+            .and_then(|file| git::run_rebase_editor(&PathBuf::from(file)));
+        if let Err(error) = &result {
+            eprintln!("{error:#}");
+        }
+        std::process::exit(i32::from(result.is_err()));
+    }
     #[cfg(windows)]
     if arguments
         .peek()

@@ -160,6 +160,7 @@ impl Desk {
                 Dialog::CherryPickMerge { .. } => "摘取提交",
                 Dialog::Operation { title, .. } => *title,
                 Dialog::Forget(_) => "移除仓库入口",
+                Dialog::AbortRebaseMessage { .. } => "中止变基",
             };
             let modal = egui::Modal::new(egui::Id::new(title)).frame(dialog_frame(ctx));
             let opening = ctx.memory(|memory| memory.top_modal_layer() != Some(modal.area.layer()));
@@ -287,13 +288,35 @@ impl Desk {
                             confirmation_buttons(
                                 ui,
                                 title,
-                                !self.operations.contains(root),
-                                matches!(operation, Operation::Push | Operation::DiscardUnstaged),
+                                !self.operations.contains(root)
+                                    && (!operation.requires_idle_worktree()
+                                        || self
+                                            .repos
+                                            .get(root)
+                                            .is_some_and(|state| state.normal_writes_available())),
+                                matches!(
+                                    operation,
+                                    Operation::Push
+                                        | Operation::DiscardUnstaged
+                                        | Operation::Recover { .. }
+                                ),
                                 opening,
                                 || {
                                     self.operate(ctx, root.clone(), operation.clone());
                                 },
                             )
+                        }
+                        Dialog::AbortRebaseMessage { root, editor } => {
+                            ui.label("将放弃这次提交说明编辑，并尝试恢复变基前的状态。");
+                            ui.label("本次变基的改动和冲突解决结果可能丢失。");
+                            ui.label(
+                                RichText::new(root.display().to_string())
+                                    .small()
+                                    .color(colors.muted),
+                            );
+                            confirmation_buttons(ui, title, true, true, opening, || {
+                                self.abort_rebase_message(root, *editor)
+                            })
                         }
                         Dialog::Forget(path) => {
                             ui.label("从 Refdesk 的仓库列表移除此入口。");

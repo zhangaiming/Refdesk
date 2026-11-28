@@ -89,10 +89,29 @@ fn paint_copy_sha_toast(ctx: &egui::Context, toast_id: egui::Id) {
     ctx.request_repaint();
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileGroup {
+    Conflict,
+    Staged,
+    Unstaged,
+}
+
+impl FileGroup {
+    fn of(file: &Change) -> Self {
+        if file.code == 'U' {
+            Self::Conflict
+        } else if file.area == Area::Staged {
+            Self::Staged
+        } else {
+            Self::Unstaged
+        }
+    }
+}
+
 enum FileRow<'a> {
     Group {
         name: &'static str,
-        area: Area,
+        group: FileGroup,
         count: usize,
     },
     File(&'a Change),
@@ -107,26 +126,30 @@ fn file_rows<'a>(
     files: &'a [Change],
     worktree: bool,
     query: &str,
-    collapsed_groups: &[Area],
+    collapsed_groups: &[FileGroup],
 ) -> Vec<FileRow<'a>> {
     let matches = file_filter(query);
     let mut rows = Vec::with_capacity(files.len() + 2);
     if worktree {
-        for (name, area) in [("已暂存", Area::Staged), ("未暂存", Area::Unstaged)] {
+        for (name, group) in [
+            ("冲突", FileGroup::Conflict),
+            ("已暂存", FileGroup::Staged),
+            ("未暂存", FileGroup::Unstaged),
+        ] {
             let group_start = rows.len();
             rows.extend(
                 files
                     .iter()
-                    .filter(|file| file.area == area)
+                    .filter(|file| FileGroup::of(file) == group)
                     .filter(&matches)
                     .map(FileRow::File),
             );
             let count = rows.len() - group_start;
             if count > 0 {
-                if collapsed_groups.contains(&area) {
+                if collapsed_groups.contains(&group) {
                     rows.truncate(group_start);
                 }
-                rows.insert(group_start, FileRow::Group { name, area, count });
+                rows.insert(group_start, FileRow::Group { name, group, count });
             }
         }
     } else {
@@ -196,6 +219,38 @@ fn file_directory(
     )
 }
 
+fn commit_message_box(
+    ui: &mut egui::Ui,
+    draft: &mut String,
+    id: egui::Id,
+    hint: &str,
+    enabled: bool,
+) -> egui::Response {
+    let colors = theme::palette(ui.ctx());
+    let footer_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+    let height = (ui.available_height() - footer_height).max(0.0);
+    egui::ScrollArea::vertical()
+        .id_salt(id.with("scroll"))
+        .max_height(height)
+        .min_scrolled_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.hovered.expansion = 0.0;
+            widgets.active.expansion = 0.0;
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::multiline(draft)
+                    .id(id)
+                    .hint_text(RichText::new(hint).color(colors.subtle))
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY)
+                    .min_size(Vec2::new(0.0, height)),
+            )
+        })
+        .inner
+}
+
 impl Desk {
     pub(crate) fn focus_worktree_commit(&mut self, ctx: &egui::Context) {
         if !matches!(self.selection, Selection::Worktree) {
@@ -212,6 +267,15 @@ impl Desk {
         let busy = active
             .as_ref()
             .is_some_and(|root| self.operations.contains(root));
+        let recovery = self.state().is_some_and(|state| state.recovery.is_some());
+        let rebase_editing = self
+            .state()
+            .and_then(|state| state.rebase_message.as_ref())
+            .is_some_and(|edit| edit.visible);
+        let can_focus = self.dialog.is_none();
+        let normal_commit = self
+            .state()
+            .is_some_and(|state| state.normal_writes_available());
         let staged = self.state().map_or(0, |state| {
             state
                 .changes()
@@ -230,6 +294,7 @@ impl Desk {
         );
         let (_, section) = ui.allocate_space(Vec2::new(ui.available_width(), height));
         let mut commit = false;
+        let mut edit_response = None;
         {
             let mut commit_panel = ui.new_child(
                 UiBuilder::new()
@@ -240,37 +305,98 @@ impl Desk {
             commit_panel.set_clip_rect(ui.clip_rect().intersect(section));
             let ui = &mut commit_panel;
             ui.horizontal(|ui| {
-                heading(ui, if worktree { "提交" } else { "提交详情" }, None);
-                if self.details_busy {
+                heading(
+                    ui,
+                    if rebase_editing {
+                        "编辑变基提交说明"
+                    } else if !worktree {
+                        "提交详情"
+                    } else if recovery {
+                        "当前操作"
+                    } else {
+                        "提交"
+                    },
+                    None,
+                );
+                if self.details_busy && !rebase_editing {
                     ui.spinner();
                 }
             });
             ui.add_space(4.0);
-            if worktree {
-                let footer_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-                let editor_height = (ui.available_height() - footer_height).max(0.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("commit-message")
-                    .max_height(editor_height)
-                    .min_scrolled_height(editor_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Keep the editor frame inside the scroll viewport in every state.
-                        let widgets = &mut ui.visuals_mut().widgets;
-                        widgets.hovered.expansion = 0.0;
-                        widgets.active.expansion = 0.0;
-                        ui.add_enabled(
-                            active.is_some(),
-                            egui::TextEdit::multiline(&mut self.editor)
-                                .id(egui::Id::new(COMMIT_MESSAGE_ID))
-                                .hint_text(
-                                    RichText::new("写下本次提交的说明…").color(colors.subtle),
-                                )
-                                .desired_rows(1)
-                                .desired_width(f32::INFINITY)
-                                .min_size(Vec2::new(0.0, editor_height)),
-                        );
+            if rebase_editing {
+                if let Some(edit) = active
+                    .as_ref()
+                    .and_then(|root| self.repos.get_mut(root))
+                    .and_then(|state| state.rebase_message.as_mut())
+                {
+                    if let Some(commit) = &edit.commit {
+                        ui.label(
+                            RichText::new(crate::ui_recovery::short_id(commit))
+                                .monospace()
+                                .small()
+                                .color(colors.muted),
+                        )
+                        .on_hover_text(commit);
+                    }
+                    let id = egui::Id::new(("rebase-commit-message", edit.id));
+                    let text =
+                        commit_message_box(ui, &mut edit.draft, id, "写下变基后的提交说明…", true);
+                    if can_focus && std::mem::take(&mut edit.focus) {
+                        text.request_focus();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .button(
+                                RichText::new("保存说明并继续")
+                                    .color(colors.accent)
+                                    .strong(),
+                            )
+                            .clicked()
+                        {
+                            edit_response = Some(true);
+                        }
+                        if ui.button("取消编辑").clicked() {
+                            edit_response = Some(false);
+                        }
                     });
+                }
+            } else if worktree
+                && let Some(edit) = self.state().and_then(|state| state.rebase_message.as_ref())
+            {
+                if let Some(commit) = &edit.commit {
+                    ui.label(format!(
+                        "待编辑提交  {}",
+                        crate::ui_recovery::short_id(commit)
+                    ))
+                    .on_hover_text(commit);
+                }
+            } else if worktree
+                && let Some(recovery) = self.state().and_then(|state| state.recovery.as_ref())
+            {
+                let short = crate::ui_recovery::short_id;
+                ui.label(recovery.kind.title());
+                let colors = theme::palette(ctx);
+                for (label, value) in [
+                    ("分支", recovery.branch.as_deref()),
+                    ("当前提交", recovery.commit.as_deref().map(short)),
+                    ("目标基点", recovery.onto.as_deref().map(short)),
+                ] {
+                    if let Some(value) = value {
+                        let text = format!("{label}  {value}");
+                        ui.add(
+                            egui::Label::new(RichText::new(&text).color(colors.muted)).truncate(),
+                        )
+                        .on_hover_text(text);
+                    }
+                }
+            } else if worktree {
+                commit_message_box(
+                    ui,
+                    &mut self.editor,
+                    egui::Id::new(COMMIT_MESSAGE_ID),
+                    "写下本次提交的说明…",
+                    active.is_some(),
+                );
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("{staged} 项已暂存"))
@@ -280,7 +406,10 @@ impl Desk {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         commit = ui
                             .add_enabled(
-                                staged > 0 && !self.editor.trim().is_empty() && !busy,
+                                normal_commit
+                                    && staged > 0
+                                    && !self.editor.trim().is_empty()
+                                    && !busy,
                                 egui::Button::new(
                                     RichText::new("提交").color(colors.accent).strong(),
                                 ),
@@ -335,6 +464,9 @@ impl Desk {
                     .show(ui, |ui| ui.colored_label(colors.removed.foreground, error));
             }
         }
+        if let Some(save) = edit_response {
+            self.respond_to_rebase_message(save);
+        }
         if commit && let Some(root) = active {
             self.operate(ctx, root, Operation::Commit(self.editor.trim().to_owned()));
         }
@@ -344,10 +476,12 @@ impl Desk {
     }
 
     fn files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let reveal_conflict = std::mem::take(&mut self.reveal_conflict);
         let colors = theme::palette(ctx);
         let worktree = matches!(self.selection, Selection::Worktree);
         let state = self.active.as_ref().and_then(|root| self.repos.get(root));
-        let status_busy = state.is_some_and(|state| state.status_busy);
+        let status_busy =
+            state.is_some_and(|state| state.status_busy && state.rebase_message.is_none());
         let count = if worktree {
             state.map_or(0, |state| state.changes().len())
         } else {
@@ -361,6 +495,8 @@ impl Desk {
             .is_some_and(|root| !self.operations.contains(root));
         let mut chosen = None;
         let mut external = false;
+        #[cfg(windows)]
+        let mut open = None;
         let mut staging = None;
         let mut stage_selected = false;
         let files = if worktree {
@@ -410,8 +546,14 @@ impl Desk {
             ui.colored_label(colors.removed.foreground, error);
         }
         let collapsed_groups_id = ui.id().with("collapsed-file-groups");
+        if reveal_conflict {
+            ctx.data_mut(|data| {
+                data.get_temp_mut_or_default::<Vec<FileGroup>>(collapsed_groups_id)
+                    .retain(|group| *group != FileGroup::Conflict);
+            });
+        }
         let collapsed_groups = ctx
-            .data(|data| data.get_temp::<Vec<Area>>(collapsed_groups_id))
+            .data(|data| data.get_temp::<Vec<FileGroup>>(collapsed_groups_id))
             .unwrap_or_default();
         let entries = file_rows(files, worktree, &self.file_query, &collapsed_groups);
         if entries.is_empty() {
@@ -441,7 +583,7 @@ impl Desk {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let list = egui::ScrollArea::vertical().id_salt(("file-list", self.details_busy));
-            let list = if reset_scroll {
+            let list = if reset_scroll || reveal_conflict {
                 list.vertical_scroll_offset(0.0)
             } else {
                 list
@@ -457,7 +599,7 @@ impl Desk {
                         let right = rect.right() - FILE_RIGHT_INSET;
                         let baseline = rect.center().y + baseline_offset;
                         let file = match entries[index] {
-                            FileRow::Group { name, area, count } => {
+                            FileRow::Group { name, group, count } => {
                                 let response = ui
                                     .interact(rect, collapsed_groups_id.with(name), Sense::click())
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -468,16 +610,17 @@ impl Desk {
                                         name,
                                     )
                                 });
-                                let collapsed = collapsed_groups.contains(&area);
+                                let collapsed = collapsed_groups.contains(&group);
                                 if response.clicked() {
                                     ctx.data_mut(|data| {
-                                        let groups = data.get_temp_mut_or_default::<Vec<Area>>(
-                                            collapsed_groups_id,
-                                        );
+                                        let groups = data
+                                            .get_temp_mut_or_default::<Vec<FileGroup>>(
+                                                collapsed_groups_id,
+                                            );
                                         if collapsed {
-                                            groups.retain(|group| *group != area);
+                                            groups.retain(|entry| *entry != group);
                                         } else {
-                                            groups.push(area);
+                                            groups.push(group);
                                         }
                                     });
                                     ctx.request_repaint();
@@ -553,7 +696,8 @@ impl Desk {
                         }
                         let color = match file.code {
                             'A' | '?' => colors.added.foreground,
-                            'D' | 'U' => colors.removed.foreground,
+                            'D' => colors.removed.foreground,
+                            'U' => colors.warning,
                             'R' => colors.accent,
                             _ => colors.warning,
                         };
@@ -625,6 +769,15 @@ impl Desk {
                                 ui.ctx().copy_text(file.path.clone());
                                 ui.close_menu();
                             }
+                            #[cfg(windows)]
+                            if worktree
+                                && file.code == 'U'
+                                && !file.is_gitlink()
+                                && ui.button("在记事本打开工作树文件").clicked()
+                            {
+                                open = Some(file.path.clone());
+                                ui.close_menu();
+                            }
                             if worktree && file.area != Area::Commit {
                                 let batch = can_select
                                     && selected.len() > 1
@@ -633,6 +786,8 @@ impl Desk {
                                     stage_label(selected.len())
                                 } else if file.area == Area::Staged {
                                     "取消暂存".to_owned()
+                                } else if file.code == 'U' {
+                                    "暂存解决结果".to_owned()
                                 } else {
                                     "暂存".to_owned()
                                 };
@@ -679,6 +834,10 @@ impl Desk {
             if let Some(tool) = tool {
                 self.external(ctx, tool);
             }
+        }
+        #[cfg(windows)]
+        if let Some(path) = open {
+            self.open_conflict_file(&path);
         }
         if let (Some(operation), Some(root)) = (staging, self.active.clone()) {
             self.operate(ctx, root, operation);
@@ -746,13 +905,13 @@ mod tests {
         let rows = file_rows(&files, true, "src/", &[]);
         let [
             FileRow::Group {
-                area: Area::Staged,
+                group: FileGroup::Staged,
                 count: 1,
                 ..
             },
             FileRow::File(staged),
             FileRow::Group {
-                area: Area::Unstaged,
+                group: FileGroup::Unstaged,
                 count: 1,
                 ..
             },
@@ -767,7 +926,7 @@ mod tests {
         let readme = file_rows(&files, true, "readme", &[]);
         assert!(matches!(
             readme.as_slice(),
-            [FileRow::Group { area: Area::Unstaged, count: 1, .. }, FileRow::File(file)] if file.path == "README.md"
+            [FileRow::Group { group: FileGroup::Unstaged, count: 1, .. }, FileRow::File(file)] if file.path == "README.md"
         ));
     }
 
@@ -778,12 +937,12 @@ mod tests {
             change("README.md", Area::Staged),
             change("src/lib.rs", Area::Unstaged),
         ];
-        let rows = file_rows(&files, true, "src/", &[Area::Staged]);
+        let rows = file_rows(&files, true, "src/", &[FileGroup::Staged]);
         assert!(matches!(
             rows.as_slice(),
             [
-                FileRow::Group { area: Area::Staged, count: 1, .. },
-                FileRow::Group { area: Area::Unstaged, count: 1, .. },
+                FileRow::Group { group: FileGroup::Staged, count: 1, .. },
+                FileRow::Group { group: FileGroup::Unstaged, count: 1, .. },
                 FileRow::File(file),
             ] if file.path == "src/lib.rs"
         ));
