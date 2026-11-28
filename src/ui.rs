@@ -26,6 +26,10 @@ pub(crate) struct WindowButtons {
     pub maximize_pressed: bool,
 }
 
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "Win32 uses these hit-test regions")
+)]
 pub(crate) struct ToolbarRegions {
     pub drag: Rect,
     pub controls: [Rect; 3],

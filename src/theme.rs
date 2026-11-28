@@ -225,6 +225,10 @@ pub(crate) struct Palette {
     pub splitter_hover: Color32,
     #[serde(deserialize_with = "deserialize_color")]
     pub tree_guide: Color32,
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "The Win32 window frame uses this color")
+    )]
     #[serde(deserialize_with = "deserialize_color")]
     pub window_active_border: Color32,
     #[serde(deserialize_with = "deserialize_color")]

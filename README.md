@@ -1,14 +1,16 @@
 # Refdesk
 
-Refdesk 是 Windows 上的 Rust Git 桌面客户端。左边放仓库和分支，中间是提交图，右边是提交和变更文件，下方是并排 diff。左栏、右栏和 diff 的分隔条可以拖动。
+Refdesk 是面向 Windows x64 和 Apple Silicon Mac 的 Rust Git 桌面客户端。左边放仓库和分支，中间是提交图，右边是提交和变更文件，下方是并排 diff。左栏、右栏和 diff 的分隔条可以拖动。
 
 ## 启动
 
-双击项目根目录的 **Start-Refdesk.cmd**，或者在 PowerShell 运行：
+Windows 上双击项目根目录的 **Start-Refdesk.cmd**，或者在 PowerShell 运行：
 
     .\Start-Refdesk.cmd
 
 启动器和直接运行 `refdesk.exe` 默认共用 `%APPDATA%\Refdesk\settings.json`，用它恢复已登记仓库和上次活动仓库。需要使用独立会话时，可通过 `REFDESK_CONFIG` 指定文件。
+
+Apple Silicon Mac 上解压 macOS ZIP，然后从 Finder 打开 `Refdesk.app`。仓库操作需要有可用的 Git。
 
 从旧版启动器迁移时，若用户目录下还没有 `settings.json`，可将项目里的 `.local/settings.json` 整份复制过去，保留原有仓库、分支选择和 Diff Tools 设置。
 
@@ -51,11 +53,11 @@ Windows 桌面版默认在 `%LOCALAPPDATA%\Refdesk\logs` 写入 INFO 级别日�
 
 ## 构建和验证
 
-Rust 1.88 或以上、原生 Windows Rust 工具链及 Git。使用 windows-gnu 工具链时需要 GNU Binutils。Windows x64 的工具链配置、Release EXE 打包和校验步骤见 [Windows 打包流程](docs/PACKAGING.md)。
+需要 Rust 1.88 或以上及 Git。Windows 使用原生 Windows Rust 工具链，使用 windows-gnu 时还需要 GNU Binutils。Apple Silicon 使用 `aarch64-apple-darwin` 和 Xcode 命令行工具。两端构建、校验和发布见 [打包与发布](docs/PACKAGING.md)。
 
     cargo build --release --locked
 
-Release 构建输出到 target/release/refdesk.exe。启动器优先使用 artifacts/refdesk-current.exe，便于桌面版运行时重编译。单元测试、回归测试、Windows CI 和完整检查命令见 [测试与验收](docs/TESTING.md)。
+Windows Release 构建输出到 `target/release/refdesk.exe`。启动器优先使用 `artifacts/refdesk-current.exe`，便于桌面版运行时重编译。单元测试、回归测试和两端 CI 检查见 [测试与验收](docs/TESTING.md)。
 
 ## 0.2 范围
 
