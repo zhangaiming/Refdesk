@@ -7,6 +7,9 @@ use eframe::egui::{
 };
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+mod macos_fonts;
+
 pub(crate) const ROW: f32 = 25.0;
 pub(crate) const DETAIL_SIZE: f32 = 12.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 26.0;
@@ -73,6 +76,8 @@ pub fn install_style(ctx: &egui::Context) {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    macos_fonts::install(&mut fonts);
     ctx.set_fonts(fonts);
 }
 

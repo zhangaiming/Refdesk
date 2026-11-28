@@ -41,6 +41,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString", "CFURL"] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["CTFont", "CTFontDescriptor"] }
+ttf-parser = "0.25.1"
+
 [build-dependencies]
 embed-resource = "3.0"
 
